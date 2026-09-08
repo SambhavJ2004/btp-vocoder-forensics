@@ -124,16 +124,20 @@ def run_bandlimit_ablation(*_args, **_kwargs):
     shift, not where the artifact information lives. Budget the GPU hours
     accordingly (len(cutoffs) x len(conditions) matched trainings).
 
-    The archive rate is what makes this ablation meaningful. At the old 16 kHz
-    delivery rate there was no content above 8 kHz to remove, so the sweep could
-    not reach the band the mechanism argument is about. At 22.05 kHz Nyquist is
-    11.025 kHz and cutoffs can be placed on both sides of 8 kHz.
+    The archive rate and the full-band archive are what make this meaningful. At
+    the old 16 kHz delivery rate there was no content above 8 kHz to remove; and
+    while INV-17 band-limited at generation, there was none above LADDER_FMAX
+    either. Now the archive carries the whole band, so cutoffs sit on both sides
+    of LADDER_FMAX -- the boundary between what the vocoder was told and what it
+    invented.
     """
     raise NotImplementedError(
         "Implement once run_matched works end to end. Use "
-        "detectors.bandlimit.cutoffs_for_rate(ARCHIVE_SR), apply the identical "
-        "filter to real and vocoded audio, and record band_limit_hz and tier on "
-        "every DetectionResult."
+        "data.preprocess.band_limit_comparison_set, which applies the identical "
+        "filter to real and every vocoded member at once (INV-17), over "
+        "detectors.bandlimit.cutoffs_for_rate(ARCHIVE_SR). Record band_limit_hz "
+        "and tier on every DetectionResult. Read audio from written PCM_16 files "
+        "-- never from Phase A arrays (INV-17)."
     )
 
 

@@ -32,13 +32,14 @@ import pandas as pd
 
 from data.invariants import (
     ARCHIVE_TIER,
-    BAND_EXEMPT_CONDITIONS,
+    CORRELATION_EXCLUDED,
     REAL_CONDITION,
     TIER_RATES,
     TIERS,
     ZEROSHOT_TIER,
     InvariantViolation,
-    is_band_exempt,
+    exclusion_reason,
+    is_correlation_excluded,
 )
 
 from .eer import bootstrap_eer_ci, compute_eer
@@ -233,15 +234,17 @@ def spearman_headline(
     # is exactly the confound the ladder band exists to remove. This refuses
     # rather than silently filtering: a caller that passed an exempt condition
     # has a different question in mind and should say so.
-    smuggled = sorted(set(merged["condition"]) & set(BAND_EXEMPT_CONDITIONS))
+    smuggled = sorted(set(merged["condition"]) & set(CORRELATION_EXCLUDED))
     if smuggled:
+        reasons = "\n".join(f"  - {c}: {exclusion_reason(c)}" for c in smuggled)
         raise InvariantViolation(
-            f"INV-17: {smuggled} are band-exempt and cannot enter the primary "
-            "correlation. They keep their full native band, so including them "
-            "puts a bandwidth cliff back into the headline number. For the "
-            "bandwidth-vs-architecture comparison use "
-            "detectors.protocols.paired_bandwidth_contrast instead, or filter "
-            "with data.manifest.primary_ladder_frame first."
+            f"INV-17: {smuggled} are excluded from the primary correlation.\n"
+            f"{reasons}\n"
+            "They are generated and reported like any other condition; what they "
+            "are not is comparable on the headline axis. Filter with "
+            "data.manifest.primary_ladder_frame, or use "
+            "detectors.protocols.paired_bandwidth_contrast for the paired "
+            "bandwidth question."
         )
 
     if len(merged) < 3:
@@ -266,10 +269,11 @@ BANDWIDTH_PAIRS: dict[str, tuple[str, str]] = {
     # Isolates what a generator TRAINED to produce the high band does
     # differently from one that was not.
     "bigvgan": ("bigvgan_112m", "bigvgan_v2_22khz_fullband"),
-    # One checkpoint, delivered with and without the ladder band. Isolates only
-    # what the delivery filter removes -- the band-limited ablation at a single
-    # cutoff, on a second architecture.
-    "melgan": ("melgan", "melgan_fullband"),
+    # The "melgan" pair was removed when INV-17 moved to analysis time: it was
+    # one checkpoint delivered with and without the generation-time filter, and
+    # with a full-band archive both sides are the same audio. The contrast it
+    # gave is now an analysis choice -- band-limit the melgan comparison set or
+    # do not -- rather than a second stored condition.
 }
 
 
@@ -286,22 +290,19 @@ def paired_bandwidth_contrast(
     Pass ``pair`` to select from :data:`BANDWIDTH_PAIRS`, or name the two
     conditions directly.
 
-    **The two pairs answer different questions.** ``bigvgan_112m`` and
-    ``bigvgan_v2_22khz_fullband`` are separately trained checkpoints -- same
-    architecture, same parameter count, same recipe -- differing in mel fmax
-    alone, so their EER difference isolates what training bandwidth does to the
-    artifact. ``melgan`` and ``melgan_fullband`` share one set of weights and
-    differ only in whether the delivery filter ran, so that difference isolates
-    what the filter removes: the band-limited ablation evaluated at one cutoff,
-    on a second architecture.
+    ``bigvgan_112m`` and ``bigvgan_v2_22khz_fullband`` are separately trained
+    checkpoints -- same architecture, same parameter count, same recipe --
+    differing in mel fmax alone, so their EER difference isolates what training
+    bandwidth does to the artifact.
 
-    The second is the weaker of the two as a mechanism claim, and its value is
-    breadth: without it the high-band argument rests on a single model. Report
-    them side by side, never pooled.
+    The band-limited ablation sweeps a filter over a fixed generator; this pair
+    varies the generator's own band with the filter held fixed. They fail
+    differently, which is why both are worth running.
 
-    The band-limited ablation sweeps a filter over a fixed generator; the
-    BigVGAN pair varies the generator's own band with the filter held fixed.
-    They fail differently, which is why both are worth running.
+    The former ``melgan``/``melgan_fullband`` pair was removed: it was one
+    checkpoint delivered with and without the generation-time filter, and with a
+    full-band archive (INV-17) both sides are the same audio. That contrast is
+    now an analysis choice, not a stored condition.
     """
     if pair is not None:
         if pair not in BANDWIDTH_PAIRS:
@@ -309,10 +310,10 @@ def paired_bandwidth_contrast(
                 f"unknown bandwidth pair '{pair}'. Known: {sorted(BANDWIDTH_PAIRS)}"
             )
         band_limited, full_band = BANDWIDTH_PAIRS[pair]
-    if not is_band_exempt(full_band):
+    if not is_correlation_excluded(full_band):
         raise InvariantViolation(
-            f"INV-17: '{full_band}' is not band-exempt, so this is not a bandwidth "
-            "contrast -- both sides would be at the ladder band."
+            f"INV-17: '{full_band}' is not a correlation-excluded control, so this "
+            "is not a paired bandwidth contrast."
         )
     assert_protocols_not_pooled(detection)
     det = detection[detection["protocol"] == protocol.value]

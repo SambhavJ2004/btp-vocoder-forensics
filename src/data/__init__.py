@@ -4,8 +4,8 @@ from .alignment import AlignmentReport, assert_aligned, check_vocoder_alignment
 from .invariants import (
     ARCHIVE_SR,
     ARCHIVE_TIER,
-    BAND_EXEMPT_CONDITIONS,
     CONTRACTS,
+    CORRELATION_EXCLUDED,
     LADDER_FMAX,
     LOUDNESS_TARGET_LUFS,
     REAL_CONDITION,
@@ -16,14 +16,15 @@ from .invariants import (
     check_band_limit,
     check_pairing,
     check_waveform,
-    is_band_exempt,
+    exclusion_reason,
+    is_correlation_excluded,
     tier_for_rate,
 )
 
 __all__ = [
     "ARCHIVE_SR",
     "ARCHIVE_TIER",
-    "BAND_EXEMPT_CONDITIONS",
+    "CORRELATION_EXCLUDED",
     "CONTRACTS",
     "LADDER_FMAX",
     "LOUDNESS_TARGET_LUFS",
@@ -38,6 +39,7 @@ __all__ = [
     "check_pairing",
     "check_vocoder_alignment",
     "check_waveform",
-    "is_band_exempt",
+    "exclusion_reason",
+    "is_correlation_excluded",
     "tier_for_rate",
 ]

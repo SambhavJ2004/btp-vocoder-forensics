@@ -2,9 +2,12 @@
 
 The X-axis straddles both tiers (INV-01), and it has to:
 
-  ARCHIVE (22.05 kHz)   MCD, band-wise LSD, F0 error. These measure the high
-                        band, which is the whole mechanism argument, so they
-                        must not see the derived set.
+  ARCHIVE (22.05 kHz)   MCD, band-wise LSD, F0 error, and the high-band
+                        distance. These measure the high band, which is the
+                        whole mechanism argument, so they must not see the
+                        derived set -- and since INV-17 moved band-limiting to
+                        analysis time, the archive still HAS that band to
+                        measure.
   ZEROSHOT (16 kHz)     UTMOS and PESQ-WB. Both are hard-locked to 16 kHz by
                         their own definitions -- UTMOS22 is a 16 kHz model and
                         PESQ-WB accepts nothing else.
@@ -31,7 +34,7 @@ from data.manifest import require_primary, select_tier
 
 from .f0 import f0_error
 from .mcd import mcd
-from .spectral import log_spectral_distance_by_band
+from .spectral import high_band_distance, log_spectral_distance_by_band
 from .utmos import UTMOSScorer
 
 
@@ -53,6 +56,10 @@ def evaluate_archive(df: pd.DataFrame, *, with_f0: bool = True) -> pd.DataFrame:
             "mcd": mcd(ref, wav, sr=ARCHIVE_SR),
         }
         rec.update(log_spectral_distance_by_band(ref, wav, sr=ARCHIVE_SR))
+        # INV-17: the band the vocoder was never told about. Reported alongside
+        # the energy fraction because the right amount of energy with the wrong
+        # structure is a strong detection cue an energy measure cannot see.
+        rec.update(high_band_distance(ref, wav, sr=ARCHIVE_SR))
         if with_f0:
             rec.update(f0_error(ref, wav, sr=ARCHIVE_SR))
         rows.append(rec)

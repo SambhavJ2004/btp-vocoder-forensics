@@ -307,10 +307,11 @@ over. If two conditions were processed in different orders — easy to do when
 one is regenerated later — they end up with a systematic level or duration
 offset that no individual step is responsible for.
 
-**Scope.** The guarantee is over **a comparison set**. `PIPELINE_ORDER` applies
-to every primary-ladder condition; INV-17-exempt conditions run
-`PIPELINE_ORDER_BAND_EXEMPT`, which differs by exactly one step and is never
-pooled with the ladder. See the INV-17 conflict note.
+**Scope.** Every condition now runs the same `PIPELINE_ORDER`, with no
+exceptions at all. The band-exempt variant existed because INV-17 filtered at
+generation and controls skipped that step; INV-17 no longer filters at
+generation, so the exception is gone and INV-07's original "no exceptions"
+wording is literally true again.
 
 **Enforced by.** `data.preprocess.finalise_trimmed` is the **single
 implementation** of the post-trim ordering (band-limit → loudness). It is
@@ -583,73 +584,67 @@ the `alignment_checked` / `alignment_peak_lag` columns, and the
 
 ---
 
-### INV-17 — One ladder band, applied to every condition including real
+### INV-17 — Full-band archive; the band limit is an ANALYSIS transform
 
-**Rule.** Every primary-ladder condition, **including REAL**, is low-passed to
-`LADDER_FMAX`. The filter runs **after resampling and trimming, before loudness
-normalisation**, so the LUFS target is met on the signal that is actually
-delivered. `LADDER_FMAX` is *derived* — `min(audited fmax)` over the
-constraining primary conditions, read from
-[`docs/mel_configs.md`](docs/mel_configs.md) via
-`invariants.AUDITED_MEL_FMAX` — never written as a literal. It currently
+**Rule.** The archive is **full-band**. Nothing is low-passed at generation.
+
+Band-limiting to `LADDER_FMAX` is an **analysis-time transform**,
+`data.preprocess.band_limit_comparison_set`, applied on request to an entire
+comparison set — **including the real reference** — and never to one member of
+it. `LADDER_FMAX` is *derived*: `min(audited fmax)` over the constraining
+primary conditions, read from [`docs/mel_configs.md`](docs/mel_configs.md) via
+`invariants.AUDITED_MEL_FMAX`, never written as a literal. It currently
 evaluates to **8000.0 Hz**.
 
-**The ladder is fmax-agnostic, and that is a design property worth using.**
-Because every non-exempt condition is low-passed to `LADDER_FMAX` before
-delivery, a condition's native `fmax` no longer reaches any measurement. A
-replacement rung may therefore have *any* native band: Vocos entered the ladder
-at `fmax = 12000` (and 24 kHz, and 100 mel bands) without disturbing anything,
-because `LADDER_FMAX` is `min()` over the audit table and 12000 was never the
-minimum. The only way a substitution moves the ladder band is if it comes in
-*below* the current minimum — a 7600 Hz MelGAN re-source would, and everything
-would then need regenerating. Check the audit table, not intuition.
+**Why (the premise this invariant was built on was false).** The original INV-17
+low-passed at generation because an `fmax = 8000` mel front-end was assumed to
+produce no output above 8 kHz. It does not. **`fmax` constrains the ANALYSIS the
+vocoder consumes, not the synthesis it performs**: a time-domain upsampling
+vocoder emits content across the full band regardless of what the mel carried.
 
-Conditions in `BAND_EXEMPT_CONDITIONS` keep their native band and are excluded
-from the primary correlation. Exemption is declared in three places that are
-cross-checked at import: `VocoderSpec.primary_ladder`,
-`invariants.BAND_EXEMPT_CONDITIONS`, and `registry.CONTROL_CONDITIONS`.
+Measured on 20 LJSpeech files, fraction of energy above 8 kHz:
 
-**Why.** Several conditions ship mel front-ends with `fmax = 8000`
-(`hifigan_v1`, `bigvgan_base`, `bigvgan_112m`; and `specdiff_gan` before it was
-dropped) and therefore emit *exactly zero* energy between 8 kHz and archive
-Nyquist. Real audio at 22.05 kHz carries that
-band. A detector separates real from those conditions on high-band energy alone
-— matched EER goes to ~0 and the Y-axis loses all resolution across the lower
-half of the ladder.
+| condition | >8 kHz fraction | |
+|---|---|---|
+| real | **0.01803** | |
+| BigVGAN | **0.01480** | tracks real per-file |
+| Griffin-Lim | **0.00000** | exactly zero |
 
-The direction is what makes it fatal rather than merely noisy. The confound
-spares exactly the conditions with the *widest* band, so it would manufacture a
-clean positive correlation in the direction of the hypothesis. It is the most
-convincing wrong answer this study can produce, and it would survive every other
-gate.
+Griffin-Lim is the exception, and it is the exception that produced the error.
+It inverts the mel to a linear spectrogram and runs ISTFT, so it genuinely
+cannot exceed `fmax`. **The cliff was measured on Griffin-Lim and generalised by
+config inspection to conditions where it does not hold.**
 
-**The argument depends on PCM_16, and that dependency is not visible in the
-filter spec.** The claim "the residual is absent from the file" holds only
-because every detector input is *read back from a written 16-bit file*. The
-filter's own output is float32 and carries ~1.8e-16 above the band; it is
-quantisation to PCM_16 that raises the floor to ~2e-8 and destroys the
-structure. Traced (2026-09-08): `detectors.protocols.score_condition` is the
-only call site of `Detector.score_batch`, and both its arguments come from
-`data.audio_io.read_processed`, i.e. `soundfile.read` of a written WAV.
-`Detector.fit` receives manifest DataFrames of paths, not arrays. Phase A only
-writes. So the property holds today.
+What the old rule cost: everything above `LADDER_FMAX` in a neural vocoder's
+output is **hallucinated** — the mel carried no information there, so the model
+invented it from its prior. That is the most forensically interesting content on
+the ladder, and generation-time filtering destroyed precisely it.
 
-It is a *contract*, not a coincidence: an adapter that cached Phase A's
-in-memory arrays, or a band-limit ablation wired to Phase A rather than to the
-written files, would hand a detector float32 audio in which the INV-17 residual
-survives at 1.8e-16 and remains structured. Do not do that. If a future path
-needs in-memory audio, quantise it first.
+**This mirrors INV-01.** Archive high, derive low. The reasoning is identical
+and was already written down one invariant earlier: information discarded at
+generation cannot be recovered, while any narrower view can always be derived
+from a wider archive. A band-limited comparison set is derivable from a
+full-band archive; a full-band archive is not recoverable from band-limited
+files. INV-01 applies it to sample rate, INV-17 applies it to bandwidth, and
+INV-17 got it backwards until this was measured.
 
-**Real is filtered too, and that is the whole point.** Band-limiting only the
-vocoded conditions would leave real audio holding a high band the fakes lack —
-the same cliff with the sign flipped, equally learnable, and now dressed up as a
-control. A confound control is only a control when it is applied identically to
-every condition; that is the doctrine the rest of this document already runs on.
+**What did not change.** The filter itself (`band_limit_to_ladder`, zero-phase
+Chebyshev II order 12 / 100 dB), the measured floors, and the gate. They moved
+from generation to analysis; they were not weakened. `check_band_limit` now
+gates the *output of the analysis transform* rather than the archive — the
+archive is full-band and would fail that check on every file, which is the point.
 
-**Ordering is load-bearing.** Filtering *after* loudness normalisation would
-remove energy the meter had already counted, leaving every file under target by
-an amount proportional to its own high-band content — the artifact under study
-leaking straight into the gain. Hence: trim → band-limit → normalise.
+**The real reference is band-limited too, on the same terms.** That has not
+changed either, only when it happens. `band_limit_comparison_set` takes the
+whole set at once and refuses a set with no `real` member, because band-limiting
+only the vocoded conditions leaves real holding a high band they lack — the same
+separable cliff with its sign flipped.
+
+**The argument still depends on PCM_16.** Detector inputs are read back from
+written 16-bit files (`detectors.protocols.score_condition` → `read_processed`),
+which is what destroys the filter's own float32 residual. Unchanged by this
+rewrite, and still a contract rather than a coincidence: do not hand a detector
+in-memory Phase A audio.
 
 **Constants.** `LADDER_FMAX` (derived, 8000.0), `MEASUREMENT_FLOOR = 1e-15`,
 `PCM16_OOB_FLOOR = 2e-8`, `BAND_LIMIT_FLOOR_MARGIN = 50`,
@@ -660,74 +655,67 @@ Zero-phase (`sosfiltfilt`) for two reasons: a causal filter's group delay is
 itself a phase artifact sitting in the band under study, and it would shift the
 condition out of sample alignment with its reference, tripping INV-16.
 
-**Chebyshev Type II, not Butterworth — this mattered more than expected.** An
-identical filter *attenuates* but does not *equalise*. Real audio enters with
-energy above the band and an `fmax = 8000` vocoder enters with none, so whatever
-the filter leaves behind is still a difference between them. Measured on a
+**Chebyshev Type II, not Butterworth.** An identical filter *attenuates* but
+does not *equalise*, so whatever it leaves behind is still a difference between
+two signals that entered with different high-band content. Measured on a
 harmonic-rich 22.05 kHz signal, as a fraction of total energy above the band:
 
 | design | residual | verdict |
 |---|---|---|
-| unfiltered | 1.95e-03 | the confound |
+| unfiltered | 1.95e-03 | |
 | Butterworth order 8 | 2.55e-05 | 4000x the quantisation floor — still separable |
 | Butterworth order 24 | 2.15e-06 | 350x — still separable |
 | **Chebyshev II order 12, 100 dB** | **1.78e-16** | below the floor |
 
 The target is not "small" but **below the noise floor of the delivered format**.
-PCM_16 quantisation at −27 LUFS puts ~2e-9 above the band on its own, so once the
-filter is well under that the residual is *absent from the file*, not merely
-faint. End to end on the synthetic corpus, real and Griffin-Lim land at 5.84e-09
-and 5.71e-09 — 2% apart, both quantisation-dominated. Passband cost: 0.004 dB
-below 7 kHz.
 
-**Measuring the stopband needs a window — a Blackman one specifically.**
-`out_of_band_energy` applies `np.blackman` before the transform. A bare rFFT of
-an off-bin signal leaks across the whole spectrum; measured on an off-bin tone a
-rectangular window floors out at 3.0e-6, above the gate, so a correctly filtered
-file reads as a badly filtered one.
+**Measuring the stopband needs a Blackman window.** Not Blackman-Harris:
+Blackman-Harris minimises the *peak* sidelobe (−92 dB) but has flat asymptotic
+rolloff, while Blackman's peak is worse (−58 dB) and it rolls off at
+−18 dB/octave, which is what matters at this frequency distance. Measured floors
+on an off-bin tone: rectangular 3.0e-06, Blackman-Harris 4.2e-14, Nuttall
+1.5e-12, **Blackman 5.9e-25**.
 
-Not Blackman-Harris, despite the better headline number. Blackman-Harris
-minimises the *peak* sidelobe (−92 dB) but its asymptotic rolloff is flat;
-Blackman's peak is worse (−58 dB) but it rolls off at −18 dB/octave, and the
-cutoff sits far from the dominant low-frequency content, so rolloff is what
-matters. Measured floors on an off-bin tone: rectangular 3.0e-06,
-Blackman-Harris 4.2e-14, Nuttall 1.5e-12, **Blackman 5.9e-25**.
-
-**Three floors sit under any reported figure, and they are different things.**
-Calibration (`TestOutOfBandCalibration`) injects a tone above the cutoff at known
-amplitudes and confirms linear recovery to within 0.1% from −40 dB down to
-−200 dB. What limits a reported number is therefore never the measurement:
+**Three floors sit under any reported figure.** Calibration
+(`TestOutOfBandCalibration`) confirms linear recovery to within 0.1% from −40 dB
+to −200 dB, so the measurement is never the limit:
 
 | floor | value | what it is |
 |---|---|---|
-| measurement | ~1e-22 | Blackman + float64 rFFT. Never the limit. |
-| **float32 storage** | **1.8e-16** | `band_limit_to_ladder` returns float32. `MEASUREMENT_FLOOR` is set from this. |
-| PCM_16 delivery | ~2e-8 | The physically meaningful one; `PCM16_OOB_FLOOR`. |
+| measurement | ~1e-22 | Blackman + float64 rFFT |
+| **float32 storage** | **1.8e-16** | `band_limit_to_ladder` returns float32; `MEASUREMENT_FLOOR` is set from this |
+| PCM_16 delivery | ~2e-8 | the physically meaningful one; `PCM16_OOB_FLOOR` |
 
-The float32 figure is what the earlier "Chebyshev leaves 1.78e-16" number
-actually measured — converting that array to float64 reproduces it exactly,
-which is how we know it is storage and not signal. The filter is *at least* that
-good; how much better is unknowable from a float32 array. `format_oob()` renders
-anything at or below `MEASUREMENT_FLOOR` as "below measurement floor" rather
-than quoting a number, because quoting one implies a characterisation that was
-never performed.
+`format_oob()` renders anything at or below `MEASUREMENT_FLOOR` as "below
+measurement floor" rather than quoting a number.
 
-`MEASUREMENT_FLOOR` is deliberately **not** the gate threshold: delivered files
-sit seven orders of magnitude above it, so gating there would fail everything.
-The gate is derived instead —
-`BAND_LIMIT_MAX_STOPBAND_ENERGY = PCM16_OOB_FLOOR × BAND_LIMIT_FLOOR_MARGIN` —
-anchored on a measured delivery floor rather than on a chosen literal.
+**Correlation exclusions.** `invariants.CORRELATION_EXCLUDED` maps each excluded
+condition to *why*, and `spearman_headline` refuses a frame containing one,
+quoting the reason. Excluded conditions are generated, measured and **reported**
+like any other; what they are not is comparable on the headline axis.
 
-**Enforced by.** `data.preprocess.band_limit_to_ladder` (the only sanctioned
-filter), `data.invariants.check_band_limit` (per-file gate on residual
-out-of-band energy), `data.manifest._validate_band` (one cutoff and one filter
-spec across every non-exempt condition; exemption flags must match the code),
-`detectors.protocols.spearman_headline` (**refuses** a frame containing an
-exempt condition), `data.manifest.primary_ladder_frame`,
-`vocoders.registry` import-time cross-check.
+| condition | reason |
+|---|---|
+| `griffin_lim` | **floor reference.** Structurally cannot emit above its mel fmax (ISTFT of an inverted mel), measured 0.00000. Its detectability is a bandwidth artifact, not a reconstruction artifact, and at the low-quality end of the ladder it would anchor a strong positive Spearman for a reason unrelated to the hypothesis. |
+| `bigvgan_v2_22khz_fullband` | **paired control.** Differs from `bigvgan_112m` in training mel fmax alone, which is the variable it exists to isolate. |
 
-**Manifest columns.** `band_limit_hz`, `band_filter`, `band_exempt`,
-`band_oob_energy`.
+**`melgan_fullband` was removed.** It was the same checkpoint as `melgan`
+differing only in whether the generation-time filter ran. With a full-band
+archive the two produce byte-identical audio, so it became a duplicate
+condition. The contrast it gave is now an analysis choice on `melgan` itself.
+
+**Enforced by.** `data.preprocess.band_limit_comparison_set` (the only
+sanctioned way to band-limit; refuses a set without `real`),
+`data.preprocess.band_limit_to_ladder` (the filter),
+`data.invariants.check_band_limit` (gates the transform's output),
+`data.manifest._validate_band` (**asserts the archive is full-band** — the
+inverse of what it used to assert), `detectors.protocols.spearman_headline`
+(refuses a `CORRELATION_EXCLUDED` condition, with the reason),
+`data.manifest.primary_ladder_frame`, `vocoders.registry` import-time
+cross-check.
+
+**Manifest columns.** `archive_band_hz`, `archive_band` (always `full_band`),
+`high_band_fraction` (measured per file — evidence, not a gate).
 
 ---
 
@@ -735,9 +723,12 @@ exempt condition), `data.manifest.primary_ladder_frame`,
 
 These are stated rather than reconciled away.
 
-**INV-10 (no post-processing) — genuine contradiction of the letter.** INV-10
-forbids "denoising, EQ, peak limiting" on vocoder output. A low-pass filter is
-EQ. INV-17 does exactly what INV-10 prohibits.
+**INV-10 (no post-processing) — RESOLVED, largely for the same reason.** INV-10
+forbids "denoising, EQ, peak limiting" on vocoder output, and a low-pass filter
+is EQ, so the generation-time INV-17 did exactly what INV-10 prohibited. With
+the band limit moved to analysis time, no filter touches the archive at all and
+the contradiction is gone. The scoping below is kept because it still applies to
+the pipeline steps that *do* run at generation (resample, trim, loudness).
 
 The rationales do not conflict — INV-10 exists because *"post-processing is a
 filter applied to one condition and not others"*, and INV-17 is applied to all
@@ -750,30 +741,29 @@ loudness normalisation, none of which INV-10 was ever read as forbidding.
 The test is not "is it a filter?" but "does any condition get something the
 others do not?". Adapters still return raw generator output.
 
-**INV-07 (fixed pipeline order) — genuine contradiction, narrowly.** INV-07 says
-"same order, every condition, **no exceptions**". Band-exempt conditions skip the
-`band_limit` step, so they run a different pipeline. That is a real exception and
-INV-07 as written forbids it.
+**INV-07 (fixed pipeline order) — RESOLVED, the conflict is gone.** It used to
+be real: band-exempt conditions skipped the generation-time `band_limit` step, so
+they ran a different pipeline than INV-07's "no exceptions" allowed.
 
-Resolution: INV-07's guarantee is scoped to **a comparison set**, not to the
-repository. Every condition compared against another in the headline number runs
-`PIPELINE_ORDER`; exempt conditions run `PIPELINE_ORDER_BAND_EXEMPT` and are
-never pooled with the ladder. Both tuples are declared in `invariants.py` so the
-difference is exactly one step and visible in code. Any *further* divergence
-between them is a bug.
+Moving the band limit to analysis time removed the exception rather than scoping
+around it. Every condition now runs the identical `PIPELINE_ORDER`. This is worth
+noting as a general shape: the INV-07 conflict was a *symptom* of INV-17 doing
+its work in the wrong place, and it disappeared when that was fixed rather than
+needing its own resolution.
 
 **INV-02 (mel config) — no contradiction, but its scope shrinks.** INV-02 governs
 the **input** to the vocoder; INV-17 governs the **output** of the pipeline. No
 model is taken out of distribution: each vocoder still analyses with its own mel.
 
-But the Step-1 audit changed what INV-02 is actually about. Every ladder config
-turned out numerically identical — n_fft 1024, hop 256, win 1024, 80 mels,
-fmin 0, 22050 Hz — differing *only* in `fmax`, and INV-17 now stops that
-difference reaching the measurement. What remains is **implementation**
-difference, not parameter difference: MelGAN's `Audio2Mel` differs from
-HiFi-GAN's `mel_spectrogram` in windowing and log convention. That residue is
-real and still belongs in the limitations section, but "each vocoder uses a
-different front-end" is no longer an accurate description of this ladder.
+The `fmax` difference between configs no longer reaches the delivered archive
+either — but not because it is filtered away. It never constrained the synthesis
+in the first place, except for Griffin-Lim. What `fmax` *does* determine is the
+frequency above which a condition's output is invented rather than reconstructed,
+which is now measured directly by `metrics.spectral.high_band_distance` rather
+than assumed away.
+
+Vocos also re-widens INV-02: 24 kHz, 100 mel bands, `fmax` 12000, unlike the
+five conditions that share 1024/256/1024 at 80 bands.
 
 ---
 
@@ -906,6 +896,19 @@ nudge a pipeline toward a preferred answer.
 
   </details>
 
+- **RESOLVED — INV-17 rebuilt on a measured premise.** The original invariant
+  band-limited at generation because an `fmax = 8000` front-end was assumed to
+  emit nothing above 8 kHz. Measured on 20 LJSpeech files that is false for every
+  condition except Griffin-Lim (real 0.01803, BigVGAN 0.01480, Griffin-Lim
+  0.00000). The archive is now full-band and band-limiting is an analysis-time
+  transform. `griffin_lim` became a floor reference, excluded from the headline
+  correlation; `melgan_fullband` was deleted as a duplicate. `LADDER_FMAX` is
+  unchanged at 8000. Evidence in [`docs/mel_configs.md`](docs/mel_configs.md).
+
+- **Regenerate every condition.** The archive changed meaning: files produced
+  under the old INV-17 are band-limited at 8 kHz and cannot be reused. Nothing
+  generated before this change is valid.
+
 - **MelGAN is the band outlier, not the laggard.** The audit found
   `descriptinc/melgan-neurips` uses `mel_fmax=None` → 11025 Hz, so MelGAN is the
   *widest*-band primary condition. If it is ever re-sourced from a
@@ -939,15 +942,15 @@ nudge a pipeline toward a preferred answer.
   a test asserting regeneration is a no-op. Do not hand-edit inside a marked
   block afterwards — that is the failure mode returning by another route.
 
-- **`hifigan_v1`, `melgan` and `melgan_fullband` remain unpinned (INV-08).**
+- **`hifigan_v1` and `melgan` remain unpinned (INV-08).**
   Neither checkpoint is on HuggingFace, so no revision SHA exists. The
   verification mechanism is implemented
   (`vocoders.checkpoints.fetch_and_verify`); what is missing is the digests
   themselves, which can only be computed by whoever first downloads the weights.
   Run once with `allow_first_use=True`, paste the printed value into the spec,
   and commit it. `btpvf audit` reports all three blocked until then.
-  `melgan` and `melgan_fullband` must record the *same* digest — they are the
-  same file, and the pair stops being a controlled contrast otherwise.
+  (`melgan_fullband` was removed, so the two-digests-must-match note no longer
+  applies.)
 
 - **Alignment probes not yet run.** No vocoder has an INV-16 record, so no
   vocoder condition can pass the manifest gate. The probe runs automatically on

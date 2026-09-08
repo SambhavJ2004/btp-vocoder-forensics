@@ -28,7 +28,7 @@ from data.invariants import (
     TIER_RATES,
     TIERS,
     InvariantViolation,
-    is_band_exempt,
+    is_correlation_excluded,
 )
 from data.manifest import select_tier
 from detectors.eer import compute_eer
@@ -142,13 +142,17 @@ def bandwidth_probe(
 def _verdict(probe: str, condition: str, eer: float, tier: str) -> dict[str, object]:
     """One probe result.
 
-    A band-exempt condition (INV-17) differs from real in bandwidth *by design*,
-    so the bandwidth probe is expected to separate it. That is not a leak, and
-    marking it as one would train the team to ignore the column. It is reported
-    as ``expected`` instead, which is visible without being a blocker.
+    Two conditions are expected to separate on bandwidth *by design*, and
+    flagging them as leaks would train the team to ignore the column:
+    ``griffin_lim`` (structurally cannot emit above its mel fmax) and
+    ``bigvgan_v2_22khz_fullband`` (trained at a wider fmax than the ladder). Both
+    are reported as ``expected_by_design`` instead -- visible, not a blocker.
+
+    Every OTHER condition firing this probe is a genuine finding now that the
+    archive is full-band: a time-domain vocoder should track real in the high
+    band, and one that does not is telling you something.
     """
-    exempt = is_band_exempt(condition)
-    by_design = exempt and probe == "bandwidth_rolloff"
+    by_design = is_correlation_excluded(condition) and probe == "bandwidth_rolloff"
     return {
         "probe": probe,
         "condition": condition,

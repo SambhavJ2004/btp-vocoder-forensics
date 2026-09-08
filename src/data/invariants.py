@@ -83,7 +83,7 @@ LOUDNESS_TOLERANCE_LU: Final[float] = 0.5  # verification tolerance, not a knob
 # which is precisely the artifact under study. See CLAUDE.md INV-01.
 DERIVED_LOUDNESS_DRIFT_LIMIT_LU: Final[float] = 2.0
 
-# --- INV-17  Ladder band -----------------------------------------------------
+# --- INV-17  Analysis band (NOT a generation-time filter) --------------------
 # The audited mel `fmax` of every condition, transcribed from the checkpoint's
 # OWN config. Source for each row: docs/mel_configs.md. This is the single
 # source of truth -- data.mel builds its MelConfig entries from it, so the table
@@ -93,7 +93,6 @@ DERIVED_LOUDNESS_DRIFT_LIMIT_LU: Final[float] = 2.0
 # sr/2, so it is recorded here already resolved, at 22050/2 = 11025.0.
 AUDITED_MEL_FMAX: Final[dict[str, float]] = {
     "melgan": 11_025.0,        # Audio2Mel default mel_fmax=None -> librosa sr/2
-    "melgan_fullband": 11_025.0,  # same checkpoint, exempt from INV-17
     "hifigan_v1": 8_000.0,     # jik876/hifi-gan config_v1.json
     "vocos": 12_000.0,         # torchaudio MelSpectrogram default f_max=sr/2 @24k
     "bigvgan_base": 8_000.0,   # nvidia/bigvgan_base_22khz_80band
@@ -110,10 +109,10 @@ UNAVAILABLE_CONDITIONS: Final[frozenset[str]] = frozenset({"specdiff_gan"})
 
 # Griffin-Lim has no checkpoint: it is analysis/synthesis with no learned prior,
 # so its front-end is a project decision rather than a model property. It is set
-# TO the ladder band and therefore does not constrain it.
+# TO the analysis band and therefore does not constrain it.
 FMAX_FREE_CONDITIONS: Final[frozenset[str]] = frozenset({"griffin_lim"})
 
-# The primary ladder -- the six conditions the headline correlation runs over.
+# The primary ladder -- everything generated as a rung and reported as one.
 PRIMARY_LADDER: Final[tuple[str, ...]] = (
     "griffin_lim",
     "melgan",
@@ -123,12 +122,26 @@ PRIMARY_LADDER: Final[tuple[str, ...]] = (
     "bigvgan_112m",
 )
 
-# Conditions exempt from INV-17 and excluded from the primary correlation. They
-# exist to isolate one variable against a primary-ladder partner, so forcing
-# them into the ladder band would erase the thing they measure.
-BAND_EXEMPT_CONDITIONS: Final[frozenset[str]] = frozenset(
-    {"bigvgan_v2_22khz_fullband", "melgan_fullband"}
-)
+# Conditions that are generated, measured and REPORTED like any other, but are
+# refused by the primary correlation. Two different reasons, both recorded so
+# the refusal message can say which applies -- a bare exclusion set invites
+# someone to delete an entry without knowing what it was protecting.
+CORRELATION_EXCLUDED: Final[dict[str, str]] = {
+    "griffin_lim": (
+        "floor reference. Griffin-Lim inverts the mel to a linear spectrogram "
+        "and runs ISTFT, so it genuinely cannot emit above its mel fmax -- "
+        "measured high-band fraction 0.00000 against real's 0.01803. Its "
+        "detectability is therefore driven by a hard bandwidth zero, not by the "
+        "fine reconstruction artifacts the study is about. Sitting at the "
+        "low-quality end of the ladder it would anchor a strong positive "
+        "Spearman for a reason unrelated to the hypothesis."
+    ),
+    "bigvgan_v2_22khz_fullband": (
+        "paired control. Differs from bigvgan_112m in training mel fmax alone "
+        "(11025 vs 8000), which is the variable it exists to isolate; pooling "
+        "it into the ladder would put that variable into the headline number."
+    ),
+}
 
 
 def _derive_ladder_fmax() -> float:
@@ -153,8 +166,34 @@ def _derive_ladder_fmax() -> float:
 
 LADDER_FMAX: Final[float] = _derive_ladder_fmax()
 
-# Zero-phase Chebyshev Type II, applied identically to every non-exempt
-# condition including REAL.
+# --- INV-17  What the band-limit is FOR --------------------------------------
+# The archive is FULL-BAND. Band-limiting is an ANALYSIS-time transform applied
+# to a comparison set on request, never a generation-time filter.
+#
+# This reverses the original design, which low-passed at generation on the
+# premise that an fmax=8000 mel front-end yields no output above 8000. That
+# premise is FALSE. `fmax` constrains the ANALYSIS the vocoder consumes, not the
+# synthesis it performs: a time-domain upsampling vocoder emits content across
+# the full band regardless of what the mel carried. Measured on 20 LJSpeech
+# files, fraction of energy above 8 kHz:
+#
+#     real           0.01803
+#     BigVGAN        0.01480    tracks real per-file
+#     Griffin-Lim    0.00000    exactly zero
+#
+# Griffin-Lim is the exception, and it is the exception that produced the error:
+# it inverts the mel to a linear spectrogram and runs ISTFT, so it genuinely
+# cannot exceed fmax. The cliff was measured on Griffin-Lim and generalised by
+# config inspection to conditions where it does not hold.
+#
+# What that cost: everything above LADDER_FMAX in a neural vocoder's output is
+# HALLUCINATED -- the mel carried no information there, so the model invented it
+# from its prior. That is the most forensically interesting content on the
+# ladder, and generation-time filtering destroyed exactly it.
+LADDER_FMAX_ROLE: Final[str] = "analysis band, applied on request; archive is full-band"
+
+# Zero-phase Chebyshev Type II, applied identically to every member of a
+# comparison set including REAL, at analysis time.
 #
 # Zero-phase because a causal filter's group delay would put the condition out
 # of sample alignment with its reference and trip INV-16.
@@ -236,9 +275,14 @@ BAND_LIMIT_FLOOR_MARGIN: Final[float] = 50.0
 BAND_LIMIT_MAX_STOPBAND_ENERGY: Final[float] = PCM16_OOB_FLOOR * BAND_LIMIT_FLOOR_MARGIN
 
 
-def is_band_exempt(condition: str) -> bool:
-    """INV-17. True for conditions that keep their full native band."""
-    return condition in BAND_EXEMPT_CONDITIONS
+def is_correlation_excluded(condition: str) -> bool:
+    """INV-17/INV-18. True for conditions reported but kept out of the headline rho."""
+    return condition in CORRELATION_EXCLUDED
+
+
+def exclusion_reason(condition: str) -> str | None:
+    """Why a condition is excluded, for the refusal message. None if included."""
+    return CORRELATION_EXCLUDED.get(condition)
 
 
 # --- INV-07  Pipeline order --------------------------------------------------
@@ -250,16 +294,15 @@ PIPELINE_ORDER: Final[tuple[str, ...]] = (
     "resample_once",       # -> ARCHIVE_SR, mono            (INV-01)
     "align_length",        # -> reference length            (INV-06)
     "apply_ref_trim",      # -> reference trim boundaries   (INV-03)
-    "band_limit",          # -> LADDER_FMAX                 (INV-17)
+    "measure_high_band",   # -> recorded, NOT filtered      (INV-17)
     "normalise_loudness",  # -> LOUDNESS_TARGET_LUFS        (INV-04)
     "encode",              # -> WAV / PCM_16                (INV-05)
 )
 
-# Exempt conditions (INV-17) skip exactly one step and are otherwise identical.
-# They are never compared against the ladder without that being said out loud.
-PIPELINE_ORDER_BAND_EXEMPT: Final[tuple[str, ...]] = tuple(
-    step for step in PIPELINE_ORDER if step != "band_limit"
-)
+# There is no longer a variant pipeline. INV-17 used to low-pass at generation
+# and exempt conditions skipped that step, which made INV-07's "no exceptions"
+# false; moving the band limit to analysis time removed the exception rather
+# than scoping around it. Every condition runs PIPELINE_ORDER exactly.
 
 # The derived tier's only step. Applied to the finished archive file.
 DERIVATION_ORDER: Final[tuple[str, ...]] = (
@@ -513,15 +556,13 @@ def check_band_limit(
     where: str = "unknown",
     cutoff_hz: float = LADDER_FMAX,
 ) -> float:
-    """INV-17 gate. Assert the signal carries no meaningful energy above the band.
+    """INV-17 gate on the output of the ANALYSIS-time band-limit.
 
     Returns the measured out-of-band energy fraction so the caller can record it.
 
-    This is the check that would have caught the original confound: three
-    conditions emitted exactly zero energy between 8 kHz and Nyquist while real
-    audio carried it, which a detector separates on trivially. Applying the same
-    band to every condition -- real included -- removes the cue rather than
-    working around it in the analysis.
+    This gates :func:`data.preprocess.band_limit_comparison_set`, not the
+    archive. The archive is full-band by design and would fail this check on
+    every file -- that is the point of it being full-band.
     """
     measured = out_of_band_energy(wav, sample_rate, cutoff_hz)
     if measured > BAND_LIMIT_MAX_STOPBAND_ENERGY:

@@ -6,8 +6,13 @@ Nothing here is from a paper or from memory. Fetched 2026-09-07, Vocos added
 2026-09-08.
 
 This table is the authority for `LADDER_FMAX` (INV-17) and for the `MelConfig`
-entries in [`src/data/mel.py`](../src/data/mel.py). If a row changes, the ladder
-band changes, and every condition is regenerated.
+entries in [`src/data/mel.py`](../src/data/mel.py). If a row changes, the
+analysis band changes.
+
+**`fmax` here is what each model was TOLD, not what it EMITS.** Those differ for
+every condition except Griffin-Lim — see *Measured bandwidth* below, which
+overturned the original INV-17. Do not reason from this table to a claim about
+generated audio without measuring.
 
 ## The table
 
@@ -19,8 +24,7 @@ band changes, and every condition is regenerated.
 | `vocos` | ladder | 1024 | 256 | 1024\* | **100** | 0.0\* | `None` → **12000**\* | **24000** | VERIFIED |
 | `bigvgan_base` | ladder | 1024 | 256 | 1024 | 80 | 0 | **8000** | 22050 | VERIFIED |
 | `bigvgan_112m` | ladder | 1024 | 256 | 1024 | 80 | 0 | **8000** | 22050 | VERIFIED |
-| `melgan_fullband` | control (exempt) | 1024 | 256 | 1024 | 80 | 0.0 | **11025** | 22050 | VERIFIED |
-| `bigvgan_v2_22khz_fullband` | control (exempt) | 1024 | 256 | 1024 | 80 | 0 | `null` → **11025** | 22050 | VERIFIED |
+| `bigvgan_v2_22khz_fullband` | control | 1024 | 256 | 1024 | 80 | 0 | `null` → **11025** | 22050 | VERIFIED |
 | `specdiff_gan` | **unavailable** | 1024 | 256 | 1024 | 80 | 0 | **8000** | 22050 | config VERIFIED, **weights never released** |
 
 \* Vocos passes none of `win_length`, `f_min` or `f_max` to torchaudio, so the
@@ -31,7 +35,7 @@ library defaults apply: `win_length = n_fft`, `f_min = 0.0`, `f_max = sr/2`.
 | Condition | Source |
 |---|---|
 | `griffin_lim` | No checkpoint exists. Analysis/synthesis with no learned prior, so its front-end is a **project decision, not a model property**. Set to `LADDER_FMAX` so it neither constrains nor escapes the ladder band. |
-| `melgan`, `melgan_fullband` | [`descriptinc/melgan-neurips`](https://github.com/descriptinc/melgan-neurips) → `mel2wav/modules.py`, `Audio2Mel.__init__` defaults. Confirmed against `scripts/train.py`, which instantiates `Audio2Mel(n_mel_channels=args.n_mel_channels)` — only `n_mel_channels` is passed. Both conditions are the **same checkpoint**. |
+| `melgan` | [`descriptinc/melgan-neurips`](https://github.com/descriptinc/melgan-neurips) → `mel2wav/modules.py`, `Audio2Mel.__init__` defaults. Confirmed against `scripts/train.py`, which instantiates `Audio2Mel(n_mel_channels=args.n_mel_channels)` — only `n_mel_channels` is passed. |
 | `hifigan_v1` | [`jik876/hifi-gan`](https://github.com/jik876/hifi-gan) → `config_v1.json` |
 | `vocos` | [`charactr/vocos-mel-24khz`](https://huggingface.co/charactr/vocos-mel-24khz) → `config.yaml` (`sample_rate: 24000, n_fft: 1024, hop_length: 256, n_mels: 100, padding: center`), plus [`gemelo-ai/vocos`](https://github.com/gemelo-ai/vocos) → `vocos/feature_extractors.py`, `MelSpectrogramFeatures`, which constructs `torchaudio.transforms.MelSpectrogram` **without** `f_min` or `f_max`. |
 | `bigvgan_base` | [`nvidia/bigvgan_base_22khz_80band`](https://huggingface.co/nvidia/bigvgan_base_22khz_80band) → `config.json` |
@@ -71,6 +75,72 @@ took the rung. The row stays here so the substitution is an auditable decision
 rather than an unexplained gap, and so Vocos can be compared against what it
 replaced.
 
+## Measured bandwidth — generated audio, not config
+
+**Everything above this section is config-derived. This section is measured, and
+where the two disagree the measurement wins.**
+
+20 LJSpeech files, resynthesized, fraction of total energy above 8 kHz:
+
+| condition | >8 kHz fraction | reads as |
+|---|---|---|
+| real | **0.01803** | the reference |
+| BigVGAN | **0.01480** | tracks real per-file; ~82% of real's high-band energy |
+| Griffin-Lim | **0.00000** | exactly zero — a structural bandwidth cliff |
+
+### What this overturned
+
+INV-17 originally low-passed every condition at generation, on the config-derived
+premise that an `fmax = 8000` mel front-end yields no output above 8 kHz.
+**That premise is false.** `fmax` constrains the *analysis* a vocoder consumes,
+not the *synthesis* it performs: a time-domain upsampling vocoder produces
+content across the full band whatever the mel carried. BigVGAN has `fmax = 8000`
+and emits 0.01480 above 8 kHz.
+
+Griffin-Lim is the sole exception and the source of the error. It inverts the mel
+to a linear spectrogram and runs ISTFT, so it structurally cannot exceed `fmax`.
+The cliff was measured on Griffin-Lim, then generalised by reading configs to
+conditions where it does not hold.
+
+### The rule this produces
+
+**A config-derived bandwidth expectation must be validated against generated
+audio before anything is built on it.** Reading `fmax` from a config tells you
+what the model was *told*. It does not tell you what the model *emits*, and for
+every condition in this ladder except Griffin-Lim those are different things.
+
+The failure was expensive in a specific way: the band that was filtered away is
+the band above `LADDER_FMAX`, where the mel carried nothing and the vocoder's
+output is therefore *hallucinated*. That is the most forensically interesting
+content the archive holds, and it was discarded to remove a cliff that only one
+condition actually had.
+
+Concretely, before relying on a bandwidth claim:
+
+1. Generate audio from the condition.
+2. Measure the energy fraction above the band in question
+   (`data.invariants.out_of_band_energy`).
+3. Compare against real on the same utterances, per file, not in aggregate —
+   BigVGAN tracking real *per file* is stronger evidence than a matching mean.
+4. Only a synthesis method that reconstructs through an inverse transform of the
+   mel itself (Griffin-Lim, and any future ISTFT-style condition) should be
+   expected to show a hard zero.
+
+### Where the numbers are used
+
+`griffin_lim`'s zero is why it is a **floor reference** rather than a ladder rung
+in the correlation (`invariants.CORRELATION_EXCLUDED`): its detectability is
+driven by a bandwidth cliff, not by the fine reconstruction artifacts the study
+is about.
+
+`metrics.spectral.high_band_distance` exists because BigVGAN's 0.01480 answers
+only *how much* high-band energy there is. Whether the **content** is right is a
+separate and better question — right amount with wrong structure is a strong
+detection cue that an energy fraction cannot see.
+
+Phase A records `high_band_fraction` per file in the manifest, so this
+measurement is regenerated with every dataset rather than living only here.
+
 ## Derived value
 
 ```
@@ -82,9 +152,19 @@ LADDER_FMAX = min(fmax over constraining primary-ladder conditions)
 Excluded from the `min`:
 - `griffin_lim` — front-end is ours to choose; set *to* the result.
 - `specdiff_gan` — unavailable, never generated.
-- `melgan_fullband`, `bigvgan_v2_22khz_fullband` — INV-17 exempt by design;
-  including them would drag the band to 11025 and reinstate the cliff they exist
-  to measure.
+- `bigvgan_v2_22khz_fullband` — a paired control whose wider fmax is the variable
+  it exists to isolate.
+
+**`LADDER_FMAX` did not move** when Griffin-Lim was reclassified as a floor
+reference: it was already excluded from the `min` as an fmax-free condition, so
+the value is unchanged at 8000.0.
+
+**What `LADDER_FMAX` now means.** It is no longer a delivery cutoff — the archive
+is full-band. It is the **analysis band**: the frequency above which at least one
+ladder condition had no mel information, so anything it emits above that is
+invented. That makes it the natural boundary for
+`metrics.spectral.high_band_distance` and the natural centre for the
+band-limited sweep.
 
 Implemented as `data.invariants._derive_ladder_fmax()`, reading
 `AUDITED_MEL_FMAX` — which is this table, transcribed. Change a row here and the
@@ -108,7 +188,7 @@ changes nothing — and removing all three moves the band by 3 kHz.
 | `bigvgan_112m` | **8000** | **yes — tied at the minimum** |
 | `melgan` | 11025 | no — 3025 Hz of headroom |
 | `vocos` | 12000 | no — 4000 Hz of headroom |
-| `griffin_lim` | *follows* | no — set *to* the result |
+| `griffin_lim` | *follows* | no — set *to* the result (and now a floor reference, excluded from the correlation) |
 
 What the band would become if the tied conditions were removed:
 
@@ -155,7 +235,6 @@ after download, compared on every subsequent load, raises on mismatch.
 |---|---|---|
 | `hifigan_v1` | `jik876/hifi-gan` LJ_V1 (Google Drive) | *not yet recorded* |
 | `melgan` | `descriptinc/melgan-neurips` (torch.hub) | *not yet recorded* |
-| `melgan_fullband` | same file as `melgan` | *must match `melgan`* |
 
 To record one: run `vocoders.checkpoints.fetch_and_verify(path, spec,
 allow_first_use=True)` once, paste the printed digest into the spec's
