@@ -80,17 +80,32 @@ Construct a dataset in which **vocoder identity is the only free variable**.
 
 - **Source corpus:** LJSpeech subset (~3,000 utterances), extended to VCTK for speaker diversity if time allows.
 - **Method:** resynthesis, not text-to-speech. Real audio → mel-spectrogram → vocoder → waveform. This preserves content, speaker and prosody across conditions, and provides a paired reference that enables intrusive quality metrics.
-- **Vocoder ladder (approx. worst to best):** Griffin-Lim, MelGAN, HiFi-GAN v1, SpecDiff-GAN, BigVGAN-base, BigVGAN (112M).
+- **Vocoder ladder (approx. worst to best):** Griffin-Lim, MelGAN, HiFi-GAN v1, Vocos, BigVGAN-base, BigVGAN v2 (112M, fmax 8k). Six rungs. Vocos replaces SpecDiff-GAN, whose weights were never publicly released; it keeps the rung's purpose (a non-GAN generative mechanism — Vocos predicts STFT coefficients and reconstructs by inverse FFT) and is revision-pinned. SpecDiff-GAN stays in the audit trail as a declared-but-unavailable condition.
+- **Two paired controls — not rungs.** Both are exempt from the ladder band and excluded from the headline correlation. They exist to isolate bandwidth, and they do it in two different ways that must not be pooled:
+  - **BigVGAN v2 (112M, full band).** A *separately trained* checkpoint, identical to the top rung in architecture, parameter count and recipe, differing in mel `fmax` alone (11025 vs 8000). Isolates what a generator **trained** to produce the high band does differently from one that was not.
+  - **MelGAN (full band).** The *same checkpoint* as the MelGAN rung, delivered without the ladder band. Isolates only what the delivery filter removes — the band-limited ablation at a single cutoff, on a second architecture. Weaker as a mechanism claim; its value is that the high-band argument no longer rests on one model.
+- **Ladder band — every condition, including real, is low-passed to 8 kHz.** A mel front-end audit ([`docs/mel_configs.md`](docs/mel_configs.md)) found that the released checkpoints do not share a bandwidth: `hifigan_v1`, `specdiff_gan` and `bigvgan_base` use `fmax = 8000` and emit *no* energy above it, while MelGAN (`fmax = None` → 11025) and real audio do. A detector separates those conditions from real on high-band energy alone, which would drive matched EER to ~0 across the lower ladder while sparing the widest-band conditions — manufacturing a clean positive correlation in exactly the direction of our hypothesis.
+
+  The band is therefore equalised **in the data**: `LADDER_FMAX = min(audited fmax) = 8000 Hz`, derived from the audit table rather than chosen, and applied identically to every condition **including the real reference**. Filtering only the vocoded conditions would leave real holding a high band the fakes lack — the same cliff with the sign flipped. The filter runs after trimming and before loudness normalisation, so the loudness target is met on the delivered signal.
+- **Delivery:** two artifacts per utterance, not one.
+  - **Archive — 22.05 kHz mono, primary.** Set by LJSpeech's native rate, so the real condition and most vocoders pass through no resampling filter at all. Nyquist is 11.025 kHz, which keeps the high-frequency band the mechanism argument depends on. Every measurement of that band — the band-limited ablation, band-wise spectral error, MCD, F0 — runs here.
+  - **Zero-shot — 16 kHz mono, derived.** One further downsample of the finished archive file. Required because pretrained ASVspoof detectors, PESQ-WB and UTMOS are all defined at 16 kHz and accept nothing else.
+
+  Archive high, derive low, never the reverse: deriving the 16 kHz set from source instead of from the archive would create two independent resampling paths whose filter imprints differ, and the two tiers would no longer be the same audio. Each artifact is exactly one filtering step from its parent.
+
+  The consequence is worth stating plainly, because it shapes how the results read: the matched protocol is measured on more signal than the mismatched one, and UTMOS and PESQ are blind above 8 kHz. The gap between the two protocols therefore has two causes — the deployed detector's blind spot and bandwidth — and the headline correlation relates a band-limited quality estimate to a full-band detectability estimate.
 
 **Confound controls.** These are invariants, not preferences. Violating any one of them silently invalidates the study.
 
 | Confound | Control |
 |---|---|
-| Sample-rate mismatch | Resample every output to 16 kHz mono, exactly once. Never resample twice. |
+| Sample-rate mismatch | Archive every output at 22.05 kHz mono, resampled exactly once from the vocoder's native rate. The 16 kHz zero-shot set is a separate derived artifact, one further downsample from the archive and never from source. Two derivations, each single-step; never chain. |
 | Mel configuration differences | Cannot be fully eliminated across vocoders; document per-condition and discuss as a limitation. |
 | Silence duration | Prior work on ASVspoof 2019 LA showed detectors partially keying on leading/trailing silence rather than spoofing artifacts. Apply identical trimming to real and resynthesized audio. |
 | Loudness | Identical normalisation target across all conditions. |
 | Encoding | Identical format and bit depth throughout. |
+| Bandwidth | Released checkpoints differ in mel `fmax` (8000, 11025, 12000), so some conditions emit no energy above 8 kHz while real audio does — separable on high-band energy alone, and biased in the direction of the hypothesis. Low-pass every condition, **real included**, to `LADDER_FMAX = min(audited fmax) = 8000 Hz`, derived from a checkpoint audit rather than chosen. The filter is Chebyshev Type II, not Butterworth: an identical filter attenuates but does not *equalise*, and Butterworth leaves a residual well above the 16-bit noise floor that a detector could still key on. Two exempt paired controls are excluded from the headline correlation. |
+| Vocoder time offset | Reference-derived trim spans assume the vocoder is sample-aligned with its input. Cross-correlate real against resynthesized over 20 files per condition at onboarding; peak lag must be zero. A fixed delay would depress quality scores and hand the detector a trivial cue at the same time — moving both axes in the direction that manufactures the result. |
 
 ### Phase B — Independent measurement of both axes
 
@@ -120,7 +135,13 @@ Conflating these two is a recurring weakness in the literature. Separating them 
 | Strong positive correlation | Quality and detectability are coupled. The field's assumption holds, and we have quantified the exchange rate. |
 | Weak or absent correlation | The two are orthogonal. Perceptual optimisation and forensic evasion are independent objectives, implying an undetectable vocoder need not be a high-quality one. |
 
-**Mechanism ablation — band-limited detection.** Apply low-pass filtering at varying cutoffs, retrain the detector on each band-limited variant, and identify where detection performance collapses. If detection of an older vocoder degrades sharply once content above ~8 kHz is removed while BigVGAN detection is unaffected, the artifact is localised to the high band and the anti-aliasing effect is demonstrated directly. This converts a correlation into a mechanism.
+**Mechanism ablation — band-limited detection.** Apply low-pass filtering at varying cutoffs, retrain the detector on each band-limited variant, and identify where detection performance collapses. Retraining at every cutoff is what makes this an ablation rather than a domain-shift measurement: evaluating an unmodified detector on filtered audio would show a collapse for every condition regardless of mechanism.
+
+This runs on the **22.05 kHz archive**, and within the ladder band. Because every condition is delivered low-passed to `LADDER_FMAX = 8 kHz`, the sweep runs from 1 kHz up to that ceiling and no further: above it there is nothing left to remove, and a cutoff there would just duplicate the full-band point under a different label. The ladder band costs the ablation its upper range and buys back the guarantee that the sweep measures the same thing on every condition, which it could not when the conditions differed in bandwidth.
+
+The question the sweep can therefore no longer ask — what happens *above* 8 kHz — is what the paired controls answer. The band-limited sweep varies a filter over a fixed generator; the paired BigVGAN checkpoints vary the generator's own *training* band with the filter held fixed. The MelGAN pair sits between the two: one checkpoint, delivered filtered and unfiltered, which is the sweep at a single cutoff on a second architecture.
+
+If detection of an older vocoder degrades sharply once content above ~8 kHz is removed while BigVGAN detection is unaffected, the artifact is localised to the high band and the anti-aliasing effect is demonstrated directly. This converts a correlation into a mechanism.
 
 ### Phase C — Source tracing (extension)
 
@@ -137,6 +158,11 @@ Not in a new detector and not in a new vocoder. The contribution is **experiment
 1. Paired resynthesis enabling intrusive quality metrics and detectability on identical content.
 2. Clean separation of matched and mismatched detection protocols.
 3. A band-limited ablation that identifies the artifact mechanism rather than stopping at correlation.
+4. **A paired-checkpoint bandwidth control.** NVIDIA released BigVGAN v2 at 22 kHz in two bandwidths — `bigvgan_v2_22khz_80band_fmax8k_256x` and `bigvgan_v2_22khz_80band_256x` — identical in architecture, parameter count and training recipe, differing in mel `fmax` alone. Running both turns bandwidth into a manipulated variable rather than a nuisance one. A second, weaker pair (MelGAN delivered with and without the ladder band) replicates the contrast on another architecture, so the mechanism claim does not rest on a single model.
+
+   This answers a question the band-limited ablation cannot. The ablation sweeps a filter over a *fixed* generator, so it shows where in the spectrum a detector's evidence lies. The paired checkpoints vary the *generator's own* band with the filter held fixed, so they show whether a vocoder that was never trained to produce the high band is easier or harder to catch than one that was. Those come apart precisely when the artifact is created by the synthesis of the high band rather than merely located there — which is the mechanism BigVGAN's anti-aliasing is supposed to address.
+
+   The control is only available because the two checkpoints exist as a matched pair; it is not a comparison we could have constructed ourselves.
 
 Every claim traces back to a controlled comparison, which is what makes it defensible under examination.
 

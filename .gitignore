@@ -1,0 +1,97 @@
+# ---------------------------------------------------------------------------
+# Credentials and secrets — NEVER commit. See CLAUDE.md.
+# ---------------------------------------------------------------------------
+kaggle.json
+.kaggle/
+**/kaggle.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+.netrc
+credentials.json
+client_secret*.json
+service-account*.json
+*service_account*.json
+.huggingface/
+huggingface_token*
+hf_token*
+.wandb/
+wandb/
+secrets.yaml
+secrets.yml
+secrets/
+.aws/
+.gcloud/
+*.token
+
+# ---------------------------------------------------------------------------
+# Data, checkpoints, generated audio — large and reproducible, keep out of git.
+# Datasets are published as Kaggle Datasets; manifests (small) ARE committed.
+#
+# These are anchored with a leading slash on purpose: an unanchored "data/"
+# also matches src/data/, which would silently exclude Person A's package.
+# ---------------------------------------------------------------------------
+/data/
+/datasets/
+/corpora/
+/checkpoints/
+/ckpt/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.onnx
+*.tar.gz
+*.zip
+*.wav
+*.flac
+*.mp3
+*.npy
+*.npz
+!tests/fixtures/**/*.wav
+
+# Run outputs (anchored, same reason as above)
+/runs/
+/outputs/
+/results/
+/logs/
+/lightning_logs/
+/tensorboard/
+*.log
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

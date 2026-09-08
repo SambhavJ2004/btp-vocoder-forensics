@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "btp-vocoder-forensics"
+version = "0.1.0"
+description = "Does better-sounding mean harder-to-detect? Controlled measurement of vocoder perceptual quality against forensic detectability."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "BTP Team, Netaji Subhas University of Technology" }]
+keywords = ["audio-deepfake", "vocoder", "anti-spoofing", "asvspoof", "forensics"]
+
+# Kept deliberately small. Vocoder checkpoints have conflicting dependency
+# trees (see CLAUDE.md, INV-13) and are NEVER installed into this environment;
+# each runs in its own isolated Kaggle session and writes audio to a Dataset.
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "soundfile>=0.12",       # libsndfile bindings: the only sanctioned audio writer
+  "librosa>=0.10",
+  "pyloudnorm>=0.1.1",     # ITU-R BS.1770 loudness, INV-04
+  "pandas>=2.0",
+  "pyyaml>=6.0",
+  "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+quality = [                # Person B — X-axis
+  "pesq>=0.0.4",
+  "torch>=2.1",
+  "torchaudio>=2.1",
+  "pyworld>=0.3",          # F0 / periodicity
+]
+detect = [                 # Person C — Y-axis
+  "torch>=2.1",
+  "torchaudio>=2.1",
+  "scikit-learn>=1.3",
+]
+analysis = [
+  "matplotlib>=3.7",
+  "seaborn>=0.13",
+]
+dev = [
+  "pytest>=7.4",
+  "ruff>=0.4",
+]
+
+[project.scripts]
+btpvf = "experiments.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
