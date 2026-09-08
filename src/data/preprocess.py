@@ -19,10 +19,13 @@ Two design points that are easy to get wrong:
    whose filter imprints differ, and the 16 kHz set would no longer be the same
    audio as the archive set.
 
-3. Band-limiting to LADDER_FMAX (INV-17) is applied to REAL as well as to every
-   vocoded condition. Band-limiting only the fakes would leave real audio
-   holding a high band the fakes lack, which is the same cliff with the sign
-   flipped -- and a detector separates on it just as easily either way.
+3. The archive is FULL-BAND. Band-limiting to LADDER_FMAX (INV-17) is an
+   ANALYSIS-time transform -- :func:`band_limit_comparison_set` -- applied to a
+   comparison set on request, and applied to REAL on exactly the same terms as
+   every vocoded member of that set. It is never applied at generation, because
+   information discarded there cannot be recovered, and the content above
+   LADDER_FMAX is hallucinated by the vocoder and therefore the most
+   forensically interesting content the archive holds.
 
 4. The post-trim ordering (INV-07) has exactly ONE implementation,
    :func:`finalise_trimmed`, behind two thin entry points --
@@ -42,7 +45,6 @@ import pyloudnorm as pyln
 from .invariants import (
     ARCHIVE_SR,
     BAND_LIMIT_FILTER_ORDER,
-    BAND_LIMIT_FILTER_SPEC,
     BAND_LIMIT_STOPBAND_DB,
     LADDER_FMAX,
     LOUDNESS_TARGET_LUFS,
@@ -57,7 +59,7 @@ from .invariants import (
     InvariantViolation,
     check_band_limit,
     check_derived_loudness,
-    is_band_exempt,
+    out_of_band_energy,
 )
 
 
@@ -143,7 +145,13 @@ def derive_zeroshot(
 def band_limit_to_ladder(
     wav: np.ndarray, *, sr: int = ARCHIVE_SR, cutoff_hz: float = LADDER_FMAX
 ) -> np.ndarray:
-    """INV-17. Low-pass to the ladder band, identically for every condition.
+    """INV-17. Low-pass one signal to the analysis band.
+
+    **Analysis-time only.** Nothing in Phase A calls this; the archive is
+    full-band. Reach it through :func:`band_limit_comparison_set`, which applies
+    it to every member of a comparison set at once -- including real -- so that
+    a caller cannot band-limit half a comparison and produce the same cliff with
+    the sign flipped.
 
     Zero-phase (filtfilt) for two reasons. A causal filter imposes a
     frequency-dependent group delay, which is itself a phase artifact sitting in
@@ -165,8 +173,6 @@ def band_limit_to_ladder(
     That costs a sliver of the 7-8 kHz region, identically for every condition,
     which is the trade the invariant is making.
 
-    Applied to REAL and to every non-exempt vocoded condition alike, so it is a
-    property of the dataset rather than of any one condition.
     """
     from scipy.signal import cheby2, sosfiltfilt
 
@@ -183,6 +189,43 @@ def band_limit_to_ladder(
         output="sos",
     )
     return sosfiltfilt(sos, wav).astype(np.float32)
+
+
+def band_limit_comparison_set(
+    wavs: dict[str, np.ndarray],
+    *,
+    sr: int = ARCHIVE_SR,
+    cutoff_hz: float = LADDER_FMAX,
+    verify: bool = True,
+) -> dict[str, np.ndarray]:
+    """INV-17. Band-limit an entire comparison set to the analysis band.
+
+    ``wavs`` maps condition name -> waveform, and MUST include the real
+    reference: band-limiting only the vocoded members leaves real holding a high
+    band the others lack, which is the original cliff with its sign flipped and
+    exactly as learnable. Taking the whole set at once is what makes that
+    mistake awkward to write.
+
+    Returns a new mapping; the inputs are not modified. Each output is gated by
+    :func:`data.invariants.check_band_limit` unless ``verify`` is off.
+
+    This is the transform the band-limited ablation and any like-for-like
+    comparison run through. It replaces the generation-time filter that INV-17
+    used to apply -- see the invariant for why that was wrong.
+    """
+    if REAL_CONDITION not in wavs:
+        raise InvariantViolation(
+            f"INV-17: the comparison set has no '{REAL_CONDITION}' member. "
+            "Band-limiting only the vocoded conditions leaves real with a high "
+            "band they lack -- the same separable cliff, sign flipped."
+        )
+    out: dict[str, np.ndarray] = {}
+    for name, wav in wavs.items():
+        limited = band_limit_to_ladder(wav, sr=sr, cutoff_hz=cutoff_hz)
+        if verify:
+            check_band_limit(limited, sr, where=f"{name} (analysis band)", cutoff_hz=cutoff_hz)
+        out[name] = limited
+    return out
 
 
 def derive_trim_span(ref_wav: np.ndarray, utt_id: str) -> TrimSpan:
@@ -268,7 +311,7 @@ def finalise_trimmed(
     """INV-07. The **single** implementation of the post-trim ordering.
 
     Steps, in this order and no other:
-      band_limit (INV-17, unless exempt) -> normalise_loudness (INV-04)
+      measure_high_band (INV-17, descriptive) -> normalise_loudness (INV-04)
 
     Every condition reaches this function, and reaches it by the same route.
     That is the whole point: the real reference and the vocoder conditions have
@@ -284,23 +327,20 @@ def finalise_trimmed(
     point; :func:`data.preprocess.finalise_reference` is real's. Equivalence is
     asserted by test, not by prose.
 
-    Band-limiting sits before normalisation so the LUFS target is met on the
-    signal that is actually delivered (INV-17). Filtering afterwards would
-    remove energy the meter had already counted, leaving every file slightly
-    under target by an amount proportional to its own high-band content -- which
-    is the artifact under study leaking into the gain.
+    **No filtering happens here.** The archive is full-band (INV-17); the
+    high-band fraction is *measured* and recorded, not removed. Measuring before
+    normalisation keeps the number comparable across conditions, since gain
+    would otherwise scale it.
 
-    Returns ``(wav, measured_lufs, out_of_band_energy)``. The third value is
-    ``None`` for conditions exempt from INV-17.
+    Returns ``(wav, measured_lufs, high_band_fraction)`` -- the fraction of
+    energy above LADDER_FMAX, which is evidence rather than a gate. Griffin-Lim
+    reads 0.00000 here and real reads ~0.018; that difference is the finding
+    this invariant now records instead of erasing.
     """
     wav = wav_trimmed
-    oob: float | None = None
-    if not is_band_exempt(condition):
-        wav = band_limit_to_ladder(wav, sr=ARCHIVE_SR)
-        oob = check_band_limit(wav, ARCHIVE_SR, where=f"{condition} (archive)")
-
+    high_band = out_of_band_energy(wav, ARCHIVE_SR, LADDER_FMAX)
     wav, measured = normalise_loudness(wav, meter=meter, sr=ARCHIVE_SR)
-    return wav, measured, oob
+    return wav, measured, high_band
 
 
 def finalise_reference(
@@ -348,13 +388,10 @@ def process_condition_output(
     return finalise_trimmed(wav, condition=condition, meter=meter)
 
 
-def band_filter_spec(condition: str) -> tuple[float | None, str]:
-    """What the manifest records for this condition (INV-17).
+def archive_band_spec() -> tuple[float, str]:
+    """What every manifest row records about the archive band (INV-17).
 
-    Exempt conditions record ``(None, "exempt")`` rather than a cutoff, so a
-    reader can tell "kept its full band by design" apart from "was never
-    filtered because someone forgot".
+    One value for every condition, because the archive is full-band for all of
+    them. A row that says anything else means someone filtered at generation.
     """
-    if is_band_exempt(condition):
-        return None, "exempt"
-    return LADDER_FMAX, BAND_LIMIT_FILTER_SPEC
+    return ARCHIVE_SR / 2.0, "full_band"

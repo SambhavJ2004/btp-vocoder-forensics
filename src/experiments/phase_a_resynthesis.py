@@ -22,10 +22,11 @@ Archive high, derive low, never the reverse. The real condition passes through
 the identical treatment at both tiers, which is what makes "identical" true
 rather than aspirational.
 
-Every non-exempt condition -- REAL included -- is low-passed to LADDER_FMAX
-before loudness normalisation (INV-17), so no condition carries a high band the
-others lack. The exempt control condition keeps its native band and is recorded
-as exempt rather than silently unfiltered.
+The archive is FULL-BAND (INV-17). Nothing is low-passed at generation: the
+content above LADDER_FMAX is hallucinated by the vocoder, and it is the most
+forensically interesting content the archive holds. What Phase A does record is
+the measured `high_band_fraction` per file, which is the evidence separating a
+genuine bandwidth zero from a vocoder tracking real.
 
 Each new vocoder is also probed for sample alignment (INV-16) before its
 condition is accepted.
@@ -53,12 +54,13 @@ from data.invariants import (
     ZEROSHOT_SR,
     ZEROSHOT_TIER,
     InvariantViolation,
-    is_band_exempt,
+    exclusion_reason,
+    is_correlation_excluded,
 )
 from data.manifest import ManifestRow, dump_provenance, write_manifest
 from data.preprocess import (
     TrimSpan,
-    band_filter_spec,
+    archive_band_spec,
     derive_trim_span,
     derive_zeroshot,
     finalise_reference,
@@ -117,10 +119,10 @@ def _rows_for(
     checkpoint: str | None = None,
     commit: str | None = None,
     alignment_lag: int | None = None,
-    band_oob: float | None = None,
+    high_band: float | None = None,
 ) -> list[ManifestRow]:
     """One archive row plus its derived zero-shot row, both fully provenanced."""
-    band_hz, band_filter = band_filter_spec(condition)
+    band_hz, band_name = archive_band_spec()
     common = dict(
         utt_id=utt_id,
         condition=condition,
@@ -134,10 +136,8 @@ def _rows_for(
         seed=GLOBAL_SEED,
         alignment_checked=alignment_lag is not None,
         alignment_peak_lag=alignment_lag,
-        band_limit_hz=band_hz,
-        band_filter=band_filter,
-        band_exempt=is_band_exempt(condition),
-        band_oob_energy=band_oob,
+        archive_band_hz=band_hz,
+        archive_band=band_name,
         **(mel_fields or {}),
     )
     return [
@@ -151,6 +151,7 @@ def _rows_for(
             sr_out=ARCHIVE_SR,
             duration_s=n_archive / ARCHIVE_SR,
             lufs_out=lufs_archive,
+            high_band_fraction=high_band,
             **common,
         ),
         ManifestRow(
@@ -190,12 +191,11 @@ def build_real_condition(
         wav = resample_once(wav_native, sr_native, ARCHIVE_SR)
         span = derive_trim_span(wav, utt.utt_id)
 
-        # INV-07/INV-17. Real goes through the SAME post-trim implementation as
-        # every vocoder condition -- band-limit then loudness, in that order,
-        # from one function. Real is the reference every span and pairing
+        # INV-07. Real goes through the SAME post-trim implementation as every
+        # vocoder condition. Real is the reference every span and pairing
         # derives from, so a divergence here would move every condition against
         # real at once. The equivalence is asserted by test, not assumed.
-        norm, measured, oob = finalise_reference(wav, span, meter=archive_meter)
+        norm, measured, high_band = finalise_reference(wav, span, meter=archive_meter)
 
         if would_clip(norm):
             dropped.add(utt.utt_id)
@@ -210,7 +210,7 @@ def build_real_condition(
             _rows_for(
                 utt.utt_id, REAL_CONDITION, utt.speaker, splits[utt.utt_id], span,
                 archive_path, zs_path, len(norm), n_zs, measured, lufs_zs, sr_native,
-                band_oob=oob,
+                high_band=high_band,
             )
         )
     return rows, spans, real_archive, dropped
@@ -238,12 +238,8 @@ def build_vocoder_condition(
     archive_meter = pyln.Meter(ARCHIVE_SR)
     zs_meter = pyln.Meter(ZEROSHOT_SR)
 
-    if is_band_exempt(condition):
-        print(
-            f"[INV-17] '{condition}' is band-exempt: it keeps its native band "
-            f"(no {LADDER_FMAX:.0f} Hz low-pass) and is excluded from the primary "
-            "correlation."
-        )
+    if is_correlation_excluded(condition):
+        print(f"[INV-17] '{condition}': {exclusion_reason(condition)}")
     staged: list[tuple[str, np.ndarray, float, int, str, float | None]] = []
     probe_pairs: list[tuple[np.ndarray, np.ndarray]] = []
 
@@ -261,7 +257,7 @@ def build_vocoder_condition(
             src = librosa.resample(src, orig_sr=sr_src, target_sr=spec.mel.sample_rate)
 
         wav_native = voc.resynthesize(src, spec.mel.sample_rate)
-        wav, measured, oob = process_condition_output(
+        wav, measured, high_band = process_condition_output(
             wav_native,
             spec.mel.sample_rate,
             spans[utt.utt_id],
@@ -274,7 +270,7 @@ def build_vocoder_condition(
                 "Add the utterance to the global drop list and regenerate every "
                 "condition without it -- do not attenuate this one file."
             )
-        staged.append((utt.utt_id, wav, measured, len(wav), utt.speaker, oob))
+        staged.append((utt.utt_id, wav, measured, len(wav), utt.speaker, high_band))
         if len(probe_pairs) < ALIGNMENT_PROBE_FILES:
             probe_pairs.append((real_archive[utt.utt_id], wav))
 
@@ -285,7 +281,7 @@ def build_vocoder_condition(
     assert_aligned(report)
 
     rows: list[ManifestRow] = []
-    for utt_id, wav, measured, n_archive, speaker, oob in staged:
+    for utt_id, wav, measured, n_archive, speaker, high_band in staged:
         archive_path, zs_path, lufs_zs, n_zs = _emit_pair(
             wav, measured, out_dir, condition, utt_id, zs_meter
         )
@@ -298,7 +294,7 @@ def build_vocoder_condition(
                 checkpoint=spec.checkpoint,
                 commit=spec.upstream_commit,
                 alignment_lag=report.peak_lag,
-                band_oob=oob,
+                high_band=high_band,
             )
         )
     return rows, report
@@ -360,7 +356,10 @@ def run(
             "archive_sr": ARCHIVE_SR,
             "zeroshot_sr": ZEROSHOT_SR,
             "ladder_fmax": LADDER_FMAX,
-            "band_exempt": [c for c in conditions if is_band_exempt(c)],
+            "archive_band": "full_band",
+            "correlation_excluded": [
+                c for c in conditions if is_correlation_excluded(c)
+            ],
             "n_utterances": len(spans),
             "dropped_for_peak": sorted(dropped),
             "corpus": corpus.name,

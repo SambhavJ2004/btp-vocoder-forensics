@@ -19,13 +19,16 @@ the derived 16 kHz set would be measuring the downsampler rather than the
 vocoders. :func:`data.manifest.require_primary` enforces this at the manifest
 level.
 
-**And it runs inside the ladder band** (INV-17). Every non-exempt condition is
-low-passed to LADDER_FMAX before delivery, so cutoffs above it are no-ops that
-would duplicate the full-band point under a different label. Use
-:func:`cutoffs_for_rate`, which caps the sweep accordingly, rather than
-DEFAULT_CUTOFFS directly. The question the sweep can no longer ask -- what
-happens above LADDER_FMAX -- is answered by the paired-checkpoint contrast in
-:func:`detectors.protocols.paired_bandwidth_contrast` instead.
+**The sweep now runs the whole band, and that is new** (INV-17). The archive
+used to be low-passed at LADDER_FMAX before delivery, so cutoffs above it were
+no-ops and the sweep was capped at 7 kHz. The archive is full-band now, so the
+sweep runs to Nyquist and can place cutoffs on both sides of LADDER_FMAX.
+
+That is the interesting part. Below LADDER_FMAX the vocoder had mel information
+to work from; above it, it had none and invented the content. A sweep that
+crosses that boundary asks whether a detector's evidence lives in the band the
+model was *told* about or the band it *invented* -- which is a sharper question
+than the one the capped sweep could ask.
 """
 
 from __future__ import annotations
@@ -33,12 +36,12 @@ from __future__ import annotations
 import numpy as np
 from scipy.signal import butter, sosfiltfilt
 
-from data.invariants import ARCHIVE_SR, LADDER_FMAX, InvariantViolation
+from data.invariants import ARCHIVE_SR, InvariantViolation
 
-# Cutoffs in Hz, all strictly below archive Nyquist (11.025 kHz). The 7-9 kHz
-# spacing is deliberately fine: that is where the mel front-end's compression
-# becomes severe and where BigVGAN's anti-aliasing is expected to show, so it is
-# the region the curve has to resolve.
+# Cutoffs in Hz, all strictly below archive Nyquist (11.025 kHz). The spacing is
+# deliberately fine around LADDER_FMAX: that is the boundary between the band
+# the vocoder was given and the band it invented, and it is where BigVGAN's
+# anti-aliasing is expected to show.
 DEFAULT_CUTOFFS: tuple[float, ...] = (
     1000.0,
     2000.0,
@@ -85,30 +88,25 @@ def band_limited_variant(
     return wav if cutoff_hz is None else lowpass(wav, cutoff_hz, sr)
 
 
-def cutoffs_for_rate(
-    sr: int = ARCHIVE_SR, *, band_exempt: bool = False
-) -> tuple[float, ...]:
+def cutoffs_for_rate(sr: int = ARCHIVE_SR) -> tuple[float, ...]:
     """The sweep, clipped to what actually exists in the signal.
 
-    A cutoff at or above the signal's upper edge removes nothing, so including
-    one would add a duplicate of the full-band point wearing a different label
-    and flatten the apparent curve at the top end.
+    A cutoff at or above Nyquist removes nothing, so including one would add a
+    duplicate of the full-band point wearing a different label and flatten the
+    apparent curve at the top end.
 
-    That upper edge is NOT Nyquist for a ladder condition. INV-17 low-passes
-    every non-exempt condition to LADDER_FMAX, so the sweep is capped there --
-    a consequence of the ladder band worth stating plainly: **the ablation can
-    no longer probe above LADDER_FMAX on ladder conditions, because nothing is
-    there to remove.** What the ladder band buys in exchange is that the sweep
-    is now measuring the same thing on every condition, which it was not when
-    conditions differed in bandwidth.
+    Nyquist is the only ceiling now. The archive is full-band (INV-17), so every
+    condition has content across the whole range and the sweep crosses
+    LADDER_FMAX rather than stopping below it. There is deliberately no
+    `band_exempt` parameter any more: it existed because ladder conditions were
+    low-passed at generation and controls were not, and with a full-band archive
+    that distinction does not exist in the audio.
 
-    The >LADDER_FMAX question is answered instead by the paired-checkpoint
-    contrast (`detectors.protocols.paired_bandwidth_contrast`), which varies the
-    generator's own band rather than a filter over it. Exempt conditions keep
-    their native band, so their sweep runs to Nyquist.
+    One caveat for reading the curve: `griffin_lim` has no content above its mel
+    fmax at all, so every cutoff at or above LADDER_FMAX is a no-op for it. Its
+    curve is flat up there for a structural reason, not a forensic one.
     """
-    ceiling = nyquist(sr) if band_exempt else min(LADDER_FMAX, nyquist(sr))
-    return tuple(c for c in DEFAULT_CUTOFFS if c < ceiling)
+    return tuple(c for c in DEFAULT_CUTOFFS if c < nyquist(sr))
 
 
 def collapse_point(cutoffs: list[float], eers: list[float], *, threshold: float = 0.25) -> float:

@@ -17,11 +17,16 @@ Manifest columns exist to answer specific questions:
                        records the band-limiting drift (derived).
   - ``split``        : INV-09. Frozen once, shared across conditions and tiers.
   - ``alignment_*``  : INV-16. Proves the vocoder is sample-aligned.
-  - ``band_*``       : INV-17. The ladder band actually applied, the filter that
-                       applied it, and the residual out-of-band energy. An
-                       exempt condition records its exemption rather than a
-                       cutoff, so "kept its band by design" is distinguishable
-                       from "nobody filtered it".
+  - ``archive_band_hz`` / ``archive_band``
+                     : INV-17. The archive is FULL-BAND, so every row records
+                       the same thing; a row that does not means someone
+                       band-limited at generation, which is the mistake this
+                       invariant was rewritten to undo.
+  - ``high_band_fraction``
+                     : INV-17. Measured energy above LADDER_FMAX. Evidence, not
+                       a gate -- it is how Griffin-Lim's hard zero (0.00000) is
+                       distinguishable from a neural vocoder tracking real
+                       (~0.015 against real's ~0.018).
 """
 
 from __future__ import annotations
@@ -36,8 +41,6 @@ from .invariants import (
     ALIGNMENT_REQUIRED_LAG,
     ARCHIVE_SR,
     ARCHIVE_TIER,
-    BAND_LIMIT_MAX_STOPBAND_ENERGY,
-    LADDER_FMAX,
     MAX_RESAMPLE_STEPS,
     REAL_CONDITION,
     SANCTIONED_RATES,
@@ -48,7 +51,7 @@ from .invariants import (
     ZEROSHOT_TIER,
     InvariantViolation,
     check_pairing,
-    is_band_exempt,
+    is_correlation_excluded,
 )
 
 MANIFEST_COLUMNS: tuple[str, ...] = (
@@ -77,10 +80,9 @@ MANIFEST_COLUMNS: tuple[str, ...] = (
     "mel_fmax",
     "alignment_checked",
     "alignment_peak_lag",
-    "band_limit_hz",
-    "band_filter",
-    "band_exempt",
-    "band_oob_energy",
+    "archive_band_hz",
+    "archive_band",
+    "high_band_fraction",
     "vocoder_checkpoint",
     "vocoder_commit",
     "seed",
@@ -116,12 +118,11 @@ class ManifestRow:
     mel_fmax: float | None = None
     alignment_checked: bool = False
     alignment_peak_lag: int | None = None
-    # INV-17. `band_limit_hz` is None only for exempt conditions, which must
-    # also set band_exempt=True -- the two are checked against each other.
-    band_limit_hz: float | None = LADDER_FMAX
-    band_filter: str = ""
-    band_exempt: bool = False
-    band_oob_energy: float | None = None
+    # INV-17. The archive is full-band for every condition, so these are the
+    # same on every row; `high_band_fraction` is the per-file measurement.
+    archive_band_hz: float = ARCHIVE_SR / 2.0
+    archive_band: str = "full_band"
+    high_band_fraction: float | None = None
     vocoder_checkpoint: str | None = None
     vocoder_commit: str | None = None
     seed: int | None = None
@@ -308,59 +309,44 @@ def validate_manifest(df: pd.DataFrame, *, require_zeroshot: bool = False) -> No
 
 
 def _validate_band(df: pd.DataFrame) -> None:
-    """INV-17. Every non-exempt condition shares one band; exempt ones say so."""
-    for cond, group in df.groupby("condition"):
-        exempt_flags = set(group["band_exempt"].astype(bool))
-        if len(exempt_flags) > 1:
-            raise InvariantViolation(
-                f"INV-17: condition '{cond}' is marked exempt on some rows and not "
-                "others. Exemption is a property of the condition."
-            )
-        declared_exempt = exempt_flags.pop()
-        if declared_exempt != is_band_exempt(str(cond)):
-            raise InvariantViolation(
-                f"INV-17: condition '{cond}' records band_exempt={declared_exempt}, "
-                f"but invariants.BAND_EXEMPT_CONDITIONS says "
-                f"{is_band_exempt(str(cond))}. The manifest and the code must agree "
-                "about which conditions keep their full band."
-            )
+    """INV-17. The archive is full-band, uniformly, for every condition.
 
-        if declared_exempt:
-            continue
+    The old version of this check asserted that every condition had been
+    band-limited to LADDER_FMAX at generation. That was the mistake: `fmax`
+    constrains a vocoder's analysis, not its synthesis, so filtering at
+    generation destroyed real hallucinated high-band content. It now asserts the
+    opposite -- that nobody filtered.
+    """
+    expected_hz = float(ARCHIVE_SR / 2.0)
 
-        cutoffs = set(group["band_limit_hz"].dropna().astype(float))
-        if cutoffs != {float(LADDER_FMAX)}:
-            raise InvariantViolation(
-                f"INV-17: condition '{cond}' was band-limited to {sorted(cutoffs)}, "
-                f"not to the ladder band {LADDER_FMAX}. Every non-exempt condition, "
-                "REAL included, shares one cutoff -- a condition with a different "
-                "band is separable from the rest on high-band energy alone."
-            )
-        if group["band_limit_hz"].isna().any():
-            raise InvariantViolation(
-                f"INV-17: condition '{cond}' has rows with no recorded cutoff. A "
-                "missing cutoff on a non-exempt condition means the filter was "
-                "never applied."
-            )
-        if (group["band_filter"].astype(str).str.len() == 0).any():
-            raise InvariantViolation(
-                f"INV-17: condition '{cond}' has rows with no filter spec recorded."
-            )
-        oob = group["band_oob_energy"].dropna().astype(float)
-        if len(oob) and oob.max() > BAND_LIMIT_MAX_STOPBAND_ENERGY:
-            raise InvariantViolation(
-                f"INV-17: condition '{cond}' carries up to {oob.max():.2e} of its "
-                f"energy above {LADDER_FMAX} Hz, over the "
-                f"{BAND_LIMIT_MAX_STOPBAND_ENERGY:.0e} stopband allowance."
-            )
-
-    # One filter spec across every non-exempt condition, not just one cutoff.
-    non_exempt = df[~df["band_exempt"].astype(bool)]
-    specs = set(non_exempt["band_filter"].astype(str))
-    if len(specs) > 1:
+    bands = set(df["archive_band"].astype(str))
+    if bands != {"full_band"}:
         raise InvariantViolation(
-            f"INV-17: conditions were band-limited by different filters {sorted(specs)}. "
-            "A filter's own rolloff is a signature; two filters means two signatures."
+            f"INV-17: archive rows record band(s) {sorted(bands)}, expected "
+            "{'full_band'}. The archive is full-band; band-limiting is an "
+            "analysis-time transform (data.preprocess.band_limit_comparison_set). "
+            "A band-limited archive throws away the hallucinated high-band content "
+            "that is the most forensically interesting thing it holds."
+        )
+
+    hz = set(df["archive_band_hz"].dropna().astype(float))
+    if hz != {expected_hz}:
+        raise InvariantViolation(
+            f"INV-17: archive rows record archive_band_hz {sorted(hz)}, expected "
+            f"{expected_hz} (Nyquist at the archive rate)."
+        )
+
+    # high_band_fraction is descriptive, so it is not gated on a value -- only
+    # on being present for the archive tier, where it is measured.
+    archive = df[df["tier"] == ARCHIVE_TIER]
+    if not archive.empty and archive["high_band_fraction"].isna().any():
+        missing = sorted(
+            set(archive[archive["high_band_fraction"].isna()]["condition"])
+        )
+        raise InvariantViolation(
+            f"INV-17: archive rows for {missing} have no high_band_fraction. It is "
+            "the evidence that distinguishes a genuine bandwidth zero from a "
+            "vocoder tracking real, and is measured during Phase A."
         )
 
 
@@ -382,49 +368,47 @@ def provenance_table(df: pd.DataFrame) -> pd.DataFrame:
         "sr_out",
         "derivation",
         "resample_steps",
-        "band_limit_hz",
-        "band_exempt",
+        "archive_band",
+        "high_band_fraction",
     ]
     return df.groupby(["tier", "condition"])[cols].first().reset_index()
 
 
 def band_report(df: pd.DataFrame) -> pd.DataFrame:
-    """INV-17 reporting helper: the delivered band, per condition.
+    """INV-17 reporting helper: the archive band and measured high-band content.
 
-    Out-of-band energy is rendered through :func:`data.invariants.format_oob`,
-    which refuses to quote a number below MEASUREMENT_FLOOR. A figure there is
-    float32 representation noise, and printing it would imply the filter was
-    characterised to a precision it was not.
+    ``high_band_*`` is the fraction of energy above LADDER_FMAX. It is the
+    column that separates a genuine bandwidth zero (Griffin-Lim, 0.00000) from a
+    vocoder producing high-band content (real ~0.018, BigVGAN ~0.015).
     """
-    from .invariants import format_oob
-
     rows = []
     for (tier, cond), g in df.groupby(["tier", "condition"]):
-        oob = g["band_oob_energy"].dropna().astype(float)
+        hb = g["high_band_fraction"].dropna().astype(float)
         rows.append(
             {
                 "tier": tier,
                 "condition": cond,
-                "band_exempt": bool(g["band_exempt"].iloc[0]),
-                "band_limit_hz": g["band_limit_hz"].iloc[0],
-                "band_filter": g["band_filter"].iloc[0],
-                "oob_max": format_oob(float(oob.max())) if len(oob) else "n/a (exempt)",
+                "archive_band": g["archive_band"].iloc[0],
+                "archive_band_hz": g["archive_band_hz"].iloc[0],
+                "high_band_mean": f"{hb.mean():.5f}" if len(hb) else "n/a",
+                "high_band_max": f"{hb.max():.5f}" if len(hb) else "n/a",
+                "in_correlation": not is_correlation_excluded(str(cond)),
             }
         )
     return pd.DataFrame(rows)
 
 
 def primary_ladder_frame(df: pd.DataFrame, *, why: str) -> pd.DataFrame:
-    """INV-17. Drop band-exempt conditions before a ladder-wide comparison.
+    """INV-17. Drop correlation-excluded conditions before a ladder-wide series.
 
-    Use this wherever conditions are pooled into one series. Exempt conditions
-    are generated and measured like any other, but they differ from the ladder
-    in bandwidth by design, so averaging or correlating across them measures the
-    exemption rather than the vocoders.
+    Use this wherever conditions are pooled. Excluded conditions are generated,
+    measured and reported like any other; what they are not is comparable on the
+    headline axis. See `invariants.CORRELATION_EXCLUDED` for the reason attached
+    to each.
     """
     if "condition" not in df.columns:
         raise InvariantViolation(f"INV-17: cannot filter conditions for {why}.")
-    keep = ~df["condition"].map(is_band_exempt).astype(bool)
+    keep = ~df["condition"].map(is_correlation_excluded).astype(bool)
     return df[keep]
 
 

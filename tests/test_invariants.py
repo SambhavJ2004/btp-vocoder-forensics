@@ -17,7 +17,6 @@ import pytest
 from data.invariants import (
     ARCHIVE_SR,
     ARCHIVE_TIER,
-    BAND_LIMIT_FILTER_SPEC,
     BAND_LIMIT_MAX_STOPBAND_ENERGY,
     LADDER_FMAX,
     LOUDNESS_TARGET_LUFS,
@@ -26,7 +25,7 @@ from data.invariants import (
     InvariantViolation,
     check_pairing,
     check_waveform,
-    is_band_exempt,
+    is_correlation_excluded,
     tier_for_rate,
 )
 from data.preprocess import TrimSpan, align_length, apply_trim_span, resample_once
@@ -494,10 +493,9 @@ def _manifest_frame(**overrides) -> pd.DataFrame:
                         "mel_n_mels": 80, "mel_fmin": 0.0, "mel_fmax": LADDER_FMAX,
                         "alignment_checked": cond != "real",
                         "alignment_peak_lag": None if cond == "real" else 0,
-                        "band_limit_hz": LADDER_FMAX,
-                        "band_filter": BAND_LIMIT_FILTER_SPEC,
-                        "band_exempt": False,
-                        "band_oob_energy": 1e-7,
+                        "archive_band_hz": ARCHIVE_SR / 2.0,
+                        "archive_band": "full_band",
+                        "high_band_fraction": 0.015,
                         "vocoder_checkpoint": "", "vocoder_commit": "", "seed": 1,
                     }
                 )
@@ -561,7 +559,7 @@ class TestLadder:
         for key in SPECS:
             assert get_spec(key).key == key
 
-    def test_eight_generated_conditions_six_rungs_one_unavailable(self):
+    def test_seven_generated_conditions_six_rungs_one_unavailable(self):
         from vocoders.registry import (
             ALL_CONDITIONS,
             CONTROL_CONDITIONS,
@@ -570,8 +568,8 @@ class TestLadder:
         )
 
         assert len(LADDER) == 6
-        assert len(CONTROL_CONDITIONS) == 2
-        assert len(ALL_CONDITIONS) == 8
+        assert len(CONTROL_CONDITIONS) == 1  # melgan_fullband removed (INV-17)
+        assert len(ALL_CONDITIONS) == 7
         assert not set(LADDER) & set(CONTROL_CONDITIONS)
         # Unavailable conditions are declared but never generated.
         assert "specdiff_gan" in UNAVAILABLE
@@ -598,7 +596,7 @@ class TestLadder:
             assert rows[key]["blocked"] is False, key
 
         # Not on HuggingFace: no revision exists, so still unpinned.
-        for key in ("hifigan_v1", "melgan", "melgan_fullband"):
+        for key in ("hifigan_v1", "melgan"):
             assert rows[key]["pin"] == "UNPINNED", key
             assert rows[key]["blocked"] is True, key
 
@@ -612,15 +610,23 @@ class TestLadder:
         keys = {r["condition"] for r in checkpoint_audit(include_unavailable=False)}
         assert "specdiff_gan" not in keys
 
-    def test_exemption_is_declared_consistently(self):
-        from data.invariants import BAND_EXEMPT_CONDITIONS
+    def test_control_and_exclusion_declarations_agree(self):
+        from data.invariants import CORRELATION_EXCLUDED, UNAVAILABLE_CONDITIONS
         from vocoders.registry import CONTROL_CONDITIONS, SPECS
 
         # registry.py cross-checks these at import; assert it stays true.
-        assert set(CONTROL_CONDITIONS) == set(BAND_EXEMPT_CONDITIONS)
-        assert {k for k, v in SPECS.items() if not v.primary_ladder} == set(
-            BAND_EXEMPT_CONDITIONS
-        )
+        declared = {
+            k
+            for k, v in SPECS.items()
+            if not v.primary_ladder and k not in UNAVAILABLE_CONDITIONS
+        }
+        assert declared == set(CONTROL_CONDITIONS)
+        # Every control must carry an exclusion reason, or spearman_headline
+        # would silently pool it into the headline number.
+        assert set(CONTROL_CONDITIONS) <= set(CORRELATION_EXCLUDED)
+        # griffin_lim is excluded WITHOUT being a control: it is a rung.
+        assert "griffin_lim" in CORRELATION_EXCLUDED
+        assert "griffin_lim" not in CONTROL_CONDITIONS
 
 
 class TestBandlimit:
@@ -645,18 +651,20 @@ class TestBandlimit:
             assert cuts, f"no cutoffs available at {sr}"
             assert max(cuts) < nyquist(sr)
 
-    def test_ladder_sweep_is_capped_at_the_ladder_band(self):
-        """INV-17 consequence: above LADDER_FMAX there is nothing left to remove."""
+    def test_sweep_crosses_the_analysis_band(self):
+        """INV-17 reversal: the archive is full-band, so the sweep is no longer
+        capped at LADDER_FMAX and can place cutoffs on both sides of it."""
         from detectors.bandlimit import cutoffs_for_rate
 
         cuts = cutoffs_for_rate(ARCHIVE_SR)
-        assert cuts and max(cuts) < LADDER_FMAX
+        assert any(c < LADDER_FMAX for c in cuts)
+        assert any(c > LADDER_FMAX for c in cuts)
 
-    def test_exempt_sweep_runs_to_nyquist(self):
+    def test_sweep_stops_below_nyquist(self):
+        """No band_exempt variant any more: every condition is full-band."""
         from detectors.bandlimit import cutoffs_for_rate, nyquist
 
-        cuts = cutoffs_for_rate(ARCHIVE_SR, band_exempt=True)
-        assert max(cuts) > LADDER_FMAX
+        cuts = cutoffs_for_rate(ARCHIVE_SR)
         assert max(cuts) < nyquist(ARCHIVE_SR)
 
     def test_lowpass_attenuates_above_cutoff(self):
@@ -671,131 +679,115 @@ class TestBandlimit:
         assert np.abs(out[edge:-edge]).max() < 0.01 * np.abs(high).max()
 
 
-class TestINV17LadderBand:
-    """The ladder band: derived, applied to real, and enforced downstream."""
+class TestINV17FullBandArchive:
+    """The archive is full-band; band-limiting is an analysis transform.
+
+    The original INV-17 low-passed at generation on the premise that an
+    fmax=8000 mel front-end emits nothing above 8 kHz. Measured on 20 LJSpeech
+    files that is false for every condition except Griffin-Lim: real 0.01803,
+    BigVGAN 0.01480, Griffin-Lim 0.00000. `fmax` constrains the analysis a
+    vocoder consumes, not the synthesis it performs.
+    """
 
     def _wideband(self, seconds: float = 1.0, sr: int = ARCHIVE_SR) -> np.ndarray:
-        """A signal with real energy above LADDER_FMAX, like a 22.05 kHz recording."""
         t = np.arange(int(seconds * sr)) / sr
         low = 0.05 * np.sin(2 * np.pi * 300 * t)
         high = 0.05 * np.sin(2 * np.pi * 9500 * t)  # above LADDER_FMAX
         return (low + high).astype(np.float32)
 
-    # --- derivation -------------------------------------------------------
+    # --- derivation is unchanged -----------------------------------------
     def test_ladder_fmax_is_derived_from_the_audit_table(self):
-        """Not a literal: it is min(audited fmax) over the constraining rungs."""
         from data.invariants import (
             AUDITED_MEL_FMAX,
             FMAX_FREE_CONDITIONS,
             PRIMARY_LADDER,
+            UNAVAILABLE_CONDITIONS,
         )
 
         constraining = [
             f
             for c, f in AUDITED_MEL_FMAX.items()
-            if c in PRIMARY_LADDER and c not in FMAX_FREE_CONDITIONS
+            if c in PRIMARY_LADDER
+            and c not in FMAX_FREE_CONDITIONS
+            and c not in UNAVAILABLE_CONDITIONS
         ]
         assert LADDER_FMAX == min(constraining)
 
-    def test_ladder_fmax_follows_the_table_if_a_checkpoint_is_resourced(self):
-        """A ParallelWaveGAN MelGAN (fmax 7600) must drag the ladder band down."""
-        from data.invariants import (
-            AUDITED_MEL_FMAX,
-            FMAX_FREE_CONDITIONS,
-            PRIMARY_LADDER,
-            _derive_ladder_fmax,
-        )
-
-        original = AUDITED_MEL_FMAX["melgan"]
-        try:
-            AUDITED_MEL_FMAX["melgan"] = 7600.0
-            assert _derive_ladder_fmax() == 7600.0
-        finally:
-            AUDITED_MEL_FMAX["melgan"] = original
-        assert _derive_ladder_fmax() == LADDER_FMAX
-        assert set(FMAX_FREE_CONDITIONS) <= set(PRIMARY_LADDER)
-
-    def test_griffin_lim_follows_the_band_rather_than_setting_it(self):
-        from data.mel import GRIFFIN_LIM_MEL
-
-        assert GRIFFIN_LIM_MEL.fmax == LADDER_FMAX
-
-    def test_mel_configs_come_from_the_audit_table(self):
-        from data.invariants import AUDITED_MEL_FMAX
-        from vocoders.registry import SPECS
-
-        for key, fmax in AUDITED_MEL_FMAX.items():
-            assert SPECS[key].mel.fmax == fmax, key
-
-    def test_ladder_is_fmax_agnostic(self):
-        """Vocos entered at fmax=12000 without moving the ladder band."""
-        from data.invariants import AUDITED_MEL_FMAX
-
-        assert AUDITED_MEL_FMAX["vocos"] == 12_000.0
-        assert AUDITED_MEL_FMAX["vocos"] > LADDER_FMAX
+    def test_ladder_fmax_did_not_move(self):
+        """Reclassifying griffin_lim did not change the band: it was already
+        excluded from the min as an fmax-free condition."""
         assert LADDER_FMAX == 8000.0
 
-    def test_unavailable_conditions_do_not_constrain_the_band(self):
-        """specdiff_gan is audited but never generated, so it cannot set the band."""
-        from data.invariants import (
-            AUDITED_MEL_FMAX,
-            UNAVAILABLE_CONDITIONS,
-            _derive_ladder_fmax,
+    # --- generation does NOT filter --------------------------------------
+    def test_generation_preserves_the_high_band(self):
+        """The core reversal: Phase A must not low-pass."""
+        from data.invariants import out_of_band_energy
+        from data.preprocess import TrimSpan, process_condition_output
+
+        wav = self._wideband(2.0)
+        span = TrimSpan(utt_id="u", start=0, end=len(wav), ref_length=len(wav))
+        out, _, high_band = process_condition_output(
+            wav, ARCHIVE_SR, span, condition="hifigan_v1"
+        )
+        measured = out_of_band_energy(out, ARCHIVE_SR, LADDER_FMAX)
+        assert measured > 0.1, (
+            "the archive was band-limited at generation; INV-17 moved that to "
+            "analysis time because the >LADDER_FMAX content is hallucinated by "
+            "the vocoder and is the most forensically interesting content there is"
+        )
+        assert high_band == pytest.approx(measured, rel=1e-6)
+
+    def test_high_band_fraction_is_recorded_not_removed(self):
+        from data.preprocess import TrimSpan, finalise_reference
+
+        wav = self._wideband(2.0)
+        span = TrimSpan(utt_id="u", start=0, end=len(wav), ref_length=len(wav))
+        _, _, high_band = finalise_reference(wav, span)
+        assert high_band is not None and high_band > 0.1
+
+    def test_pipeline_order_has_no_band_limit_step(self):
+        from data.invariants import PIPELINE_ORDER
+
+        assert "band_limit" not in PIPELINE_ORDER
+        assert "measure_high_band" in PIPELINE_ORDER
+        assert PIPELINE_ORDER.index("measure_high_band") < PIPELINE_ORDER.index(
+            "normalise_loudness"
         )
 
-        assert "specdiff_gan" in UNAVAILABLE_CONDITIONS
-        original = AUDITED_MEL_FMAX["specdiff_gan"]
-        try:
-            AUDITED_MEL_FMAX["specdiff_gan"] = 4000.0
-            assert _derive_ladder_fmax() == LADDER_FMAX  # unmoved
-        finally:
-            AUDITED_MEL_FMAX["specdiff_gan"] = original
-
-    # --- the filter itself ------------------------------------------------
-    def test_band_limiting_removes_the_high_band(self):
+    # --- the analysis-time transform -------------------------------------
+    def test_comparison_set_band_limits_every_member(self):
         from data.invariants import out_of_band_energy
-        from data.preprocess import band_limit_to_ladder
+        from data.preprocess import band_limit_comparison_set
 
-        wav = self._wideband()
-        before = out_of_band_energy(wav, ARCHIVE_SR, LADDER_FMAX)
-        after = out_of_band_energy(
-            band_limit_to_ladder(wav, sr=ARCHIVE_SR), ARCHIVE_SR, LADDER_FMAX
-        )
-        assert before > 0.1
-        assert after <= BAND_LIMIT_MAX_STOPBAND_ENERGY
+        wavs = {
+            "real": self._wideband(1.0),
+            "hifigan_v1": self._wideband(1.0),
+        }
+        out = band_limit_comparison_set(wavs)
+        assert set(out) == set(wavs)
+        for w in out.values():
+            assert out_of_band_energy(w, ARCHIVE_SR, LADDER_FMAX) <= (
+                BAND_LIMIT_MAX_STOPBAND_ENERGY
+            )
 
-    def test_band_measurement_is_windowed(self):
-        """A bare rFFT reports its own spectral leakage as out-of-band energy.
+    def test_comparison_set_refuses_a_set_without_real(self):
+        """Band-limiting only the fakes is the same cliff, sign flipped."""
+        from data.preprocess import band_limit_comparison_set
 
-        Regression guard: with a rectangular window, a strong low-frequency tone
-        leaks across the spectrum at roughly -50 dB, which is far above the 1e-6
-        gate. That made a correctly filtered signal look unfiltered.
-        """
+        with pytest.raises(InvariantViolation, match="INV-17.*real"):
+            band_limit_comparison_set({"hifigan_v1": self._wideband()})
+
+    def test_comparison_set_does_not_mutate_its_input(self):
         from data.invariants import out_of_band_energy
-        from data.preprocess import band_limit_to_ladder
+        from data.preprocess import band_limit_comparison_set
 
-        t = np.arange(ARCHIVE_SR) / ARCHIVE_SR
-        tone = (0.05 * np.sin(2 * np.pi * 300 * t)).astype(np.float32)
-        filtered = band_limit_to_ladder(tone, sr=ARCHIVE_SR)
-
-        windowed = out_of_band_energy(filtered, ARCHIVE_SR, LADDER_FMAX)
-
-        x = filtered.astype(np.float64)
-        spec = np.abs(np.fft.rfft(x)) ** 2
-        freqs = np.fft.rfftfreq(len(x), d=1.0 / ARCHIVE_SR)
-        rectangular = float(spec[freqs > LADDER_FMAX].sum() / spec.sum())
-
-        assert windowed <= BAND_LIMIT_MAX_STOPBAND_ENERGY
-        assert rectangular > windowed * 100
-
-    def test_gate_rejects_an_unfiltered_condition(self):
-        from data.invariants import check_band_limit
-
-        with pytest.raises(InvariantViolation, match="INV-17"):
-            check_band_limit(self._wideband(), ARCHIVE_SR, where="test")
+        wavs = {"real": self._wideband(), "melgan": self._wideband()}
+        before = out_of_band_energy(wavs["real"], ARCHIVE_SR, LADDER_FMAX)
+        band_limit_comparison_set(wavs)
+        after = out_of_band_energy(wavs["real"], ARCHIVE_SR, LADDER_FMAX)
+        assert before == after
 
     def test_band_limiting_preserves_sample_alignment(self):
-        """Zero-phase, so INV-16 still holds after INV-17 runs."""
         from data.alignment import cross_correlation_lag
         from data.preprocess import band_limit_to_ladder
 
@@ -803,188 +795,215 @@ class TestINV17LadderBand:
         lag, _ = cross_correlation_lag(wav, band_limit_to_ladder(wav, sr=ARCHIVE_SR))
         assert lag == 0
 
-    # --- real is filtered identically -------------------------------------
-    def test_real_and_vocoded_are_band_limited_identically(self):
-        """The central INV-17 claim: filtering only the fakes flips the cliff.
+    # --- manifest gate is now the inverse --------------------------------
+    def test_manifest_requires_a_full_band_archive(self):
+        from data.manifest import validate_manifest
 
-        Two signals that differ only above the ladder band -- as real audio and
-        an fmax=8000 vocoder do -- must be indistinguishable on high-band energy
-        once both have been through the same filter.
-        """
-        from data.invariants import out_of_band_energy
-        from data.preprocess import band_limit_to_ladder
+        df = _manifest_frame()
+        df["archive_band"] = "ladder_band"
+        with pytest.raises(InvariantViolation, match="INV-17.*full_band"):
+            validate_manifest(df)
 
-        t = np.arange(ARCHIVE_SR) / ARCHIVE_SR
-        shared = (0.05 * np.sin(2 * np.pi * 300 * t)).astype(np.float32)
-        real = shared + (0.05 * np.sin(2 * np.pi * 9500 * t)).astype(np.float32)
-        vocoded = shared.copy()  # an fmax=8000 vocoder: nothing above the band
+    def test_manifest_requires_high_band_fraction_on_archive_rows(self):
+        from data.manifest import validate_manifest
 
-        assert out_of_band_energy(real, ARCHIVE_SR, LADDER_FMAX) > 0.1
-        assert out_of_band_energy(vocoded, ARCHIVE_SR, LADDER_FMAX) < 1e-9
+        df = _manifest_frame()
+        df.loc[df["tier"] == ARCHIVE_TIER, "high_band_fraction"] = None
+        with pytest.raises(InvariantViolation, match="INV-17.*high_band_fraction"):
+            validate_manifest(df)
 
-        real_b = band_limit_to_ladder(real, sr=ARCHIVE_SR)
-        voc_b = band_limit_to_ladder(vocoded, sr=ARCHIVE_SR)
-        for w in (real_b, voc_b):
-            assert out_of_band_energy(w, ARCHIVE_SR, LADDER_FMAX) <= (
-                BAND_LIMIT_MAX_STOPBAND_ENERGY
-            )
+    def test_valid_full_band_manifest_passes(self):
+        from data.manifest import validate_manifest
 
-    def test_pipeline_order_places_band_limit_before_loudness(self):
-        from data.invariants import PIPELINE_ORDER, PIPELINE_ORDER_BAND_EXEMPT
+        validate_manifest(_manifest_frame())
 
-        assert PIPELINE_ORDER.index("band_limit") > PIPELINE_ORDER.index("apply_ref_trim")
-        assert PIPELINE_ORDER.index("band_limit") < PIPELINE_ORDER.index(
-            "normalise_loudness"
+    # --- the sweep is no longer capped -----------------------------------
+    def test_ablation_sweep_now_crosses_the_analysis_band(self):
+        from detectors.bandlimit import cutoffs_for_rate, nyquist
+
+        cuts = cutoffs_for_rate(ARCHIVE_SR)
+        assert any(c < LADDER_FMAX for c in cuts)
+        assert any(c > LADDER_FMAX for c in cuts), (
+            "the sweep used to stop below LADDER_FMAX because the archive was "
+            "pre-filtered; with a full-band archive it can cross that boundary"
         )
-        # The exempt pipeline differs by exactly one step.
-        assert set(PIPELINE_ORDER) - set(PIPELINE_ORDER_BAND_EXEMPT) == {"band_limit"}
+        assert max(cuts) < nyquist(ARCHIVE_SR)
 
-    def test_process_condition_output_skips_the_filter_when_exempt(self):
-        from data.preprocess import TrimSpan, process_condition_output
 
-        n = ARCHIVE_SR
-        span = TrimSpan(utt_id="u", start=0, end=n, ref_length=n)
-        wav = self._wideband(1.0)
+class TestINV17CorrelationExclusions:
+    """griffin_lim is a floor reference, not a rung in the correlation."""
 
-        _, _, oob_ladder = process_condition_output(
-            wav, ARCHIVE_SR, span, condition="hifigan_v1"
-        )
-        assert oob_ladder is not None and oob_ladder <= BAND_LIMIT_MAX_STOPBAND_ENERGY
-
-        _, _, oob_exempt = process_condition_output(
-            wav, ARCHIVE_SR, span, condition="bigvgan_v2_22khz_fullband"
-        )
-        assert oob_exempt is None  # exempt: not filtered, not measured
-
-    def test_band_filter_spec_marks_exemption(self):
-        from data.invariants import BAND_LIMIT_FILTER_SPEC
-        from data.preprocess import band_filter_spec
-
-        assert band_filter_spec("hifigan_v1") == (LADDER_FMAX, BAND_LIMIT_FILTER_SPEC)
-        assert band_filter_spec("bigvgan_v2_22khz_fullband") == (None, "exempt")
-
-    # --- manifest gate ----------------------------------------------------
-    def test_manifest_rejects_a_condition_with_a_different_band(self):
-        from data.manifest import validate_manifest
-
-        df = _manifest_frame()
-        df.loc[df["condition"] == "hifigan_v1", "band_limit_hz"] = 11025.0
-        with pytest.raises(InvariantViolation, match="INV-17"):
-            validate_manifest(df)
-
-    def test_manifest_rejects_residual_out_of_band_energy(self):
-        from data.manifest import validate_manifest
-
-        df = _manifest_frame()
-        df.loc[df["condition"] == "hifigan_v1", "band_oob_energy"] = 0.05
-        with pytest.raises(InvariantViolation, match="INV-17"):
-            validate_manifest(df)
-
-    def test_manifest_rejects_two_different_filters(self):
-        from data.manifest import validate_manifest
-
-        df = _manifest_frame()
-        df.loc[df["condition"] == "real", "band_filter"] = "chebyshev_order4"
-        with pytest.raises(InvariantViolation, match="INV-17"):
-            validate_manifest(df)
-
-    def test_manifest_rejects_an_exemption_the_code_does_not_know_about(self):
-        from data.manifest import validate_manifest
-
-        df = _manifest_frame()
-        df.loc[df["condition"] == "hifigan_v1", "band_exempt"] = True
-        with pytest.raises(InvariantViolation, match="INV-17"):
-            validate_manifest(df)
-
-    # --- the primary correlation refuses the control ----------------------
-    def test_primary_correlation_refuses_the_exempt_condition(self):
-        """Step 5: enforced in code, not merely documented."""
-        from detectors.protocols import Protocol, spearman_headline
-
+    def _frames(self, conditions):
         quality = pd.DataFrame(
-            {
-                "condition": ["griffin_lim", "melgan", "hifigan_v1", "bigvgan_112m",
-                              "bigvgan_v2_22khz_fullband"],
-                "utmos_mean": [2.0, 2.5, 3.5, 4.2, 4.3],
-            }
+            {"condition": conditions, "utmos_mean": np.linspace(2.0, 4.5, len(conditions))}
         )
         detection = pd.DataFrame(
             {
-                "condition": ["griffin_lim", "melgan", "hifigan_v1", "bigvgan_112m",
-                              "bigvgan_v2_22khz_fullband"],
-                "protocol": ["matched"] * 5,
-                "tier": [ARCHIVE_TIER] * 5,
-                "detector": ["aasist"] * 5,
-                "eer": [0.01, 0.05, 0.12, 0.30, 0.02],
+                "condition": conditions,
+                "protocol": ["matched"] * len(conditions),
+                "tier": [ARCHIVE_TIER] * len(conditions),
+                "detector": ["aasist"] * len(conditions),
+                "eer": np.linspace(0.01, 0.3, len(conditions)),
             }
         )
-        with pytest.raises(InvariantViolation, match="INV-17"):
+        return quality, detection
+
+    def test_griffin_lim_is_excluded_with_a_reason(self):
+        from data.invariants import CORRELATION_EXCLUDED, exclusion_reason
+
+        assert is_correlation_excluded("griffin_lim")
+        assert "griffin_lim" in CORRELATION_EXCLUDED
+        reason = exclusion_reason("griffin_lim")
+        assert "floor reference" in reason
+        assert "0.00000" in reason
+
+    def test_griffin_lim_is_still_a_generated_rung(self):
+        """Excluded from rho, not from the dataset: it is still reported."""
+        from vocoders.registry import ALL_CONDITIONS, LADDER
+
+        assert "griffin_lim" in LADDER
+        assert "griffin_lim" in ALL_CONDITIONS
+
+    def test_primary_correlation_refuses_griffin_lim(self):
+        from detectors.protocols import Protocol, spearman_headline
+
+        quality, detection = self._frames(
+            ["griffin_lim", "melgan", "hifigan_v1", "vocos", "bigvgan_112m"]
+        )
+        with pytest.raises(InvariantViolation, match="INV-17.*griffin_lim"):
             spearman_headline(quality, detection, protocol=Protocol.MATCHED)
 
-    def test_primary_correlation_succeeds_once_the_control_is_filtered(self):
+    def test_refusal_quotes_the_reason(self):
+        from detectors.protocols import Protocol, spearman_headline
+
+        quality, detection = self._frames(
+            ["griffin_lim", "melgan", "hifigan_v1", "vocos"]
+        )
+        with pytest.raises(InvariantViolation) as exc:
+            spearman_headline(quality, detection, protocol=Protocol.MATCHED)
+        assert "floor reference" in str(exc.value)
+
+    def test_correlation_succeeds_once_excluded_conditions_are_filtered(self):
         from data.manifest import primary_ladder_frame
         from detectors.protocols import Protocol, spearman_headline
 
-        quality = pd.DataFrame(
-            {
-                "condition": ["griffin_lim", "melgan", "hifigan_v1", "bigvgan_112m",
-                              "bigvgan_v2_22khz_fullband"],
-                "utmos_mean": [2.0, 2.5, 3.5, 4.2, 4.3],
-            }
-        )
-        detection = pd.DataFrame(
-            {
-                "condition": ["griffin_lim", "melgan", "hifigan_v1", "bigvgan_112m",
-                              "bigvgan_v2_22khz_fullband"],
-                "protocol": ["matched"] * 5,
-                "tier": [ARCHIVE_TIER] * 5,
-                "detector": ["aasist"] * 5,
-                "eer": [0.01, 0.05, 0.12, 0.30, 0.02],
-            }
-        )
+        conds = [
+            "griffin_lim", "melgan", "hifigan_v1", "vocos",
+            "bigvgan_base", "bigvgan_112m", "bigvgan_v2_22khz_fullband",
+        ]
+        quality, detection = self._frames(conds)
         stats = spearman_headline(
             primary_ladder_frame(quality, why="test"),
             primary_ladder_frame(detection, why="test"),
             protocol=Protocol.MATCHED,
         )
-        assert stats["n_conditions"] == 4
-        assert is_band_exempt("bigvgan_v2_22khz_fullband")
+        # 7 conditions minus griffin_lim and the paired control.
+        assert stats["n_conditions"] == 5
 
-    def test_paired_bandwidth_contrast_reports_the_delta(self):
-        from detectors.protocols import Protocol, paired_bandwidth_contrast
+    def test_melgan_fullband_is_gone(self):
+        """It was the same checkpoint as melgan differing only in the
+        generation-time filter; with a full-band archive it is a duplicate."""
+        from vocoders.registry import ALL_CONDITIONS, SPECS
 
-        detection = pd.DataFrame(
-            {
-                "condition": ["bigvgan_112m", "bigvgan_v2_22khz_fullband"],
-                "protocol": ["matched", "matched"],
-                "tier": [ARCHIVE_TIER, ARCHIVE_TIER],
-                "detector": ["aasist", "aasist"],
-                "eer": [0.30, 0.10],
-            }
-        )
-        out = paired_bandwidth_contrast(detection, protocol=Protocol.MATCHED)
-        assert out["delta_eer"] == pytest.approx(-0.20)
-        assert out["tier"] == ARCHIVE_TIER
+        assert "melgan_fullband" not in SPECS
+        assert "melgan_fullband" not in ALL_CONDITIONS
 
-    def test_bandwidth_probe_hit_on_the_control_is_not_a_leak(self):
-        """The control differs in bandwidth by design; flagging it trains
-        people to ignore the column."""
+    def test_bandwidth_probe_hit_is_by_design_for_excluded_conditions(self):
         from experiments.sanity_checks import _verdict
 
         leak = _verdict("bandwidth_rolloff", "hifigan_v1", 0.0, ARCHIVE_TIER)
         assert leak["leaked"] is True
 
-        by_design = _verdict(
-            "bandwidth_rolloff", "bigvgan_v2_22khz_fullband", 0.0, ARCHIVE_TIER
-        )
-        assert by_design["leaked"] is False
-        assert by_design["expected_by_design"] is True
+        for cond in ("griffin_lim", "bigvgan_v2_22khz_fullband"):
+            v = _verdict("bandwidth_rolloff", cond, 0.0, ARCHIVE_TIER)
+            assert v["leaked"] is False and v["expected_by_design"] is True
 
-        # Every other probe still blocks, exempt or not.
-        still_blocks = _verdict(
-            "silence_duration", "bigvgan_v2_22khz_fullband", 0.0, ARCHIVE_TIER
-        )
-        assert still_blocks["leaked"] is True
+        still = _verdict("silence_duration", "griffin_lim", 0.0, ARCHIVE_TIER)
+        assert still["leaked"] is True
+
+
+class TestHighBandDistance:
+    """TASK 3: right AMOUNT of high-band energy is not right CONTENT."""
+
+    def _real(self, n=None):
+        n = n or ARCHIVE_SR
+        rng = np.random.default_rng(3)
+        t = np.arange(n) / ARCHIVE_SR
+        x = sum(0.3 / k * np.sin(2 * np.pi * 140 * k * t) for k in range(1, 78))
+        x = x * np.hanning(n) + 0.01 * rng.standard_normal(n)
+        return (0.3 * x / np.max(np.abs(x))).astype(np.float32)
+
+    def test_identity_is_perfect(self):
+        from metrics.spectral import high_band_distance
+
+        r = self._real()
+        out = high_band_distance(r, r)
+        assert out["hb_lsd"] == pytest.approx(0.0, abs=1e-9)
+        assert out["hb_corr"] == pytest.approx(1.0, abs=1e-9)
+        assert out["hb_frac_ratio"] == pytest.approx(1.0, abs=1e-9)
+
+    def test_hard_bandwidth_zero_is_visible(self):
+        """Griffin-Lim's failure mode: no content at all above the band."""
+        from scipy.signal import cheby2, sosfiltfilt
+
+        from metrics.spectral import high_band_distance
+
+        r = self._real()
+        sos = cheby2(12, 100, LADDER_FMAX / (ARCHIVE_SR / 2), btype="low", output="sos")
+        gl = sosfiltfilt(sos, r).astype(np.float32)
+        out = high_band_distance(r, gl)
+        assert out["hb_frac_deg"] == pytest.approx(0.0, abs=1e-12)
+        assert out["hb_frac_ratio"] == pytest.approx(0.0, abs=1e-9)
+        assert out["hb_lsd"] > 50.0
+
+    def test_right_energy_wrong_structure_is_caught(self):
+        """The whole reason this metric exists: an energy fraction cannot see it.
+
+        Replace the high band with noise scaled to the SAME energy. The energy
+        ratio reads ~1.0 -- indistinguishable from a perfect reconstruction --
+        while the spectral distance and correlation both collapse.
+        """
+        from scipy.signal import butter, sosfiltfilt
+
+        from metrics.spectral import high_band_distance
+
+        r = self._real()
+        nyq = ARCHIVE_SR / 2
+        hp = butter(8, LADDER_FMAX / nyq, btype="high", output="sos")
+        lp = butter(8, LADDER_FMAX / nyq, btype="low", output="sos")
+
+        low = sosfiltfilt(lp, r)
+        real_high = sosfiltfilt(hp, r)
+        rng = np.random.default_rng(11)
+        noise_high = sosfiltfilt(hp, rng.standard_normal(len(r)))
+        noise_high *= np.sqrt(np.mean(real_high**2) / np.mean(noise_high**2))
+        fake = (low + noise_high).astype(np.float32)
+
+        out = high_band_distance(r, fake)
+        assert 0.5 < out["hb_frac_ratio"] < 2.0, "energy should look about right"
+        assert out["hb_lsd"] > 3.0, "but the structure should not"
+        assert out["hb_corr"] < 0.9
+
+    def test_rejects_unaligned_pairs(self):
+        from metrics.spectral import high_band_distance
+
+        with pytest.raises(InvariantViolation, match="INV-06"):
+            high_band_distance(self._real(), self._real(ARCHIVE_SR // 2))
+
+    def test_rejects_a_band_outside_nyquist(self):
+        from metrics.spectral import high_band_distance
+
+        r = self._real()
+        with pytest.raises(InvariantViolation, match="not inside"):
+            high_band_distance(r, r, lo=12_000.0)
+
+    def test_wired_into_the_runner(self):
+        import inspect
+
+        from metrics import runner
+
+        src = inspect.getsource(runner.evaluate_archive)
+        assert "high_band_distance" in src
 
 
 class TestOutOfBandCalibration:
@@ -1222,13 +1241,6 @@ class TestINV08CheckpointDigest:
         digest = fetch_and_verify(p, spec, allow_first_use=True)
         assert len(digest) == 64
 
-    def test_melgan_pair_must_share_one_digest(self):
-        """They are the same file; a divergence voids the controlled contrast."""
-        from vocoders.registry import get_spec
-
-        a, b = get_spec("melgan"), get_spec("melgan_fullband")
-        assert a.checkpoint == b.checkpoint
-        assert a.checkpoint_sha256 == b.checkpoint_sha256
 
 
 class TestBandwidthPairs:
@@ -1237,55 +1249,28 @@ class TestBandwidthPairs:
     def _detection(self):
         return pd.DataFrame(
             {
-                "condition": ["melgan", "melgan_fullband", "bigvgan_112m",
-                              "bigvgan_v2_22khz_fullband"],
-                "protocol": ["matched"] * 4,
-                "tier": [ARCHIVE_TIER] * 4,
-                "detector": ["aasist"] * 4,
-                "eer": [0.20, 0.08, 0.30, 0.10],
+                "condition": ["melgan", "bigvgan_112m", "bigvgan_v2_22khz_fullband"],
+                "protocol": ["matched"] * 3,
+                "tier": [ARCHIVE_TIER] * 3,
+                "detector": ["aasist"] * 3,
+                "eer": [0.20, 0.30, 0.10],
             }
         )
 
-    def test_melgan_fullband_is_exempt_and_excluded(self):
-        from vocoders.registry import CONTROL_CONDITIONS, LADDER
+    def test_only_the_bigvgan_pair_remains(self):
+        """The melgan pair was one checkpoint with and without the
+        generation-time filter; a full-band archive makes both sides identical."""
+        from detectors.protocols import BANDWIDTH_PAIRS
 
-        assert is_band_exempt("melgan_fullband")
-        assert "melgan_fullband" in CONTROL_CONDITIONS
-        assert "melgan_fullband" not in LADDER
+        assert set(BANDWIDTH_PAIRS) == {"bigvgan"}
 
-    def test_primary_correlation_refuses_melgan_fullband(self):
-        from detectors.protocols import Protocol, spearman_headline
-
-        quality = pd.DataFrame(
-            {"condition": ["griffin_lim", "melgan", "hifigan_v1", "melgan_fullband"],
-             "utmos_mean": [2.0, 2.5, 3.5, 2.6]}
-        )
-        detection = pd.DataFrame(
-            {"condition": ["griffin_lim", "melgan", "hifigan_v1", "melgan_fullband"],
-             "protocol": ["matched"] * 4, "tier": [ARCHIVE_TIER] * 4,
-             "detector": ["aasist"] * 4, "eer": [0.01, 0.20, 0.12, 0.08]}
-        )
-        with pytest.raises(InvariantViolation, match="INV-17"):
-            spearman_headline(quality, detection, protocol=Protocol.MATCHED)
-
-    def test_both_pairs_resolve(self):
-        from detectors.protocols import BANDWIDTH_PAIRS, paired_bandwidth_contrast
-
-        assert set(BANDWIDTH_PAIRS) == {"bigvgan", "melgan"}
-        det = self._detection()
-        big = paired_bandwidth_contrast(det, pair="bigvgan")
-        mel = paired_bandwidth_contrast(det, pair="melgan")
-        assert big["delta_eer"] == pytest.approx(-0.20)
-        assert mel["delta_eer"] == pytest.approx(-0.12)
-
-    def test_pairs_report_whether_they_share_weights(self):
-        """The reader needs this to interpret delta_eer: shared weights isolate
-        the delivery filter, separate checkpoints isolate training bandwidth."""
+    def test_bigvgan_pair_resolves(self):
         from detectors.protocols import paired_bandwidth_contrast
 
-        det = self._detection()
-        assert paired_bandwidth_contrast(det, pair="melgan")["shared_weights"] is True
-        assert paired_bandwidth_contrast(det, pair="bigvgan")["shared_weights"] is False
+        out = paired_bandwidth_contrast(self._detection(), pair="bigvgan")
+        assert out["delta_eer"] == pytest.approx(-0.20)
+        assert out["shared_weights"] is False
+
 
     def test_unknown_pair_rejected(self):
         from detectors.protocols import paired_bandwidth_contrast
@@ -1518,8 +1503,9 @@ class TestINV07SingleOrdering:
             assert ref_lufs == voc_lufs
             assert ref_oob == voc_oob
 
-    def test_exempt_condition_also_agrees(self):
-        """The exemption branch is shared too, not duplicated."""
+    def test_control_condition_also_agrees(self):
+        """Every condition runs the identical pipeline now -- INV-17 no longer
+        filters at generation, so there is no exempt branch to diverge."""
         from data.preprocess import (
             derive_trim_span,
             finalise_reference,
@@ -1530,10 +1516,10 @@ class TestINV07SingleOrdering:
         span = derive_trim_span(wav, "u7")
         cond = "bigvgan_v2_22khz_fullband"
 
-        a, la, oa = finalise_reference(wav, span, condition=cond)
-        b, lb, ob = process_condition_output(wav, ARCHIVE_SR, span, condition=cond)
+        a, la, ha = finalise_reference(wav, span, condition=cond)
+        b, lb, hb = process_condition_output(wav, ARCHIVE_SR, span, condition=cond)
         assert np.array_equal(a, b)
-        assert la == lb and oa is None and ob is None
+        assert la == lb and ha == hb
 
     def test_phase_a_real_and_identity_vocoder_produce_identical_files(
         self, tmp_path, monkeypatch

@@ -9,11 +9,17 @@ Eight conditions are generated but only six are rungs.
 
 ``LADDER`` (6)              the primary ladder, what the headline correlation
                             runs over.
-``CONTROL_CONDITIONS`` (2)  ``melgan_fullband`` and
-                            ``bigvgan_v2_22khz_fullband``. Exempt from INV-17,
-                            excluded from the primary correlation by
-                            :func:`detectors.protocols.spearman_headline`, which
-                            refuses to compute rho over a frame containing them.
+``CONTROL_CONDITIONS`` (1)  ``bigvgan_v2_22khz_fullband``: a separately
+                            trained checkpoint differing from ``bigvgan_112m``
+                            in mel fmax alone. Excluded from the primary
+                            correlation by
+                            :func:`detectors.protocols.spearman_headline`.
+
+``melgan_fullband`` was removed when INV-17 moved to analysis time. It was the
+same checkpoint as ``melgan`` differing only in whether the generation-time
+filter ran; with a full-band archive the two produce byte-identical audio, so it
+became a duplicate condition. The contrast it provided is now an analysis
+choice on ``melgan`` itself.
 ``UNAVAILABLE`` (1)         ``specdiff_gan``: declared, audited, and not
                             generable because its weights were never released.
                             Kept in ``SPECS`` so the substitution is visible in
@@ -26,11 +32,11 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from data.invariants import (
-    BAND_EXEMPT_CONDITIONS,
+    CORRELATION_EXCLUDED,
     PRIMARY_LADDER,
     UNAVAILABLE_CONDITIONS,
     InvariantViolation,
-    is_band_exempt,
+    is_correlation_excluded,
 )
 
 from .base import Vocoder, VocoderSpec
@@ -44,8 +50,6 @@ from .hifigan import SPEC as HIFIGAN_SPEC
 from .hifigan import HiFiGAN
 from .melgan import SPEC as MELGAN_SPEC
 from .melgan import MelGAN
-from .melgan_fullband import SPEC as MELGAN_FULLBAND_SPEC
-from .melgan_fullband import MelGANFullband
 from .specdiff_gan import SPEC as SPECDIFF_SPEC
 from .specdiff_gan import SpecDiffGAN
 from .vocos import SPEC as VOCOS_SPEC
@@ -57,10 +61,7 @@ LADDER: tuple[str, ...] = PRIMARY_LADDER
 
 # Paired controls: real conditions, generated and measured like any other, but
 # never averaged into the headline number.
-CONTROL_CONDITIONS: tuple[str, ...] = (
-    "melgan_fullband",
-    "bigvgan_v2_22khz_fullband",
-)
+CONTROL_CONDITIONS: tuple[str, ...] = ("bigvgan_v2_22khz_fullband",)
 
 # Declared but not generable: weights are not publicly available. Kept in SPECS
 # so the audit trail survives the substitution (INV-08) and so the replacement
@@ -81,7 +82,6 @@ SPECS: dict[str, VocoderSpec] = {
     "vocos": VOCOS_SPEC,
     "bigvgan_base": BIGVGAN_BASE_SPEC,
     "bigvgan_112m": BIGVGAN_LARGE_SPEC,
-    "melgan_fullband": MELGAN_FULLBAND_SPEC,
     "bigvgan_v2_22khz_fullband": BIGVGAN_FULLBAND_SPEC,
     # Declared but unavailable; excluded from ALL_CONDITIONS.
     "specdiff_gan": SPECDIFF_SPEC,
@@ -94,31 +94,29 @@ _BUILDERS: dict[str, Callable[[], Vocoder]] = {
     "vocos": Vocos,
     "bigvgan_base": lambda: BigVGAN(BIGVGAN_BASE_SPEC),
     "bigvgan_112m": lambda: BigVGAN(BIGVGAN_LARGE_SPEC),
-    "melgan_fullband": MelGANFullband,
     "bigvgan_v2_22khz_fullband": lambda: BigVGAN(BIGVGAN_FULLBAND_SPEC),
     "specdiff_gan": SpecDiffGAN,
 }
 
-# Keep the three declarations of "what is exempt" from drifting apart. The spec
-# flag, the invariants set and the control list must agree, or a condition could
-# be filtered by one code path and not another.
-_declared_exempt = {
+# Keep the declarations of "what is a control" from drifting apart. A control
+# is not in the primary ladder AND is correlation-excluded; a rung that is
+# correlation-excluded (griffin_lim) is a ladder member with an exclusion
+# reason, which is a different thing and must not be conflated.
+_declared_controls = {
     k for k, v in SPECS.items() if not v.primary_ladder and k not in UNAVAILABLE_CONDITIONS
 }
-if _declared_exempt != set(BAND_EXEMPT_CONDITIONS) or _declared_exempt != set(
-    CONTROL_CONDITIONS
-):
+if _declared_controls != set(CONTROL_CONDITIONS):
     raise InvariantViolation(
-        "INV-17: exemption declarations disagree. VocoderSpec.primary_ladder says "
-        f"{sorted(_declared_exempt)}, invariants.BAND_EXEMPT_CONDITIONS says "
-        f"{sorted(BAND_EXEMPT_CONDITIONS)}, registry.CONTROL_CONDITIONS says "
+        "INV-17: control declarations disagree. VocoderSpec.primary_ladder says "
+        f"{sorted(_declared_controls)}, registry.CONTROL_CONDITIONS says "
         f"{sorted(CONTROL_CONDITIONS)}."
     )
-if set(LADDER) & set(BAND_EXEMPT_CONDITIONS):
+_missing_reason = set(CONTROL_CONDITIONS) - set(CORRELATION_EXCLUDED)
+if _missing_reason:
     raise InvariantViolation(
-        "INV-17: an exempt condition is in the primary ladder. Exempt conditions "
-        "keep their full native band, so including one would put a bandwidth cliff "
-        "back into the headline correlation."
+        f"INV-17: controls {sorted(_missing_reason)} have no entry in "
+        "CORRELATION_EXCLUDED, so spearman_headline would silently pool them "
+        "into the headline number."
     )
 
 
@@ -135,8 +133,8 @@ def get_spec(key: str) -> VocoderSpec:
 
 
 def primary_ladder_only(conditions) -> list[str]:
-    """Drop exempt conditions from an arbitrary iterable, preserving order."""
-    return [c for c in conditions if not is_band_exempt(c)]
+    """Drop correlation-excluded conditions, preserving order."""
+    return [c for c in conditions if not is_correlation_excluded(c)]
 
 
 def checkpoint_audit(include_unavailable: bool = True) -> list[dict[str, object]]:
@@ -178,7 +176,7 @@ def checkpoint_audit(include_unavailable: bool = True) -> list[dict[str, object]
                 "role": "unavailable"
                 if unavailable
                 else ("ladder" if spec.primary_ladder else "control"),
-                "band": "exempt" if is_band_exempt(key) else "ladder",
+                "in_rho": not is_correlation_excluded(key),
                 "checkpoint": spec.checkpoint or "(none required)",
                 "pin": pin,
                 "mel_verified": mel_verified,

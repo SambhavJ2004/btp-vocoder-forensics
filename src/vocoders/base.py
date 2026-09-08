@@ -40,8 +40,9 @@ class VocoderSpec:
     checkpoint_sha256: str = ""
     upstream_commit: str = ""
     isolated_env: bool = True   # INV-13: never co-installed with other vocoders
-    # INV-17. Exempt conditions keep their full native band and are excluded
-    # from the primary correlation. Set only via BAND_EXEMPT_CONDITIONS.
+    # INV-17. False for paired controls: generated and reported, but not a rung.
+    # Correlation exclusion is declared in invariants.CORRELATION_EXCLUDED, which
+    # also covers rungs excluded for other reasons (griffin_lim).
     primary_ladder: bool = True
     notes: str = ""
 

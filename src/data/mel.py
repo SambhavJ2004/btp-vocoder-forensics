@@ -157,16 +157,6 @@ VOCOS_MEL = MelConfig(
     ),
 )
 
-# MelGAN at its native band, exempt from INV-17. Same checkpoint and same mel as
-# `melgan`; the two differ only in whether the ladder band is applied on the way
-# out. See CLAUDE.md INV-17 for why that makes it a weaker contrast than the
-# BigVGAN pair.
-MELGAN_FULLBAND_MEL = _lj_config(
-    AUDITED_MEL_FMAX["melgan_fullband"],
-    "descriptinc/melgan-neurips Audio2Mel defaults (mel_fmax=None -> 11025); "
-    "identical to melgan, delivered without the ladder band",
-)
-
 BIGVGAN_BASE_22K_MEL = _lj_config(
     AUDITED_MEL_FMAX["bigvgan_base"],
     "nvidia/bigvgan_base_22khz_80band config.json",
@@ -184,8 +174,15 @@ BIGVGAN_V2_22K_FULLBAND_MEL = _lj_config(
 )
 
 # Griffin-Lim has no checkpoint, so its front-end is ours to choose. It is set
-# to the ladder band rather than to any model's value: it neither constrains
-# LADDER_FMAX nor escapes it. See docs/mel_configs.md.
+# to the analysis band rather than to any model's value: it neither constrains
+# LADDER_FMAX nor escapes it.
+#
+# Unlike every other condition, this value is a HARD CEILING on its output.
+# Griffin-Lim inverts the mel to a linear spectrogram and runs ISTFT, so it
+# cannot emit above fmax at all -- measured high-band fraction 0.00000. Every
+# other condition is a time-domain upsampler whose fmax constrains only what it
+# is TOLD, not what it produces. That asymmetry is why griffin_lim is a floor
+# reference rather than a rung in the correlation. See docs/mel_configs.md.
 GRIFFIN_LIM_MEL = _lj_config(
     LADDER_FMAX,
     "no checkpoint; front-end is a project decision, set to LADDER_FMAX",

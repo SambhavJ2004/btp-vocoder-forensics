@@ -8,7 +8,17 @@ phase-coherence cue the study expects detectors to exploit.
 Fully implementable with no checkpoint, so this is the condition Person A ships
 first in the v0 dataset. Having no checkpoint also means its mel front-end is a
 project decision rather than a model property: it is set to LADDER_FMAX, so it
-follows the ladder band instead of constraining it (INV-17).
+follows the analysis band instead of constraining it (INV-17).
+
+**It is a floor reference, not a rung in the correlation.** Griffin-Lim
+reconstructs by inverting the mel to a linear spectrogram and running ISTFT, so
+it structurally cannot emit above fmax: measured high-band fraction 0.00000,
+against 0.01803 for real. Every other condition is a time-domain upsampler that
+produces full-band output regardless of what the mel carried. That makes
+Griffin-Lim's detectability a bandwidth artifact rather than a reconstruction
+artifact, and at the low-quality end of the ladder it would anchor a strong
+positive Spearman for a reason unrelated to the hypothesis. It is generated and
+reported; `spearman_headline` refuses it (INV-17, CORRELATION_EXCLUDED).
 """
 
 from __future__ import annotations

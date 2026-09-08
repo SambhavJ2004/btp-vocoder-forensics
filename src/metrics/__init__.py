@@ -6,6 +6,15 @@ this package does not require the ``[quality]`` extra.
 """
 
 from .mcd import mcd
-from .spectral import log_spectral_distance_by_band, spectral_centroid_shift
+from .spectral import (
+    high_band_distance,
+    log_spectral_distance_by_band,
+    spectral_centroid_shift,
+)
 
-__all__ = ["log_spectral_distance_by_band", "mcd", "spectral_centroid_shift"]
+__all__ = [
+    "high_band_distance",
+    "log_spectral_distance_by_band",
+    "mcd",
+    "spectral_centroid_shift",
+]
