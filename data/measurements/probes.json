@@ -4,6 +4,9 @@
   "classifier": "LogisticRegression(max_iter=5000)",
   "features": "log mean magnitude spectrum, n_fft=1024 hop=256",
   "quantisation": "PCM_16 grid",
+  "pipeline_order": "resample -> loudness normalise (if any) -> quantise",
+  "loudness_variants": "both recorded; keys with _norm are normalised",
+  "target_lufs": -27.0,
   "ladder_fmax": 8000,
   "kaiser_params": {
     "lowpass_filter_width": 64,
@@ -14,7 +17,8 @@
   "corpus": "/kaggle/input/datasets/mathurinache/the-lj-speech-dataset/LJSpeech-1.1/wavs/LJ001-0001.wav",
   "probes": {
     "real_vs_rt_default": {
-      "ratio_highband": 0.8005038652704736,
+      "ratio_highband": 0.8005,
+      "loudness_normalised": false,
       "auroc_below": 0.5291,
       "auroc_below_std": 0.0024,
       "auroc_above": 1.0,
@@ -23,7 +27,8 @@
       "auroc_full_std": 0.0
     },
     "real_vs_rt_kaiser": {
-      "ratio_highband": 0.9997367196968923,
+      "ratio_highband": 0.99974,
+      "loudness_normalised": false,
       "auroc_below": 0.5,
       "auroc_below_std": 0.0,
       "auroc_above": 0.9935,
@@ -32,7 +37,8 @@
       "auroc_full_std": 0.0071
     },
     "real_vs_rt_soxr": {
-      "ratio_highband": 0.9922228785526435,
+      "ratio_highband": 0.99222,
+      "loudness_normalised": false,
       "auroc_below": 0.5,
       "auroc_below_std": 0.0,
       "auroc_above": 1.0,
@@ -41,13 +47,58 @@
       "auroc_full_std": 0.0
     },
     "kaiser_1x_vs_2x": {
-      "ratio_highband": 0.9997942163510827,
+      "ratio_highband": 0.99979,
+      "loudness_normalised": false,
       "auroc_below": 0.5,
       "auroc_below_std": 0.0,
       "auroc_above": 0.9928,
       "auroc_above_std": 0.0073,
       "auroc_full": 0.9918,
       "auroc_full_std": 0.0066
+    },
+    "real_vs_rt_default_norm": {
+      "ratio_highband": 0.8005,
+      "loudness_normalised": true,
+      "mean_gain_delta_db": 0.02986,
+      "auroc_below": 0.5348,
+      "auroc_below_std": 0.0018,
+      "auroc_above": 1.0,
+      "auroc_above_std": 0.0,
+      "auroc_full": 1.0,
+      "auroc_full_std": 0.0
+    },
+    "real_vs_rt_kaiser_norm": {
+      "ratio_highband": 0.99976,
+      "loudness_normalised": true,
+      "mean_gain_delta_db": 4.62e-05,
+      "auroc_below": 0.5,
+      "auroc_below_std": 0.0,
+      "auroc_above": 0.9989,
+      "auroc_above_std": 0.0011,
+      "auroc_full": 0.9972,
+      "auroc_full_std": 0.0043
+    },
+    "real_vs_rt_soxr_norm": {
+      "ratio_highband": 0.99223,
+      "loudness_normalised": true,
+      "mean_gain_delta_db": 0.001534,
+      "auroc_below": 0.5,
+      "auroc_below_std": 0.0,
+      "auroc_above": 1.0,
+      "auroc_above_std": 0.0,
+      "auroc_full": 1.0,
+      "auroc_full_std": 0.0
+    },
+    "kaiser_1x_vs_2x_norm": {
+      "ratio_highband": 0.99979,
+      "loudness_normalised": true,
+      "mean_gain_delta_db": 4.046e-05,
+      "auroc_below": 0.5,
+      "auroc_below_std": 0.0,
+      "auroc_above": 0.9941,
+      "auroc_above_std": 0.0065,
+      "auroc_full": 0.9925,
+      "auroc_full_std": 0.0076
     }
   }
 }
