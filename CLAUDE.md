@@ -129,7 +129,8 @@ band-limited primary analysis (INV-18). Source:
 The original finding used synthetic audio. Whether the pinned round trip is
 **at chance below** `LADDER_FMAX` on the real corpus is now committed: 0.5000 ±
 0.0000 below, 0.9935 above (`data/measurements/probes.json`, 200 LJSpeech files,
-grouped CV; see INV-18). Reproduced by `TestVocosResampleSignature` and
+grouped CV), and 0.5000 below, 0.9989 above with the pipeline's loudness
+normalisation (see INV-18). Reproduced by `TestVocosResampleSignature` and
 `TestINV18ResampleProbe`.
 
 **Vocos's resampler is pinned, and differs from `RESAMPLE_METHOD`.** Both its
@@ -755,6 +756,20 @@ it re-runs analyses and leaves the archive alone. That is INV-17's own argument
 paying out: a generation-time filter would have meant regenerating every
 condition.
 
+**The ablation sweep uses the same design.** `detectors.bandlimit.lowpass` was a
+zero-phase Butterworth order 8, and it failed the sweep both ways it can. Its
+transition *straddled* every cutoff (−6 dB at the cutoff, −20 dB 130–480 Hz above
+it). It also attenuated without equalising, leaving 7e-06 to 3e-04 of total energy
+above the cutoff. A retrained detector could still learn the band a cutoff was
+meant to remove, and the collapse point would read too high. It now calls
+`band_limit_sos` at each cutoff. Measured directly at every cutoff from 1 to
+10 kHz: −1 dB at cutoff − 84..86 Hz, −3 dB at cutoff − 77..79 Hz, −20 dB at
+cutoff − 59..62 Hz, ≤ −200 dB at and above the cutoff, and a residual at the
+float32 floor. It costs order 31–60 against 8, a 22–44 ms impulse response against
+1.5–5.8 ms, and 3–7× the filtering compute, all negligible next to retraining a
+detector per cutoff. At `LADDER_FMAX` the sweep point is byte-identical to the
+primary analysis. Per-cutoff table: [`docs/measurements.md`](docs/measurements.md).
+
 **Measuring the stopband needs a Blackman window.** Not Blackman-Harris:
 Blackman-Harris minimises the *peak* sidelobe (−92 dB) but has flat asymptotic
 rolloff, while Blackman's peak is worse (−58 dB) and it rolls off at
@@ -800,7 +815,10 @@ disagrees with `invariants.band_limit_order`),
 `data.invariants.check_band_limit` (gates the transform's output),
 `TestINV17BandLimitResponse` (pins −1 dB and −20 dB, measured by impulse and by
 tone; asserts nothing at or above `LADDER_FMAX` survives; mutation-checks that the
-order-12 design fails),
+order-12 design fails), `detectors.bandlimit.lowpass` (the sweep, same design at
+every cutoff) with `TestBandlimit` (transition below every cutoff, residual at the
+storage floor, derived order per cutoff, identical to the analysis band limit at
+`LADDER_FMAX`, mutation-checks that Butterworth-8 straddles every cutoff),
 `data.manifest._validate_band` (**asserts the archive is full-band** — the
 inverse of what it used to assert). Membership of the two analyses is INV-18.
 
@@ -883,8 +901,9 @@ analysis removes.
   [10900, 11025) Hz that makes it indistinguishable from resampled real audio
   and separable from an unresampled vocoder at AUROC 0.9997. Those figures
   describe a Vocos resampled with the torchaudio default, before the pin;
-  the pinned kaiser round trip is still separable above the band at 0.9935
-  (`probes.json`), and the exclusion cites both.
+  the pinned kaiser round trip is still separable above the band at 0.9935,
+  and at 0.9989 with the pipeline's loudness normalisation (`probes.json`). The
+  exclusion cites all three.
 
 A **blanket exclusion loses usable data**: removing Griffin-Lim from every
 analysis throws away its below-band reconstruction behaviour, which is exactly
@@ -913,19 +932,21 @@ refuses any detection row whose audio can carry content above `LADDER_FMAX` —
 archive rows without `band_limit_hz`, or a tier whose Nyquist exceeds the band.
 This is load-bearing rather than tidy: Griffin-Lim is only safe in the headline
 *because* the headline is band-limited. Admit full-band rows and its cliff comes
-straight back.
+straight back. Band-limiting removes the cliff's *content*, though, not its effect on the
+full-band loudness gain; see the open item on per-condition gain deltas.
 
 **Vocos below the band — established by committed measurement.** Vocos's
 inclusion in the primary analysis rests on its resampler leaving no artifact below
 `LADDER_FMAX`. `data/measurements/probes.json` measures exactly the pinned
 resampler (parameters checked equal to `VOCOS_RESAMPLER`) on 200 LJSpeech files,
-`GroupKFold(5)` by utterance, PCM_16:
+`GroupKFold(5)` by utterance, PCM_16, both without and with the pipeline's
+loudness normalisation (resample → normalise → quantise):
 
-| round trip vs real | high-band ratio | AUROC below `LADDER_FMAX` | above (control) |
-|---|---|---|---|
-| **kaiser (pinned)** | 0.9997 | **0.5000 ± 0.0000** | **0.9935 ± 0.0056** |
-| soxr | 0.9922 | 0.5000 ± 0.0000 | 1.0000 |
-| torchaudio default | 0.8005 | **0.5291 ± 0.0024** | 1.0000 |
+| round trip vs real | high-band ratio | gain delta (normalised) | AUROC below, raw → normalised | above (control), raw → normalised |
+|---|---|---|---|---|
+| **kaiser (pinned)** | 0.9997 | 4.62e-05 dB | **0.5000 → 0.5000** | **0.9935 → 0.9989** |
+| soxr | 0.9922 | 0.001534 dB | 0.5000 → 0.5000 | 1.0000 → 1.0000 |
+| torchaudio default | 0.8005 | 0.02986 dB | **0.5291 → 0.5348** | 1.0000 → 1.0000 |
 
 **0.5000 ± 0.0000 is degenerate, not noisy chance, and not a bug.** It means the
 classifier gave both versions of every utterance the same score. lbfgs starts at
@@ -938,15 +959,34 @@ and in the **same** band it reads a non-degenerate 0.5291 for the lossier defaul
 above-band control is under `PROBE_CONTROL_MIN_AUROC`. Full reasoning, with the
 mechanism reproduced: [`docs/measurements.md`](docs/measurements.md).
 
-**The loudness step.** `probes.json` does not record loudness normalisation, and
-the pipeline normalises on the full band. A round trip that removes high-band
-energy therefore gets a slightly larger gain, which shifts every below-band bin.
-Locally this coupling is what moved the synthetic probe to 0.54–0.57. The same
-probe is 0.5000 without loudness normalisation, which explains the earlier
-"configuration-sensitive, 0.50–0.69". Measured resampler-free at the committed
-ratios, through loudness → PCM_16 → band limit, the pinned ratio's gain
-difference is 6.4e-5 dB and the probe stays at 0.5000 ± 0.0000. At the default's
-ratio the same path reads 0.532. `TestINV18LoudnessCoupling` pins both.
+**The loudness step — a threshold with a margin, not a gate.** The pipeline
+normalises on the full band, so a round trip that removes high-band energy gets a
+slightly larger gain, which shifts every below-band bin. Measured on real audio
+(the `_norm` probes above), the coupling shows at a 0.02986 dB gain delta
+(0.5291 → 0.5348) and not at 0.001534 dB or 4.62e-05 dB.
+
+- **It is a bracket.** Onset lies in (0.001534, 0.02986] dB. "~0.0015 dB" is the
+  highest measured null, not a located threshold.
+- **It is this probe's resolution.** A gain delta moves every log feature equally,
+  and lbfgs never leaves zero below ~0.0035 dB (natural log) or ~0.008 dB (log10).
+  That predicts this bracket exactly. The shift does not vanish below it; it drops
+  below what this linear probe resolves.
+- **The pin's margin.** The pinned resampler sits **33× below the highest null**
+  and 646× below the lowest detection. `LOUDNESS_COUPLING_MIN_MARGIN` requires 10×.
+  33× does not reach 100×.
+
+This also explains the local synthetic probe's 0.54–0.57 and the earlier
+"configuration-sensitive, 0.50–0.69": synthetic audio loses far more high-band
+energy to `soxr_hq`. The coupling is not specific to resamplers. See the open item
+on per-condition gain deltas below.
+
+**Normalisation and the high-band evidence.** Under the pipeline's normalisation,
+above-band separability is not weaker: kaiser 0.9935 → 0.9989 (fold std 0.0056 →
+0.0011), once vs twice 0.9928 → 0.9941. The Vocos exclusion and the uniform
+round-trip rejection are at least as well supported under the real pipeline as the
+un-normalised probe indicated. Each rise is within about one un-normalised fold
+std and per-fold values are not recorded. So "not weaker" is established, while
+"normalisation sharpens it" is not. Griffin-Lim's exclusion is unaffected.
 
 The earlier "reported 0.502" is in no artifact and has no counterpart here. If it
 was the default resampler, the committed 0.5291 disagrees with it.
@@ -956,7 +996,7 @@ not proposed again. The idea was to pass *every* condition through the same
 22050 → 24000 → 22050 round trip, so Vocos would no longer be the only condition
 with a resampler imprint. It fails because **resampling is not idempotent**: one
 kaiser round trip versus two is separable at **AUROC 0.9928 above the band**
-(0.9918 full; `probes.json`). Adding a round trip to the other conditions gives
+(0.9918 full; 0.9941 above with loudness normalisation; `probes.json`). Adding a round trip to the other conditions gives
 every condition an imprint and Vocos a *different* one; it does not make them
 path-identical. Below the band once and twice are indistinguishable (0.5000),
 which is consistent: no round trip was needed there. The figure previously
@@ -972,28 +1012,38 @@ systematically inverted — 0.13 against the grouped 0.57 on identical data.
 
 **Constants.** `PRIMARY_ANALYSIS`, `HIGH_BAND_ANALYSIS`, `ANALYSIS_EXCLUSIONS`,
 `REJECTED_ALTERNATIVES`, `vocoders.vocos.VOCOS_RESAMPLER`,
-`PROBE_CONTROL_MIN_AUROC = 0.95`, `PROBE_CHANCE_MAX_DEVIATION = 0.01`.
+`PROBE_CONTROL_MIN_AUROC = 0.95`, `PROBE_CHANCE_MAX_DEVIATION = 0.01`,
+`LOUDNESS_COUPLING_OPERATING_PROBE = "real_vs_rt_kaiser_norm"`,
+`LOUDNESS_COUPLING_MIN_MARGIN = 10.0`.
 
 **Enforced by.** `data.invariants.ANALYSIS_EXCLUSIONS` (each `Exclusion` carries
 its `MeasurementRef`s; Vocos's also cites the pinned resampler's above-band
-0.9935), `data.measurements.verify` (recomputes every CSV statistic, and checks
+0.9935, and 0.9989 under loudness normalisation), `data.measurements.verify` (recomputes every CSV statistic, and checks
 every `probes.json` citation against the file),
 `data.measurements.probe_reading` (a below-band reading never exists without a
 separable above-band control), `vocoders.vocos.VOCOS_RESAMPLER.justification`
-(cites kaiser ratio 0.9997, kaiser below 0.5000, default below 0.5291),
+(cites kaiser ratio 0.9997, kaiser below 0.5000 raw and normalised, kaiser gain
+delta 4.62e-05 dB, default below 0.5291), `data.measurements.loudness_coupling`
+(derives the null/detection bracket and the pin's margin from every normalised
+probe in `probes.json`; raises if not monotone in gain delta),
 `detectors.protocols.spearman_headline`
 (refuses excluded conditions with the evidence, refuses controls by membership,
 refuses full-band rows), `detectors.protocols.refuse_excluded`,
 `metrics.spectral.high_band_distance` (refuses excluded conditions; `condition`
 is required so the refusal cannot be skipped), `data.manifest.analysis_frame`,
 `metrics.runner.evaluate_archive` (records exclusions rather than scoring them).
-Tests: `TestINV18PerAnalysisMembership` (every citation recomputed; refusals),
+Tests: `TestINV18PerAnalysisMembership` (every citation recomputed; refusals; the
+high-band evidence clears the control threshold under loudness normalisation),
 `TestINV18ResampleProbe` (**pinned kaiser at chance below the band, from
 `probes.json`**, formerly a strict xfail; default not at chance; local
 concentration above; grouped CV), `TestINV18ProbeControls` (every probe's
 above-band control separable; a reading without one refused; the exact-0.5
-mechanism reproduced), `TestINV18LoudnessCoupling` (the pinned ratio survives
-loudness normalisation; the default's does not), `TestINV18RejectedAlternatives`,
+mechanism reproduced), `TestINV18LoudnessCoupling` (**from `probes.json`, not a
+local synthetic run**: the pinned resampler at chance below the band after
+normalisation; soxr not detected; default detected as positive control; the
+bracket; the pin's margin ≥ 10× below the highest null, tied to the pinned
+parameters; the bracket reproduced from the solver's resolution),
+`TestINV18RejectedAlternatives`,
 `TestResamplerPin`, `TestMeasurementArtifacts` (`probes.json` measured exactly the
 pin).
 
@@ -1149,6 +1199,29 @@ nudge a pipeline toward a preferred answer.
   design put its −1 dB point at 6419 Hz. It is now specified by both edges and is
   −1 dB at 7915.5 Hz, −20 dB at 7940.3 Hz, at order 53. [7900, 8000) Hz remains
   the unavoidable transition (INV-17). Analysis-time only; no regeneration.
+- **RESOLVED — the ablation sweep's Butterworth-8 straddled every cutoff.**
+  −6 dB at the cutoff and 7e-06 to 3e-04 of energy surviving above it. Ported to
+  the two-edge design (INV-17): −1 dB at cutoff − 85 Hz, ≤ −200 dB at and above
+  the cutoff, order 31–60. Analysis-time only; no regeneration.
+- **OPEN — the loudness coupling is not specific to resamplers (estimated, not
+  measured).** Loudness is normalised on the full band, so every condition with
+  less high-band energy than real gets a larger gain, and so a below-band level
+  offset in the band-limited primary analysis. Scaling from the committed
+  `_norm` deltas (7.4–9.8 dB per unit of total energy removed above
+  `LADDER_FMAX`) gives about 0.03–0.04 dB for BigVGAN and Vocos (CSV high-band
+  ratios 0.8055 and 0.8040; the Vocos row predates the pin). That is the size
+  at which the default resampler's coupling *was* detected. It gives about
+  0.15–0.20 dB for Griffin-Lim, a trace of
+  the cliff INV-18 relies on the band limit to remove. The manifest records
+  `lufs_out` but not the gain applied, so none of this can be read back from
+  Phase A.
+  Needed, in order:
+  1. Record the pre-normalisation loudness per file.
+  2. Measure the per-condition gain delta against real.
+  3. Only then decide whether the primary analysis needs level matching on the
+     band-limited signal. That would be an analysis-time transform like the band
+     limit itself, and a change to INV-04 / INV-07 to be made deliberately, not
+     patched in. See [`docs/measurements.md`](docs/measurements.md).
 - **Regenerate every condition.** The archive changed meaning: files produced
   under the old INV-17 are band-limited at 8 kHz and cannot be reused. Nothing
   generated before this change is valid.

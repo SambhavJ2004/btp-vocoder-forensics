@@ -240,7 +240,10 @@ ANALYSIS_EXCLUSIONS: Final[dict[str, dict[str, Exclusion]]] = {
                 "it there is the resampler, not the vocoder. Those sliver figures "
                 "describe a Vocos resampled with the torchaudio DEFAULT, before "
                 "the pin; under the pinned kaiser resampler the round trip is "
-                "still separable above LADDER_FMAX (AUROC 0.9935)."
+                "still separable above LADDER_FMAX (AUROC 0.9935), and under the "
+                "pipeline's own loudness normalisation more so (0.9989 +- 0.0011). "
+                "The un-normalised probe understated the exclusion's support, if "
+                "anything; it did not overstate it."
             ),
             measurements=(
                 MeasurementRef(_BAND_CSV, "vocos", _EDGE, "mean", 8.630273e-07),
@@ -250,8 +253,12 @@ ANALYSIS_EXCLUSIONS: Final[dict[str, dict[str, Exclusion]]] = {
                     _BAND_CSV, "vocos", _EDGE, "auroc_vs:real_roundtrip", 0.507222,
                     rel_tol=1e-3,
                 ),
-                # the imprint under the resampler Vocos actually uses now
+                # the imprint under the resampler Vocos actually uses now...
                 MeasurementRef(_PROBES, "real_vs_rt_kaiser", "auroc_above", "recorded", 0.9935),
+                # ...and under the pipeline order: resample -> normalise -> quantise
+                MeasurementRef(
+                    _PROBES, "real_vs_rt_kaiser_norm", "auroc_above", "recorded", 0.9989
+                ),
             ),
         ),
     },
@@ -310,6 +317,10 @@ REJECTED_ALTERNATIVES: Final[dict[str, RejectedAlternative]] = {
             # rejection, not against it: below LADDER_FMAX no round trip was
             # needed in the first place.
             MeasurementRef(_PROBES, "kaiser_1x_vs_2x", "auroc_below", "recorded", 0.5),
+            # Under loudness normalisation, the pipeline's own order. Kept as
+            # corroboration; measured_value stays at the lower, un-normalised
+            # figure.
+            MeasurementRef(_PROBES, "kaiser_1x_vs_2x_norm", "auroc_above", "recorded", 0.9941),
         ),
     ),
 }
@@ -331,6 +342,34 @@ PROBE_CONTROL_MIN_AUROC: Final[float] = 0.95
 # control in the same band: the torchaudio DEFAULT round trip reads 0.5291 +-
 # 0.0024 below the band and must be (and is) classified NOT at chance.
 PROBE_CHANCE_MAX_DEVIATION: Final[float] = 0.01
+
+# --- INV-18  Loudness coupling: a threshold with a margin, not a gate --------
+# Loudness is normalised on the FULL band (INV-04). A condition that lost
+# high-band energy therefore gets a slightly larger gain, and the gain moves
+# every bin BELOW LADDER_FMAX too. probes.json measures it on 200 LJSpeech files
+# in the pipeline order resample -> normalise -> quantise (keys ending _norm):
+#
+#     round trip    mean gain delta   AUROC below LADDER_FMAX, raw -> normalised
+#     default       0.02986 dB        0.5291 -> 0.5348      detected
+#     soxr          0.001534 dB       0.5000 -> 0.5000      not detected
+#     kaiser (pin)  4.62e-05 dB       0.5000 -> 0.5000      not detected
+#
+# Read it as a BRACKET. Onset lies somewhere in (0.001534, 0.02986] dB; three
+# points do not locate it more finely than that factor of ~19.
+#
+# And read it as a property of THIS probe, not of the coupling. A gain delta g
+# shifts every log-magnitude feature by the same amount, and lbfgs never leaves
+# zero while 0.25 * shift < tol (1e-4): g < ~0.0035 dB for natural-log
+# features, ~0.008 dB for log10. That predicts exactly this bracket. The gain
+# shift itself does not vanish below 0.0015 dB; it falls below what a linear
+# probe on mean spectra resolves. A stronger detector could resolve less.
+#
+# The operating point is the pinned resampler: 33x below the highest measured
+# null (soxr), 646x below the lowest detected delta (default). A future
+# resampler must keep this factor below the highest null; the committed margin
+# is 33x, which clears 10x but NOT 100x.
+LOUDNESS_COUPLING_OPERATING_PROBE: Final[str] = "real_vs_rt_kaiser_norm"
+LOUDNESS_COUPLING_MIN_MARGIN: Final[float] = 10.0
 
 
 def _derive_ladder_fmax() -> float:

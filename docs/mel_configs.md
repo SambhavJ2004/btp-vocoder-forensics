@@ -139,6 +139,10 @@ listed for the record, not used.
 Exactly 0.5000 ± 0.0000 is a degenerate probe, not noisy chance. It is read only
 next to its above-band control; see [`measurements.md`](measurements.md).
 
+With the pipeline's loudness normalisation (probes ending `_norm`): kaiser reads
+0.5000 below and 0.9989 above at a 4.62e-05 dB gain delta; soxr 0.5000 below at
+0.001534 dB; the default 0.5348 below at 0.02986 dB.
+
 ### What this overturned
 
 INV-17 originally low-passed every condition at generation, on the config-derived
@@ -203,7 +207,8 @@ names a committed measurement.
 
 Griffin-Lim is back **in** the primary correlation: its cliff is above the band
 the primary analysis keeps. Vocos is in it because the pinned resampler reads
-0.5000 below the band with a 0.9935 above-band control (committed, 200 files; see
+0.5000 below the band with a 0.9935 above-band control (0.9989 with loudness
+normalisation; committed, 200 files; see
 INV-18 and [`measurements.md`](measurements.md)).
 
 **The resampler pin,** `vocoders.vocos.VOCOS_RESAMPLER`, cites the committed

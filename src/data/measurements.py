@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 from .invariants import (
+    LOUDNESS_COUPLING_OPERATING_PROBE,
     PROBE_CHANCE_MAX_DEVIATION,
     PROBE_CONTROL_MIN_AUROC,
     InvariantViolation,
@@ -167,6 +168,8 @@ class ProbeReading:
     control_auroc: float        # auroc_above: the positive control
     control_auroc_std: float
     ratio_highband: float
+    loudness_normalised: bool = False
+    mean_gain_delta_db: float | None = None   # recorded for normalised probes only
 
     @property
     def below_deviation(self) -> float:
@@ -200,7 +203,16 @@ def probe_reading(name: str, *, artifact: str = PROBES) -> ProbeReading:
         control_auroc=float(fields["auroc_above"]),
         control_auroc_std=float(fields["auroc_above_std"]),
         ratio_highband=float(fields["ratio_highband"]),
+        loudness_normalised=bool(fields.get("loudness_normalised", False)),
+        mean_gain_delta_db=(
+            float(fields["mean_gain_delta_db"]) if "mean_gain_delta_db" in fields else None
+        ),
     )
+    if reading.loudness_normalised and reading.mean_gain_delta_db is None:
+        raise InvariantViolation(
+            f"INV-18: probe {name!r} is loudness-normalised but records no "
+            "mean_gain_delta_db; the coupling cannot be read without it."
+        )
     if reading.control_auroc < PROBE_CONTROL_MIN_AUROC:
         raise InvariantViolation(
             f"INV-18: probe {name!r} reads {reading.auroc_below:.4f} below LADDER_FMAX, "
@@ -209,3 +221,76 @@ def probe_reading(name: str, *, artifact: str = PROBES) -> ProbeReading:
             "0.5 cannot be told apart from a broken pipeline; do not read it."
         )
     return reading
+
+
+# --- Loudness coupling: a bracket and an operating margin ---------------------
+
+
+@dataclass(frozen=True)
+class LoudnessCoupling:
+    """What the committed normalised probes say about gain-induced leakage.
+
+    Not a gate. ``highest_null_db`` is the largest gain delta at which the
+    below-band probe stayed at chance; ``lowest_detected_db`` the smallest at
+    which it did not. The onset lies between them and is not located more
+    finely. ``margin`` is how far below the highest null the pinned resampler
+    sits.
+    """
+
+    highest_null_db: float
+    highest_null_probe: str
+    lowest_detected_db: float
+    lowest_detected_probe: str
+    operating_db: float
+    operating_probe: str
+
+    @property
+    def margin(self) -> float:
+        return self.highest_null_db / self.operating_db
+
+    @property
+    def margin_to_detected(self) -> float:
+        return self.lowest_detected_db / self.operating_db
+
+
+def loudness_coupling(*, artifact: str = PROBES) -> LoudnessCoupling:
+    """INV-18. Derive the coupling bracket from every normalised probe on file.
+
+    Derived rather than hard-coded, so a re-run that adds a probe moves the
+    bracket instead of leaving a stale constant. Raises if the evidence is not
+    monotone -- a null above a detection would mean gain delta is not what
+    drives the below-band leak, and the bracket would be meaningless.
+    """
+    readings = [
+        probe_reading(name, artifact=artifact) for name in load_probes(artifact)["probes"]
+    ]
+    normalised = [r for r in readings if r.loudness_normalised]
+    nulls = [r for r in normalised if r.below_at_chance]
+    hits = [r for r in normalised if not r.below_at_chance]
+    if not nulls or not hits:
+        raise InvariantViolation(
+            "INV-18: the loudness coupling needs at least one normalised probe at "
+            "chance below the band and one that is not."
+        )
+    null = max(nulls, key=lambda r: r.mean_gain_delta_db)
+    hit = min(hits, key=lambda r: r.mean_gain_delta_db)
+    if null.mean_gain_delta_db >= hit.mean_gain_delta_db:
+        raise InvariantViolation(
+            f"INV-18: {null.name} is at chance at a gain delta of "
+            f"{null.mean_gain_delta_db:.3g} dB but {hit.name} leaks at "
+            f"{hit.mean_gain_delta_db:.3g} dB. Not monotone in gain delta."
+        )
+    op = probe_reading(LOUDNESS_COUPLING_OPERATING_PROBE, artifact=artifact)
+    if not op.loudness_normalised or not op.below_at_chance:
+        raise InvariantViolation(
+            f"INV-18: the operating point {op.name} must be a normalised probe at "
+            "chance below the band."
+        )
+    return LoudnessCoupling(
+        highest_null_db=null.mean_gain_delta_db,
+        highest_null_probe=null.name,
+        lowest_detected_db=hit.mean_gain_delta_db,
+        lowest_detected_probe=hit.name,
+        operating_db=op.mean_gain_delta_db,
+        operating_probe=op.name,
+    )

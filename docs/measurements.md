@@ -131,22 +131,28 @@ which band?
 | **Probe** | `LogisticRegression(max_iter=5000)` on the log mean magnitude spectrum (n_fft 1024, hop 256), no feature scaling recorded |
 | **CV** | `GroupKFold(5)` grouped by utterance — both versions of an utterance always in the same fold |
 | **Quantisation** | PCM_16 grid |
-| **Bands** | `below` = [0, `LADDER_FMAX`), `above` = [`LADDER_FMAX`, Nyquist), `full` |
+| **Bands** | `below` = [0, `LADDER_FMAX`), `above` = [`LADDER_FMAX`, Nyquist), `full` — bin selections, not the analysis band-limit filter |
+| **Pipeline order** | resample → loudness normalise to −27.0 LUFS (probes ending `_norm` only) → quantise. No trim step; the pipeline trims before normalising |
 | **Kaiser parameters** | `sinc_interp_kaiser`, width 64, rolloff 0.9999, beta 14.769656459379492 — **identical to `VOCOS_RESAMPLER`** (checked by `TestMeasurementArtifacts`) |
-| **Not recorded** | loudness normalisation, log base, which soxr quality, scikit-learn version, how `ratio_highband` is aggregated, per-fold coefficients |
+| **Not recorded** | log base, which soxr quality, scikit-learn version, how `ratio_highband` and `mean_gain_delta_db` are aggregated, per-fold values or coefficients |
 
-| probe | high-band ratio | AUROC below `LADDER_FMAX` | AUROC above | AUROC full |
-|---|---|---|---|---|
-| real vs torchaudio default round trip | 0.8005 | **0.5291 ± 0.0024** | 1.0000 ± 0.0000 | 1.0000 ± 0.0000 |
-| real vs **kaiser (pinned)** round trip | 0.9997 | **0.5000 ± 0.0000** | 0.9935 ± 0.0056 | 0.9924 ± 0.0071 |
-| real vs soxr round trip | 0.9922 | **0.5000 ± 0.0000** | 1.0000 ± 0.0000 | 1.0000 ± 0.0000 |
-| kaiser round trip once vs twice | 0.9998 | **0.5000 ± 0.0000** | 0.9928 ± 0.0073 | 0.9918 ± 0.0066 |
+| probe | loudness | high-band ratio | mean gain delta | AUROC below `LADDER_FMAX` | AUROC above | AUROC full |
+|---|---|---|---|---|---|---|
+| real vs torchaudio default round trip | raw | 0.8005 | — | **0.5291 ± 0.0024** | 1.0000 ± 0.0000 | 1.0000 ± 0.0000 |
+| | **normalised** | 0.8005 | 0.02986 dB | **0.5348 ± 0.0018** | 1.0000 ± 0.0000 | 1.0000 ± 0.0000 |
+| real vs **kaiser (pinned)** round trip | raw | 0.99974 | — | **0.5000 ± 0.0000** | 0.9935 ± 0.0056 | 0.9924 ± 0.0071 |
+| | **normalised** | 0.99976 | 4.62e-05 dB | **0.5000 ± 0.0000** | 0.9989 ± 0.0011 | 0.9972 ± 0.0043 |
+| real vs soxr round trip | raw | 0.99222 | — | **0.5000 ± 0.0000** | 1.0000 ± 0.0000 | 1.0000 ± 0.0000 |
+| | **normalised** | 0.99223 | 0.001534 dB | **0.5000 ± 0.0000** | 1.0000 ± 0.0000 | 1.0000 ± 0.0000 |
+| kaiser round trip once vs twice | raw | 0.99979 | — | **0.5000 ± 0.0000** | 0.9928 ± 0.0073 | 0.9918 ± 0.0066 |
+| | **normalised** | 0.99979 | 4.046e-05 dB | **0.5000 ± 0.0000** | 0.9941 ± 0.0065 | 0.9925 ± 0.0076 |
 
 Read with its controls (next section), this establishes what INV-18 needed:
 **the pinned kaiser round trip leaves no below-band imprint this probe can
-detect, and a clear one above.** The torchaudio default does leave a small
-below-band imprint, so the pin is load-bearing for Vocos's membership in the
-*primary* analysis, not only for high-band energy.
+detect, and a clear one above — with and without the pipeline's loudness
+normalisation.** The torchaudio default does leave a small below-band imprint,
+so the pin is load-bearing for Vocos's membership in the *primary* analysis, not
+only for high-band energy.
 
 ### Why 0.5000 ± 0.0000 is not a bug
 
@@ -214,6 +220,93 @@ cannot travel without its control.
 norms, the per-bin mean paired differences, the log base, whether loudness was
 normalised, and the scikit-learn version, all in `probes.json`.
 
+### Loudness coupling: a threshold with a margin
+
+Loudness is normalised on the **full** band (INV-04). A round trip that removes
+high-band energy lowers the K-weighted loudness, so the normaliser applies a
+slightly larger gain, and that gain shifts every bin *below* `LADDER_FMAX` by the
+same amount. The `_norm` probes measure this on real LJSpeech in the pipeline's
+order:
+
+| round trip | mean gain delta | AUROC below, raw → normalised | verdict |
+|---|---|---|---|
+| torchaudio default | **0.02986 dB** | 0.5291 → **0.5348** | coupling detected |
+| soxr | **0.001534 dB** | 0.5000 → 0.5000 | not detected — highest measured null |
+| kaiser (pinned) | **4.62e-05 dB** | 0.5000 → 0.5000 | not detected — the operating point |
+| kaiser once vs twice | 4.046e-05 dB | 0.5000 → 0.5000 | not detected |
+
+**The threshold is a bracket.** Onset lies somewhere in (0.001534, 0.02986] dB.
+Three points do not locate it more finely than that factor of ~19. "Roughly
+0.0015 dB" is the highest measured null, the conservative end, not a located
+threshold.
+
+**The bracket is this probe's resolution, not a property of the coupling.** A
+gain delta *g* moves every log-magnitude feature by the same amount, and lbfgs
+never leaves zero while 0.25 × shift < tol (see *Why 0.5000*). That puts the
+probe's detection limit at *g* ≈ 0.0035 dB for natural-log features or ≈ 0.008 dB
+for log10. Either value falls inside the bracket, and
+`TestINV18LoudnessCoupling.test_bracket_is_this_probes_resolution` reproduces
+both verdicts from the mechanism alone. The gain shift itself does not vanish
+below 0.0015 dB. It falls below what a linear probe on mean spectra resolves, and
+a stronger detector could resolve less.
+
+**The operating point's margin.** The pinned resampler's gain delta is
+**33× below the highest null** (1.5 orders of magnitude) and **646× below the
+lowest detected delta** (2.8 orders). `data.measurements.loudness_coupling`
+derives these from every normalised probe on file, rather than from constants,
+and raises if the evidence is not monotone in gain delta.
+`LOUDNESS_COUPLING_MIN_MARGIN` requires at least 10× below the highest null. The
+committed 33× clears 10× and does **not** clear 100×. A future resampler change
+cannot cross it silently, because the pin is also checked equal to the parameters
+`probes.json` measured, so changing the pin forces a re-measurement.
+
+**Corroboration.** Before this was committed, a resampler-free synthetic
+dose-response estimated the same three gain deltas at 6.4e-05, 1.7e-03 and
+4.3e-02 dB, with identical verdicts. The real-audio values are 0.72×, 0.92× and
+0.69× of those. That run is superseded and no longer tested.
+
+**Beyond resamplers — estimated, not measured.** Nothing about the coupling is
+specific to resampling. Any condition with less high-band energy than real gets a
+larger gain, and so a below-band level offset. Scaling from the committed deltas
+gives about 7.4–9.8 dB of gain delta per unit of total energy removed above
+`LADDER_FMAX`, using real's high-band fraction of 0.0202 from the 60-file CSV.
+The same energy was removed from each condition's total, which isolates only the
+above-band-driven part:
+
+| condition (CSV) | high-band ratio to real | estimated gain delta |
+|---|---|---|
+| `bigvgan` | 0.8055 | ~0.03–0.04 dB — the size the default was detected at |
+| `vocos` | 0.8040 (row predates the pin) | ~0.03–0.04 dB |
+| `griffin_lim` | ~0 | ~0.15–0.20 dB |
+
+If these hold, the band-limited primary analysis carries a projection of each
+condition's above-band deficit as a level offset. That is the mechanism INV-18
+relies on the band limit to remove, including a trace of Griffin-Lim's cliff. The
+manifest records `lufs_out` but not the gain applied, so the per-condition deltas
+cannot be read back from Phase A today. This is an open item in CLAUDE.md.
+
+### Normalisation and the high-band evidence
+
+With the pipeline's loudness normalisation, above-band separability is **at
+least** as high as the un-normalised probe showed. So the Vocos high-band
+exclusion and the uniform-round-trip rejection are, if anything, better supported
+under the real pipeline:
+
+| probe | above, raw | above, normalised | rise | raw fold std |
+|---|---|---|---|---|
+| kaiser (pinned) | 0.9935 ± 0.0056 | **0.9989 ± 0.0011** | +0.0054 | 0.0056 |
+| kaiser once vs twice | 0.9928 ± 0.0073 | **0.9941 ± 0.0065** | +0.0013 | 0.0073 |
+
+Both non-saturated probes rise, and so do both full-band figures. But each rise
+is at most about one un-normalised fold std, and per-fold values are not
+recorded. So what the evidence supports is "not weaker under normalisation", not
+"normalisation sharpens it" as an established effect. The mechanism is not
+recorded either. One untested hypothesis is that per-file normalisation removes
+between-utterance level variation, a nuisance the unpaired AUROC otherwise has to
+overcome. Griffin-Lim's high-band exclusion does not depend on a resampler and is
+unaffected. `TestINV18PerAnalysisMembership.test_high_band_evidence_holds_in_the_pipeline_order`
+asserts the evidence clears the control threshold, not that it rose.
+
 ---
 
 ## Reported numbers against the committed artifacts
@@ -238,21 +331,13 @@ rather than reconciled.
 Not from the Kaggle run; produced in this repository and reproducible from the
 test suite.
 
-### The local probe and the loudness coupling
+### The local synthetic probe (`soxr_hq`)
 
-Earlier local measurements put the below-band probe anywhere from 0.50 to 0.69,
-which kept Vocos's primary membership open. The committed probe settles the
-membership. The local spread now has an explanation: **loudness normalisation.**
-
-The pipeline normalises loudness on the full band (INV-04) before any
-analysis-time band limit. A round trip that removes above-band energy lowers the
-K-weighted loudness, so the normaliser applies a slightly larger gain, and that
-gain shifts every below-band bin the same way. A paired probe is sensitive to
-exactly that kind of consistent shift (above). `probes.json` does not record a
-loudness step.
-
-Isolated on the local synthetic probe (`soxr_hq` round trip, n=60,
-`GroupKFold(5)`, current band-limit filter):
+`TestINV18ResampleProbe` still runs a synthetic probe, round-tripped with
+`soxr_hq` because torchaudio is absent by INV-13. With loudness normalisation it
+reads 0.54–0.57 below the band. That is the coupling above: synthetic
+flat-spectrum audio loses far more high-band energy to `soxr_hq` than LJSpeech
+loses to the pin. It explains the earlier "configuration-sensitive, 0.50–0.69":
 
 | loudness normalised | features | with StandardScaler | without |
 |---|---|---|---|
@@ -260,39 +345,6 @@ Isolated on the local synthetic probe (`soxr_hq` round trip, n=60,
 | yes (pipeline) | log mean \|STFT\| < 8 kHz | 0.5514 ± 0.0056 | 0.5431 ± 0.0028 |
 | no | 32 log band energies, band-limited | **0.5000 ± 0.0000** | **0.5000 ± 0.0000** |
 | no | log mean \|STFT\| < 8 kHz | 0.4986 ± 0.0028 | **0.5000 ± 0.0000** |
-
-Without loudness normalisation the local probe is degenerate, like the committed
-one. With it, the probe reads 0.54–0.57. The earlier 0.505 / 0.558 / 0.66–0.69
-spread is consistent with this, in each case more high-band loss meaning a
-larger gain difference, but was not individually re-run.
-
-**Does the coupling reach the pinned kaiser resampler? Measured: no.** Synthetic
-soxr_hq loses far more high-band energy than LJSpeech loses to the pin, so the
-coupling was measured as a resampler-free dose-response. Synthetic audio was set
-to real LJSpeech's high-band fraction (0.0202, committed CSV), and
-[8 kHz, Nyquist) was scaled to each committed `ratio_highband`. It then went
-through loudness → PCM_16 → analysis band limit (n=200, same probe as
-`probes.json`, no scaler):
-
-| high-band ratio | matches | gain difference | AUROC, own gain (pipeline) | AUROC, shared gain |
-|---|---|---|---|---|
-| 1.0000 | — | 0 | 0.5000 ± 0.0000 | 0.5000 ± 0.0000 |
-| **0.9997** | **kaiser pin** | **+6.4e-5 dB** | **0.5000 ± 0.0000** | 0.5000 ± 0.0000 |
-| 0.9922 | soxr | +1.7e-3 dB | 0.5000 ± 0.0000 | 0.5000 ± 0.0000 |
-| 0.8005 | torchaudio default | +4.3e-2 dB | **0.5320 ± 0.0061** | 0.5096 ± 0.0037 |
-
-At the default's loss the coupling is real. Giving each path its own gain moves
-the probe from 0.510 to 0.532, and a shared gain removes most of that. At the
-pinned ratio the gain difference is 6.4e-5 dB and the probe stays degenerate
-through the full pipeline order. `TestINV18LoudnessCoupling` pins the pinned and
-default rows at n=60, the default row serving as the positive control.
-
-Limits: synthetic audio, and an idealised loss rather than the kaiser kernel.
-Loudness depends on how much K-weighted energy is removed, not on the kernel's
-shape, which is why a resampler-free test answers this question. An idealised
-loss starting exactly at 8 kHz also leaks into the top STFT bins just below it
-(0.513 on `bins < 8 kHz` without the band limit, 0.5000 with it). That comes from
-the idealisation; a real resampler's loss sits near Nyquist.
 
 ### Signature concentration (local, `soxr_hq`)
 
@@ -347,6 +399,46 @@ linear smear, identical for every member of a comparison set), and ~3.8× the
 compute. The FIRs are cheaper but leave the filter's own residual above
 `MEASUREMENT_FLOOR`; the elliptic ripples.
 
+### Ablation sweep filter response
+
+`detectors.bandlimit.lowpass` used a zero-phase Butterworth order 8. It now uses
+the analysis band limit's two-edge Chebyshev II design at every sweep cutoff
+(`data.preprocess.band_limit_sos`): passband to cutoff − 100 Hz at ≤ 0.1 dB,
+stopband from the cutoff at 100 dB per pass. At `LADDER_FMAX` the sweep point is
+byte-identical to the primary analysis. Measured **directly** (impulse through
+the filter, both passes), offsets relative to each cutoff:
+
+| cutoff | old order | old −1 dB | old −3 dB | old −20 dB | old at cutoff | old residual | **new order** | **new −1 dB** | **new −3 dB** | **new −20 dB** | new at/above cutoff | new residual (f32) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1000 | 8 | −122 | −53 | **+145** | −6.0 dB | 2.0e-04 | 31 | −85.7 | −78.6 | −62.0 | ≤ −200 dB | 5.5e-16 |
+| 2000 | 8 | −236 | −102 | **+276** | −6.0 dB | 3.1e-04 | 44 | −85.1 | −77.9 | −61.0 | ≤ −200 dB | 4.6e-16 |
+| 3000 | 8 | −333 | −144 | **+380** | −6.0 dB | 2.6e-04 | 52 | −84.7 | −77.3 | −60.0 | ≤ −200 dB | 4.4e-16 |
+| 4000 | 8 | −407 | −174 | **+450** | −6.0 dB | 2.1e-04 | 58 | −85.0 | −77.7 | −60.8 | ≤ −200 dB | 4.1e-16 |
+| 5000 | 8 | −451 | −191 | **+480** | −6.0 dB | 1.6e-04 | 60 | −84.5 | −77.1 | −59.7 | ≤ −200 dB | 3.6e-16 |
+| 6000 | 8 | −460 | −193 | **+471** | −6.0 dB | 1.3e-04 | 60 | −84.4 | −76.9 | −59.4 | ≤ −200 dB | 2.9e-16 |
+| 7000 | 8 | −431 | −179 | **+426** | −6.0 dB | 5.6e-05 | 58 | −84.6 | −77.1 | −59.8 | ≤ −200 dB | 2.4e-16 |
+| 8000 | 8 | −365 | −150 | **+349** | −6.0 dB | 3.0e-05 | 53 | −84.5 | −77.0 | −59.6 | ≤ −200 dB | 1.8e-16 |
+| 9000 | 8 | −266 | −108 | **+248** | −6.0 dB | 1.7e-05 | 45 | −84.4 | −76.9 | −59.5 | ≤ −200 dB | 1.2e-16 |
+| 10000 | 8 | −142 | −57 | **+130** | −6.0 dB | 7.1e-06 | 33 | −84.4 | −76.9 | −59.6 | ≤ −200 dB | 5.7e-17 |
+
+(Offsets in Hz. Residual = fraction of total energy above the cutoff, harmonic
+test signal, Blackman window.)
+
+The Butterworth failed the sweep both ways it can. Its transition **straddled**
+every cutoff: −6 dB at the cutoff itself and −20 dB only 130–480 Hz *above* it.
+It also **attenuated without equalising**, leaving 7e-06 to 3e-04 of total energy
+above the cutoff, 350× to 15000× the PCM_16 floor. A retrained detector could
+still learn the band a cutoff was meant to remove, which pushes the measured
+collapse point too high. That is the same flaw INV-17 rejected Butterworth for.
+
+**Cost.** Order 31–60, depending on how wide 100 Hz is relative to the cutoff
+(60 at 5–6 kHz, 31 at 1 kHz), against 8. The impulse response 99.99%-energy span
+is 22–44 ms against 1.5–5.8 ms, longest at low cutoffs. Compute is 40–90 ms per
+10 s of audio against ~13 ms. All of it is linear and identical for every member
+of a sweep point, and negligible next to retraining a detector per cutoff.
+Pinned by `TestBandlimit`, which also mutation-checks that Butterworth-8 fails
+the leak assertion at every cutoff.
+
 ---
 
 ## Claims that rest on these files
@@ -354,10 +446,12 @@ compute. The FIRs are cheaper but leave the filter's own residual above
 | claim | where | evidence |
 |---|---|---|
 | Griffin-Lim emits no high-band content | CLAUDE.md INV-17, INV-18; `ANALYSIS_EXCLUSIONS` | `griffin_lim` `hb_8k_nyq` max 5.49e-08 vs `real` min 6.38e-04 |
-| Vocos carries a resampler signature above `LADDER_FMAX` | CLAUDE.md INV-18; `ANALYSIS_EXCLUSIONS` | [10900, 11025) energy: `vocos` 8.63e-07 vs `bigvgan` 7.30e-09; AUROC 0.9997 vs bigvgan, **0.507 vs `real_roundtrip`**; pinned kaiser above-band 0.9935 (`probes.json`) |
+| Vocos carries a resampler signature above `LADDER_FMAX` | CLAUDE.md INV-18; `ANALYSIS_EXCLUSIONS` | [10900, 11025) energy: `vocos` 8.63e-07 vs `bigvgan` 7.30e-09; AUROC 0.9997 vs bigvgan, **0.507 vs `real_roundtrip`**; pinned kaiser above-band 0.9935, 0.9989 normalised (`probes.json`) |
 | the torchaudio default resampler costs 18–20% of the high band | `vocoders.vocos.VOCOS_RESAMPLER.justification` | CSV `real_roundtrip` / `real` = 0.8198; `probes.json` 0.8005 |
 | the kaiser pin keeps the high band | `VOCOS_RESAMPLER.justification` | `probes.json` `real_vs_rt_kaiser` ratio 0.9997 |
-| **Vocos belongs in the band-limited primary analysis** | CLAUDE.md INV-18; btp-project-idea.md Part 2 | `probes.json` kaiser below 0.5000 ± 0.0000 with above-band control 0.9935; default below 0.5291 as same-band control; loudness path checked locally |
-| a uniform round trip would not equalise Vocos | `REJECTED_ALTERNATIVES` | `probes.json` `kaiser_1x_vs_2x` above 0.9928, full 0.9918 |
+| **Vocos belongs in the band-limited primary analysis** | CLAUDE.md INV-18; btp-project-idea.md Part 2 | `probes.json` kaiser below 0.5000 ± 0.0000, raw and loudness-normalised, with above-band controls 0.9935 / 0.9989; default below 0.5291 / 0.5348 as same-band control |
+| the pinned resampler's loudness coupling is below this probe's resolution, with margin | INV-18; `loudness_coupling` | `_norm` gain deltas: kaiser 4.62e-05 dB, 33× below the soxr null (0.001534), 646× below the default detection (0.02986) |
+| a uniform round trip would not equalise Vocos | `REJECTED_ALTERNATIVES` | `probes.json` `kaiser_1x_vs_2x` above 0.9928, full 0.9918; 0.9941 above normalised |
+| the ablation sweep cannot leak across a cutoff | `detectors.bandlimit.lowpass`; CLAUDE.md INV-17 | measured response above; `TestBandlimit` |
 | BigVGAN v2 fmax8k checkpoint identity and mel config | `vocoders.bigvgan.LARGE_SPEC` | `meta.json` |
 | BigVGAN produces ~80% of real's high-band energy | [`mel_configs.md`](mel_configs.md) | `bigvgan` / `real` mean `hb_8k_nyq` = 0.8055 |

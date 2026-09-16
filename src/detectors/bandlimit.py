@@ -34,9 +34,9 @@ than the one the capped sweep could ask.
 from __future__ import annotations
 
 import numpy as np
-from scipy.signal import butter, sosfiltfilt
+from scipy.signal import sosfiltfilt
 
-from data.invariants import ARCHIVE_SR, InvariantViolation
+from data.invariants import ARCHIVE_SR, InvariantViolation, band_limit_order
 
 # Cutoffs in Hz, all strictly below archive Nyquist (11.025 kHz). The spacing is
 # deliberately fine around LADDER_FMAX: that is the boundary between the band
@@ -54,15 +54,44 @@ DEFAULT_CUTOFFS: tuple[float, ...] = (
     9000.0,
     10000.0,
 )
-FILTER_ORDER = 8
 
 
 def nyquist(sr: int = ARCHIVE_SR) -> float:
     return sr / 2.0
 
 
+def filter_order(cutoff_hz: float, sr: int = ARCHIVE_SR) -> int:
+    """Order of the sweep filter at ``cutoff_hz`` -- derived, and it varies."""
+    return band_limit_order(sr, cutoff_hz)
+
+
 def lowpass(wav: np.ndarray, cutoff_hz: float, sr: int = ARCHIVE_SR) -> np.ndarray:
-    """Zero-phase Butterworth low-pass.
+    """Zero-phase low-pass for the sweep: the analysis band limit's design, at any cutoff.
+
+    The SAME two-edge Chebyshev II specification as INV-17's analysis band limit
+    (:func:`data.preprocess.band_limit_sos`): passband to ``cutoff - 100 Hz`` at
+    <= 0.1 dB, stopband from ``cutoff`` at 100 dB per pass, order derived. At
+    LADDER_FMAX the sweep point is byte-identical to the primary analysis.
+
+    It replaced a Butterworth order 8, which failed the sweep in both ways it can
+    fail. Its transition STRADDLED every cutoff: -6 dB at the cutoff itself and
+    -20 dB only 130-480 Hz above it, so "low-passed at 8 kHz" kept 8.0-8.35 kHz
+    at better than -20 dB. And it attenuated without equalising: 7e-6 to 3e-4 of
+    total energy survived above the cutoff, 350x to 15000x the PCM_16 floor, so
+    a retrained detector could still learn the band the cutoff was meant to
+    remove and the collapse point would sit too high.
+
+    Measured, zero-phase, directly (impulse through this function), at every
+    sweep cutoff: -1 dB at cutoff - 84..86 Hz, -3 dB at cutoff - 77..79 Hz,
+    -20 dB at cutoff - 59..62 Hz, and <= -200 dB at and above the cutoff.
+    Residual above the cutoff: the float32 storage floor (<= 5.5e-16).
+
+    Cost: order 31-60 depending on cutoff (60 at 5-6 kHz, 31 at 1 kHz, where
+    100 Hz is a wide relative transition), against 8. Impulse response
+    99.99%-energy span 22-44 ms against 1.5-5.8 ms, longest at low cutoffs.
+    ~40-90 ms per 10 s of audio against ~13 ms. All linear and identical for
+    every member of a sweep point, so it smears but does not separate -- and it
+    is negligible next to retraining a detector per cutoff.
 
     Zero-phase (filtfilt) is deliberate: a causal filter imposes its own
     frequency-dependent group delay, which is itself a phase artifact and would
@@ -71,14 +100,15 @@ def lowpass(wav: np.ndarray, cutoff_hz: float, sr: int = ARCHIVE_SR) -> np.ndarr
     exists to prevent. The identical filter is applied to real and vocoded audio
     alike.
     """
+    from data.preprocess import band_limit_sos
+
     nyq = nyquist(sr)
     if not 0 < cutoff_hz < nyq:
         raise InvariantViolation(
             f"cutoff {cutoff_hz} Hz is not inside (0, {nyq}) at {sr} Hz. Above Nyquist "
             "there is nothing to remove -- see the module docstring."
         )
-    sos = butter(FILTER_ORDER, cutoff_hz / nyq, btype="low", output="sos")
-    return sosfiltfilt(sos, wav).astype(np.float32)
+    return sosfiltfilt(band_limit_sos(sr, cutoff_hz), wav).astype(np.float32)
 
 
 def band_limited_variant(

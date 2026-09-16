@@ -56,6 +56,11 @@ _PROBES = "probes.json"
 #     torchaudio default           0.8005          0.5291 +- 0.0024       1.0000
 #     this kaiser pin              0.9997          0.5000 +- 0.0000       0.9935
 #
+# and with the pipeline's loudness normalisation (keys ending _norm):
+#
+#     torchaudio default           gain +0.02986 dB  0.5348 +- 0.0018     1.0000
+#     this kaiser pin              gain +4.62e-05 dB 0.5000 +- 0.0000     0.9989
+#
 # Two separate benefits, both committed. The pin keeps the high band (0.9997,
 # against 0.8005). And it is what makes Vocos admissible in the PRIMARY analysis:
 # the default round trip is weakly but consistently separable BELOW the band
@@ -76,10 +81,13 @@ VOCOS_RESAMPLER = ResamplerSpec(
         MeasurementRef(_CSV, "real_roundtrip", "hb_8k_nyq", "mean", 1.653462e-02),
         MeasurementRef(_CSV, "real", "hb_8k_nyq", "mean", 2.016939e-02),
         # the pin's benefit, 200 files
-        MeasurementRef(_PROBES, "real_vs_rt_kaiser", "ratio_highband", "recorded",
-                       0.9997367196968923),
+        MeasurementRef(_PROBES, "real_vs_rt_kaiser", "ratio_highband", "recorded", 0.99974),
         MeasurementRef(_PROBES, "real_vs_rt_kaiser", "auroc_below", "recorded", 0.5),
         MeasurementRef(_PROBES, "real_vs_rt_default", "auroc_below", "recorded", 0.5291),
+        # ...and through the pipeline's loudness normalisation
+        MeasurementRef(_PROBES, "real_vs_rt_kaiser_norm", "auroc_below", "recorded", 0.5),
+        MeasurementRef(_PROBES, "real_vs_rt_kaiser_norm", "mean_gain_delta_db", "recorded",
+                       4.62e-05),
     ),
 )
 

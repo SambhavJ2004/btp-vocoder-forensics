@@ -674,6 +674,75 @@ class TestBandlimit:
         cuts = cutoffs_for_rate(ARCHIVE_SR)
         assert max(cuts) < nyquist(ARCHIVE_SR)
 
+    @staticmethod
+    def _sweep_response(cutoff, n=2**17):
+        from detectors.bandlimit import lowpass
+
+        imp = np.zeros(n, dtype=np.float32)
+        imp[n // 2] = 1.0
+        h = lowpass(imp, cutoff).astype(np.float64)
+        f = np.fft.rfftfreq(n, 1 / ARCHIVE_SR)
+        return f, 20 * np.log10(np.maximum(np.abs(np.fft.rfft(h)), 1e-300))
+
+    def test_sweep_transition_sits_below_every_cutoff(self):
+        """TASK 4. Measured directly, at every sweep cutoff: -1 dB at cutoff-85 Hz,
+        -3 dB at cutoff-78 Hz, -20 dB at cutoff-60 Hz, nothing at or above it."""
+        from detectors.bandlimit import cutoffs_for_rate
+
+        for cut in cutoffs_for_rate(ARCHIVE_SR):
+            f, db = self._sweep_response(cut)
+
+            def first(level, f=f, db=db):
+                return float(f[np.nonzero(db < level)[0][0]])
+
+            assert first(-1.0) == pytest.approx(cut - 85.0, abs=3.0), cut
+            assert first(-3.0) == pytest.approx(cut - 78.0, abs=3.0), cut
+            assert first(-20.0) == pytest.approx(cut - 60.5, abs=3.0), cut
+            assert db[f >= cut].max() <= -150.0, f"{cut}: leaks across the cutoff"
+            assert np.abs(db[f <= cut - 100.0]).max() <= 0.1 + 1e-3, cut
+
+    def test_sweep_residual_above_each_cutoff_is_at_the_storage_floor(self):
+        from data.invariants import MEASUREMENT_FLOOR, out_of_band_energy
+        from detectors.bandlimit import cutoffs_for_rate, lowpass
+
+        rng = np.random.default_rng(0)
+        t = np.arange(2 * ARCHIVE_SR) / ARCHIVE_SR
+        x = sum((0.3 / k) * np.sin(2 * np.pi * 140 * k * t + rng.uniform(0, 6.28))
+                for k in range(1, 78))
+        x = (0.3 * x / np.abs(x).max() + 0.003 * rng.standard_normal(len(t))).astype(np.float32)
+        for cut in cutoffs_for_rate(ARCHIVE_SR):
+            assert out_of_band_energy(lowpass(x, cut), ARCHIVE_SR, cut) <= MEASUREMENT_FLOOR, cut
+
+    def test_sweep_point_at_ladder_fmax_is_the_analysis_band_limit(self):
+        from data.preprocess import band_limit_to_ladder
+        from detectors.bandlimit import lowpass
+
+        x = np.random.default_rng(1).standard_normal(ARCHIVE_SR).astype(np.float32)
+        assert np.array_equal(lowpass(x, LADDER_FMAX), band_limit_to_ladder(x, sr=ARCHIVE_SR))
+
+    def test_sweep_order_is_derived_per_cutoff(self):
+        from detectors.bandlimit import cutoffs_for_rate, filter_order
+
+        orders = {c: filter_order(c) for c in cutoffs_for_rate(ARCHIVE_SR)}
+        assert orders == {1000.0: 31, 2000.0: 44, 3000.0: 52, 4000.0: 58, 5000.0: 60,
+                          6000.0: 60, 7000.0: 58, 8000.0: 53, 9000.0: 45, 10000.0: 33}
+
+    def test_butterworth_8_would_straddle_every_cutoff(self):
+        """Mutation check: the old sweep filter fails the leak assertion above."""
+        from scipy.signal import butter, sosfiltfilt
+
+        from detectors.bandlimit import cutoffs_for_rate
+
+        n = 2**17
+        imp = np.zeros(n)
+        imp[n // 2] = 1.0
+        f = np.fft.rfftfreq(n, 1 / ARCHIVE_SR)
+        for cut in cutoffs_for_rate(ARCHIVE_SR):
+            h = sosfiltfilt(butter(8, cut / (ARCHIVE_SR / 2), output="sos"), imp)
+            db = 20 * np.log10(np.maximum(np.abs(np.fft.rfft(h)), 1e-300))
+            assert db[np.argmin(np.abs(f - cut))] == pytest.approx(-6.0, abs=0.1), cut
+            assert db[f >= cut].max() > -150.0, cut
+
     def test_lowpass_attenuates_above_cutoff(self):
         from detectors.bandlimit import lowpass
 
@@ -902,9 +971,27 @@ class TestINV18PerAnalysisMembership:
         from data.measurements import verify
 
         refs = ANALYSIS_EXCLUSIONS[HIGH_BAND_ANALYSIS]["vocos"].measurements
-        (pinned,) = [r for r in refs if r.condition == "real_vs_rt_kaiser"]
-        assert pinned.metric == "auroc_above"
-        assert verify(pinned) >= 0.99
+        for probe in ("real_vs_rt_kaiser", "real_vs_rt_kaiser_norm"):
+            (pinned,) = [r for r in refs if r.condition == probe]
+            assert pinned.metric == "auroc_above"
+            assert verify(pinned) >= 0.99, probe
+
+    def test_high_band_evidence_holds_in_the_pipeline_order(self):
+        """TASK 3. Under loudness normalisation -- what the pipeline actually does --
+        the above-band evidence for the Vocos exclusion and the uniform-round-trip
+        rejection is at least as strong as the un-normalised probe showed.
+
+        Deliberately NOT asserted: that normalisation raises it. The rise (kaiser
+        0.9935 -> 0.9989, 1x vs 2x 0.9928 -> 0.9941) is within the un-normalised
+        fold spread (0.0056, 0.0073) and per-fold values are not recorded.
+        """
+        from data.invariants import PROBE_CONTROL_MIN_AUROC
+        from data.measurements import probe_reading
+
+        for name in ("real_vs_rt_kaiser_norm", "kaiser_1x_vs_2x_norm"):
+            r = probe_reading(name)
+            assert r.loudness_normalised
+            assert r.control_auroc >= 0.99 > PROBE_CONTROL_MIN_AUROC, name
 
     def test_a_wrong_recorded_probe_value_is_caught(self):
         from data.invariants import MeasurementRef
@@ -1888,18 +1975,24 @@ class TestMeasurementArtifacts:
         from data.measurements import load_probes
 
         p = load_probes()["probes"]
-        quoted = {
-            "real_vs_rt_default": (0.8005, 0.5291, 0.0024, 1.0),
-            "real_vs_rt_kaiser": (0.9997, 0.5, 0.0, 0.9935),
-            "real_vs_rt_soxr": (0.9922, 0.5, 0.0, 1.0),
-            "kaiser_1x_vs_2x": (0.9998, 0.5, 0.0, 0.9928),
+        quoted = {  # ratio, below, below_std, above, above_std, gain delta dB
+            "real_vs_rt_default": (0.8005, 0.5291, 0.0024, 1.0, 0.0, None),
+            "real_vs_rt_kaiser": (0.9997, 0.5, 0.0, 0.9935, 0.0056, None),
+            "real_vs_rt_soxr": (0.9922, 0.5, 0.0, 1.0, 0.0, None),
+            "kaiser_1x_vs_2x": (0.9998, 0.5, 0.0, 0.9928, 0.0073, None),
+            "real_vs_rt_default_norm": (0.8005, 0.5348, 0.0018, 1.0, 0.0, 0.02986),
+            "real_vs_rt_kaiser_norm": (0.9998, 0.5, 0.0, 0.9989, 0.0011, 4.62e-05),
+            "real_vs_rt_soxr_norm": (0.9922, 0.5, 0.0, 1.0, 0.0, 0.001534),
+            "kaiser_1x_vs_2x_norm": (0.9998, 0.5, 0.0, 0.9941, 0.0065, 4.046e-05),
         }
         assert set(p) == set(quoted)
-        for name, (ratio, below, below_std, above) in quoted.items():
+        for name, (ratio, below, below_std, above, above_std, gain) in quoted.items():
             assert p[name]["ratio_highband"] == pytest.approx(ratio, abs=5e-5), name
             assert p[name]["auroc_below"] == below, name
             assert p[name]["auroc_below_std"] == below_std, name
             assert p[name]["auroc_above"] == above, name
+            assert p[name]["auroc_above_std"] == above_std, name
+            assert p[name].get("mean_gain_delta_db") == gain, name
 
     def test_generated_audio_under_data_is_still_ignored(self):
         """The negation must not reopen data/ for generated audio."""
@@ -2085,9 +2178,10 @@ class TestINV18ResampleProbe:
       Vocos's primary-analysis membership rests on
       (test_pinned_resampler_is_at_chance_below_the_band).
     * LOCAL -- synthetic audio round-tripped with RESAMPLE_METHOD (soxr_hq), since
-      torchaudio is absent by INV-13. It carries loudness normalisation, which the
-      committed probe does not record, and reads 0.55-0.57 below the band for that
-      reason (see TestINV18LoudnessCoupling). It pins what is robust -- the
+      torchaudio is absent by INV-13. It carries loudness normalisation, and
+      synthetic flat-spectrum audio loses far more high-band energy to soxr_hq than
+      LJSpeech loses to the pin, so it reads 0.55-0.57 below the band: the coupling
+      TestINV18LoudnessCoupling measures on real audio. It pins what is robust -- the
       signature is concentrated above the band -- and the grouped-CV trap.
     """
 
@@ -2181,10 +2275,11 @@ class TestINV18ResampleProbe:
         """
         from data.measurements import probe_reading
 
-        kaiser = probe_reading("real_vs_rt_kaiser")
-        assert kaiser.below_at_chance, f"below-band deviation {kaiser.below_deviation:.4f}"
-        assert kaiser.below_is_degenerate
-        assert kaiser.control_auroc >= 0.99
+        for name in ("real_vs_rt_kaiser", "real_vs_rt_kaiser_norm"):
+            kaiser = probe_reading(name)
+            assert kaiser.below_at_chance, f"{name}: deviation {kaiser.below_deviation:.4f}"
+            assert kaiser.below_is_degenerate, name
+            assert kaiser.control_auroc >= 0.99, name
 
     def test_the_torchaudio_default_would_not_be_at_chance_below(self):
         """Why the pin is load-bearing for the PRIMARY analysis, not only the high band."""
@@ -2328,92 +2423,101 @@ class TestINV18ProbeControls:
 
 
 class TestINV18LoudnessCoupling:
-    """Does the committed probe's result survive the pipeline's loudness step?
+    """Does the below-band result survive the pipeline's loudness step? Committed.
 
-    probes.json does not record loudness normalisation. The pipeline normalises
-    on the FULL band (INV-04, INV-07), so a round trip that removes above-band
-    energy gets a slightly larger gain, and that gain shifts every bin BELOW the
-    band. Locally this is what moved the synthetic soxr_hq probe off 0.5000.
+    Loudness is normalised on the FULL band (INV-04), so a round trip that removes
+    above-band energy gets a slightly larger gain, and that gain shifts every bin
+    below LADDER_FMAX. probes.json measures it on 200 LJSpeech files in the
+    pipeline order resample -> normalise -> quantise: keys ending ``_norm``, each
+    with the mean gain delta it induced.
 
-    Resampler-free dose-response on synthetic audio with real LJSpeech's
-    high-band fraction, through the pipeline order (loudness -> PCM_16 ->
-    analysis band limit), at the COMMITTED high-band ratios.
+    This used to rest on a local synthetic dose-response. The committed file
+    replaces it (kaiser: 4.62e-05 dB measured against 6.4e-05 dB estimated).
     """
 
-    N = 60
-    _cache: dict = {}
+    def test_file_records_both_loudness_variants_in_pipeline_order(self):
+        from data.measurements import load_probes
 
-    @classmethod
-    def _probe(cls, ratio):
-        if ratio in cls._cache:
-            return cls._cache[ratio]
-        import librosa
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.metrics import roc_auc_score
-        from sklearn.model_selection import GroupKFold
+        meta = load_probes()
+        assert meta["target_lufs"] == LOUDNESS_TARGET_LUFS
+        order = [s.strip() for s in meta["pipeline_order"].split("->")]
+        assert order[0] == "resample" and order[-1] == "quantise"
+        assert order[1].startswith("loudness normalise")
+        probes = meta["probes"]
+        raw = {k for k in probes if not k.endswith("_norm")}
+        assert {f"{k}_norm" for k in raw} == set(probes) - raw
+        for k, v in probes.items():
+            assert v["loudness_normalised"] is k.endswith("_norm"), k
+            assert ("mean_gain_delta_db" in v) is k.endswith("_norm"), k
 
-        from data.measurements import load_csv
-        from data.preprocess import band_limit_to_ladder, normalise_loudness
-
-        df = load_csv()
-        hb = float(df[df["condition"] == "real"]["hb_8k_nyq"].mean())
-
-        def src(i):
-            rng = np.random.default_rng(5000 + i)
-            n = int(ARCHIVE_SR * (1.6 + 0.02 * (i % 25)))
-            t = np.arange(n) / ARCHIVE_SR
-            f0 = 100 + 3 * (i % 40)
-            x = sum((0.35 / k) * np.sin(2 * np.pi * f0 * k * t + rng.uniform(0, 6.28))
-                    for k in range(1, int(ARCHIVE_SR / 2 / f0)))
-            x = x * (1 + 0.4 * np.sin(2 * np.pi * (2 + i % 5) * t))
-            x = (x + 0.02 * rng.standard_normal(n)) * np.hanning(n)
-            spec, f = np.fft.rfft(x), np.fft.rfftfreq(n, 1 / ARCHIVE_SR)
-            hi = f >= LADDER_FMAX
-            e_hi, e_lo = np.sum(np.abs(spec[hi]) ** 2), np.sum(np.abs(spec[~hi]) ** 2)
-            spec[hi] *= np.sqrt(hb / (1 - hb) * e_lo / e_hi)
-            x = np.fft.irfft(spec, n)
-            return 0.3 * x / np.max(np.abs(x)), hi
-
-        def pipeline(x):
-            norm, _ = normalise_loudness(x.astype(np.float32), sr=ARCHIVE_SR)
-            q = (np.round(np.clip(norm, -1, 1) * 32767) / 32768).astype(np.float32)
-            w = band_limit_to_ladder(q, sr=ARCHIVE_SR)
-            s = np.abs(librosa.stft(w, n_fft=1024, hop_length=256)).mean(axis=1)
-            fr = librosa.fft_frequencies(sr=ARCHIVE_SR, n_fft=1024)
-            return np.log(s[fr < LADDER_FMAX] + 1e-10)
-
-        a, b = [], []
-        for i in range(cls.N):
-            x, hi = src(i)
-            spec = np.fft.rfft(x)
-            spec[hi] *= np.sqrt(ratio)
-            a.append(pipeline(np.fft.irfft(spec, len(x))))
-            b.append(pipeline(x))
-        x = np.vstack([a, b])
-        y = np.r_[np.ones(cls.N), np.zeros(cls.N)]
-        g = np.r_[np.arange(cls.N), np.arange(cls.N)]
-        aucs = [roc_auc_score(y[te], LogisticRegression(max_iter=5000).fit(x[tr], y[tr])
-                              .decision_function(x[te]))
-                for tr, te in GroupKFold(5).split(x, y, g)]
-        cls._cache[ratio] = (float(np.mean(aucs)), float(np.std(aucs)))
-        return cls._cache[ratio]
-
-    def test_pinned_ratio_survives_loudness_normalisation(self):
-        from data.invariants import PROBE_CHANCE_MAX_DEVIATION
+    def test_pinned_resampler_survives_loudness_normalisation(self):
         from data.measurements import probe_reading
 
-        auc, std = self._probe(probe_reading("real_vs_rt_kaiser").ratio_highband)
-        assert (auc, std) == (0.5, 0.0)
-        assert abs(auc - 0.5) + 2 * std <= PROBE_CHANCE_MAX_DEVIATION
+        kaiser = probe_reading("real_vs_rt_kaiser_norm")
+        assert kaiser.loudness_normalised
+        assert kaiser.mean_gain_delta_db == pytest.approx(4.62e-05)
+        assert kaiser.below_is_degenerate and kaiser.below_at_chance
+        assert kaiser.control_auroc >= 0.99
 
-    def test_coupling_path_is_live_at_the_default_ratio(self):
-        """Positive control: the same path DOES leak at the default's high-band
-        loss, so the pinned-ratio 0.5000 is not a test that cannot fail."""
-        from data.invariants import PROBE_CHANCE_MAX_DEVIATION
+    def test_soxr_gain_delta_is_not_detected_either(self):
         from data.measurements import probe_reading
 
-        auc, std = self._probe(probe_reading("real_vs_rt_default").ratio_highband)
-        assert abs(auc - 0.5) + 2 * std > PROBE_CHANCE_MAX_DEVIATION, f"{auc:.4f} +- {std:.4f}"
+        soxr = probe_reading("real_vs_rt_soxr_norm")
+        assert soxr.mean_gain_delta_db == pytest.approx(0.001534)
+        assert soxr.below_is_degenerate
+
+    def test_coupling_is_live_at_the_default_resampler(self):
+        """Positive control: the same step DOES add a below-band cue when the gain
+        delta is large enough, so the pinned 0.5000 is not a test that cannot fail."""
+        from data.measurements import probe_reading
+
+        raw, norm = probe_reading("real_vs_rt_default"), probe_reading("real_vs_rt_default_norm")
+        assert norm.mean_gain_delta_db == pytest.approx(0.02986)
+        assert not norm.below_at_chance
+        assert norm.auroc_below > raw.auroc_below
+
+    # --- TASK 2: a threshold with a margin, not a pass/fail ---------------------
+    def test_threshold_is_a_bracket_between_null_and_detection(self):
+        from data.measurements import loudness_coupling
+
+        c = loudness_coupling()
+        assert (c.highest_null_probe, c.lowest_detected_probe) == (
+            "real_vs_rt_soxr_norm", "real_vs_rt_default_norm"
+        )
+        assert c.highest_null_db == pytest.approx(0.001534)
+        assert c.lowest_detected_db == pytest.approx(0.02986)
+
+    def test_pinned_gain_delta_keeps_its_margin_below_the_highest_null(self):
+        """A future resampler change cannot silently cross the threshold.
+
+        Two links. probes.json measured exactly VOCOS_RESAMPLER, so changing the
+        pin breaks that equality and forces a re-measurement; and the re-measured
+        gain delta must then sit LOUDNESS_COUPLING_MIN_MARGIN below the highest
+        null. The committed margin is 33x: it clears 10x, not 100x.
+        """
+        from data.invariants import LOUDNESS_COUPLING_MIN_MARGIN
+        from data.measurements import load_probes, loudness_coupling
+        from vocoders.registry import get_spec
+
+        pin = get_spec("vocos").resampler
+        for k, v in load_probes()["kaiser_params"].items():
+            assert getattr(pin, k) == v, f"pin changed ({k}); re-measure probes.json"
+        c = loudness_coupling()
+        assert c.margin >= LOUDNESS_COUPLING_MIN_MARGIN, f"margin {c.margin:.1f}x"
+        assert c.margin == pytest.approx(33.2, abs=0.1)
+        assert c.margin_to_detected == pytest.approx(646.3, abs=0.5)
+
+    def test_bracket_is_this_probes_resolution(self):
+        """Why the 'threshold' is where it is. A gain delta shifts every
+        log-magnitude feature equally; the solver never leaves zero while
+        0.25 * shift < tol. Reproduced at the committed deltas, under either log
+        convention the file might have used, on synthetic paired features."""
+        import math
+
+        probe = TestINV18ProbeControls._paired_probe
+        for per_db in (20.0 / math.log(10.0), 20.0):   # natural-log, log10 amplitude
+            assert probe(shift=0.001534 / per_db)[:2] == (0.5, 0.0)
+            assert probe(shift=0.02986 / per_db)[0] > 0.5
 
 
 class TestINV17BandLimitResponse:
