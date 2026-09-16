@@ -37,6 +37,7 @@ Two design points that are easy to get wrong:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import librosa
 import numpy as np
@@ -44,8 +45,9 @@ import pyloudnorm as pyln
 
 from .invariants import (
     ARCHIVE_SR,
-    BAND_LIMIT_FILTER_ORDER,
+    BAND_LIMIT_PASSBAND_LOSS_DB,
     BAND_LIMIT_STOPBAND_DB,
+    BAND_LIMIT_TRANSITION_HZ,
     LADDER_FMAX,
     LOUDNESS_TARGET_LUFS,
     REAL_CONDITION,
@@ -58,6 +60,7 @@ from .invariants import (
     ZEROSHOT_SR,
     InvariantViolation,
     ResamplerSpec,
+    band_limit_order,
     check_band_limit,
     check_derived_loudness,
     out_of_band_energy,
@@ -186,6 +189,58 @@ def derive_zeroshot(
     return out, measured
 
 
+def band_limit_sos(sr: int = ARCHIVE_SR, cutoff_hz: float = LADDER_FMAX) -> np.ndarray:
+    """INV-17. The band-limit filter, as second-order sections, for one pass.
+
+    Specified by BOTH edges and the order derived, never by an order alone:
+
+      passband edge  ``cutoff_hz - BAND_LIMIT_TRANSITION_HZ``, at most
+                     ``BAND_LIMIT_PASSBAND_LOSS_DB`` total after filtfilt
+      stopband edge  ``cutoff_hz``, at least ``BAND_LIMIT_STOPBAND_DB`` per pass
+
+    The old design fixed order 12 and gave scipy only the stopband edge, so the
+    passband edge fell wherever order and attenuation put it -- -1 dB at 6419 Hz,
+    a 1.6 kHz hole below LADDER_FMAX that neither analysis covered. See the
+    measured-response note beside BAND_LIMIT_TRANSITION_HZ.
+
+    Fails closed if scipy's order disagrees with the invariant's arithmetic: the
+    documented spec and the filter that runs must be the same filter.
+    """
+    from scipy.signal import cheb2ord
+
+    nyq = sr / 2.0
+    if not 0 < cutoff_hz < nyq:
+        raise InvariantViolation(
+            f"INV-17: ladder band {cutoff_hz} Hz is not inside (0, {nyq}) at {sr} Hz."
+        )
+    expected = band_limit_order(sr, cutoff_hz)
+    order, wn = cheb2ord(
+        (cutoff_hz - BAND_LIMIT_TRANSITION_HZ) / nyq,
+        cutoff_hz / nyq,
+        BAND_LIMIT_PASSBAND_LOSS_DB / 2.0,   # per pass; filtfilt doubles it
+        BAND_LIMIT_STOPBAND_DB,
+    )
+    if order != expected:
+        raise InvariantViolation(
+            f"INV-17: cheb2ord gives order {order} but the invariant derives "
+            f"{expected} for a {cutoff_hz} Hz band at {sr} Hz."
+        )
+    return _cheby2_sos(order, float(wn))
+
+
+@lru_cache(maxsize=8)
+def _cheby2_sos_cached(order: int, wn: float) -> bytes:
+    from scipy.signal import cheby2
+
+    return cheby2(order, BAND_LIMIT_STOPBAND_DB, wn, btype="low", output="sos").tobytes()
+
+
+def _cheby2_sos(order: int, wn: float) -> np.ndarray:
+    # Cached as immutable bytes; every caller gets its own writable copy
+    # (sosfilt refuses read-only buffers).
+    return np.frombuffer(_cheby2_sos_cached(order, wn), dtype=np.float64).reshape(-1, 6).copy()
+
+
 def band_limit_to_ladder(
     wav: np.ndarray, *, sr: int = ARCHIVE_SR, cutoff_hz: float = LADDER_FMAX
 ) -> np.ndarray:
@@ -209,30 +264,17 @@ def band_limit_to_ladder(
     even at order 24 it leaves ~2.5e-6 of total energy above the band, orders of
     magnitude above the 16-bit noise floor, so the two remain separable on
     exactly the cue INV-17 exists to remove. Chebyshev II is equiripple in the
-    stopband and monotone in the passband, which is the right shape here: 100 dB
-    of stopband rejection for 0.004 dB of passband loss.
+    stopband and monotone in the passband.
 
-    ``cutoff_hz`` is the *stopband edge* under this design -- rejection reaches
-    the full 100 dB at LADDER_FMAX, with the transition sitting just below it.
-    That costs a sliver of the 7-8 kHz region, identically for every condition,
-    which is the trade the invariant is making.
-
+    ``cutoff_hz`` is the *stopband edge*: nothing at or above it survives, which
+    is what keeps Griffin-Lim's above-band cliff out of the primary analysis
+    (INV-18). The transition therefore sits entirely BELOW it, and is held to
+    ``BAND_LIMIT_TRANSITION_HZ`` wide -- measured zero-phase response at
+    LADDER_FMAX = 8000: -1 dB 7915.5 Hz, -3 dB 7922.9 Hz, -20 dB 7940.3 Hz.
     """
-    from scipy.signal import cheby2, sosfiltfilt
+    from scipy.signal import sosfiltfilt
 
-    nyq = sr / 2.0
-    if not 0 < cutoff_hz < nyq:
-        raise InvariantViolation(
-            f"INV-17: ladder band {cutoff_hz} Hz is not inside (0, {nyq}) at {sr} Hz."
-        )
-    sos = cheby2(
-        BAND_LIMIT_FILTER_ORDER,
-        BAND_LIMIT_STOPBAND_DB,
-        cutoff_hz / nyq,
-        btype="low",
-        output="sos",
-    )
-    return sosfiltfilt(sos, wav).astype(np.float32)
+    return sosfiltfilt(band_limit_sos(sr, cutoff_hz), wav).astype(np.float32)
 
 
 def band_limit_comparison_set(

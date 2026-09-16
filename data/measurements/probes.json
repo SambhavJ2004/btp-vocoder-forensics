@@ -1,0 +1,53 @@
+{
+  "n_files": 200,
+  "cv": "GroupKFold(5) grouped by utterance",
+  "classifier": "LogisticRegression(max_iter=5000)",
+  "features": "log mean magnitude spectrum, n_fft=1024 hop=256",
+  "quantisation": "PCM_16 grid",
+  "ladder_fmax": 8000,
+  "kaiser_params": {
+    "lowpass_filter_width": 64,
+    "rolloff": 0.9999,
+    "resampling_method": "sinc_interp_kaiser",
+    "beta": 14.769656459379492
+  },
+  "corpus": "/kaggle/input/datasets/mathurinache/the-lj-speech-dataset/LJSpeech-1.1/wavs/LJ001-0001.wav",
+  "probes": {
+    "real_vs_rt_default": {
+      "ratio_highband": 0.8005038652704736,
+      "auroc_below": 0.5291,
+      "auroc_below_std": 0.0024,
+      "auroc_above": 1.0,
+      "auroc_above_std": 0.0,
+      "auroc_full": 1.0,
+      "auroc_full_std": 0.0
+    },
+    "real_vs_rt_kaiser": {
+      "ratio_highband": 0.9997367196968923,
+      "auroc_below": 0.5,
+      "auroc_below_std": 0.0,
+      "auroc_above": 0.9935,
+      "auroc_above_std": 0.0056,
+      "auroc_full": 0.9924,
+      "auroc_full_std": 0.0071
+    },
+    "real_vs_rt_soxr": {
+      "ratio_highband": 0.9922228785526435,
+      "auroc_below": 0.5,
+      "auroc_below_std": 0.0,
+      "auroc_above": 1.0,
+      "auroc_above_std": 0.0,
+      "auroc_full": 1.0,
+      "auroc_full_std": 0.0
+    },
+    "kaiser_1x_vs_2x": {
+      "ratio_highband": 0.9997942163510827,
+      "auroc_below": 0.5,
+      "auroc_below_std": 0.0,
+      "auroc_above": 0.9928,
+      "auroc_above_std": 0.0073,
+      "auroc_full": 0.9918,
+      "auroc_full_std": 0.0066
+    }
+  }
+}

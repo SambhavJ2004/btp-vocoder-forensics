@@ -147,9 +147,13 @@ class MeasurementRef:
     """
 
     artifact: str       # file under data/measurements/
-    condition: str      # row selector, in the ARTIFACT's own condition naming
-    metric: str         # a column, or "colA-colB" for a derived band difference
-    statistic: str      # mean | median | min | max | auroc_vs:<condition>
+    condition: str      # CSV: row selector, in the ARTIFACT's own naming.
+                        # probes.json: the probe name, e.g. "real_vs_rt_kaiser"
+    metric: str         # CSV: a column, or "colA-colB" for a band difference.
+                        # probes.json: a recorded field, e.g. "auroc_below"
+    statistic: str      # CSV: mean | median | min | max | auroc_vs:<condition>
+                        # probes.json: "recorded" -- the run computed it, the
+                        # file stores the result, nothing here recomputes it
     value: float        # what that statistic evaluated to
     rel_tol: float = 1e-4
 
@@ -195,6 +199,7 @@ class Exclusion:
 
 
 _BAND_CSV = "band_measurements.csv"
+_PROBES = "probes.json"
 # Energy in [rt_edge, Nyquist) = [10900, 11025) Hz: the sliver where a resampler's
 # transition band leaves its fingerprint. meta.json records rt_edge = 10900.
 _EDGE = "hb_8k_nyq-hb_8k_rtedge"
@@ -232,7 +237,10 @@ ANALYSIS_EXCLUSIONS: Final[dict[str, dict[str, Exclusion]]] = {
                 "[rt_edge, Nyquist) it carries ~118x the energy of BigVGAN, is "
                 "separable from BigVGAN at AUROC 0.9997, and is INDISTINGUISHABLE "
                 "from resampled real audio (AUROC 0.507) -- so what distinguishes "
-                "it there is the resampler, not the vocoder."
+                "it there is the resampler, not the vocoder. Those sliver figures "
+                "describe a Vocos resampled with the torchaudio DEFAULT, before "
+                "the pin; under the pinned kaiser resampler the round trip is "
+                "still separable above LADDER_FMAX (AUROC 0.9935)."
             ),
             measurements=(
                 MeasurementRef(_BAND_CSV, "vocos", _EDGE, "mean", 8.630273e-07),
@@ -242,6 +250,8 @@ ANALYSIS_EXCLUSIONS: Final[dict[str, dict[str, Exclusion]]] = {
                     _BAND_CSV, "vocos", _EDGE, "auroc_vs:real_roundtrip", 0.507222,
                     rel_tol=1e-3,
                 ),
+                # the imprint under the resampler Vocos actually uses now
+                MeasurementRef(_PROBES, "real_vs_rt_kaiser", "auroc_above", "recorded", 0.9935),
             ),
         ),
     },
@@ -252,17 +262,22 @@ ANALYSIS_EXCLUSIONS: Final[dict[str, dict[str, Exclusion]]] = {
 class RejectedAlternative:
     """A design considered and rejected, kept so it is not proposed again.
 
-    ``in_committed_artifacts`` says whether the deciding measurement can be
-    re-checked from data/measurements/. A rejection resting on a number nobody
-    can recompute is weaker than one that can, and the difference should be
-    visible in code rather than discovered later.
+    ``evidence`` cites the deciding measurement in data/measurements/.
+    ``in_committed_artifacts`` is DERIVED from it rather than set by hand: it
+    used to be a hand-written flag, and a flag can say True while the citation
+    is missing. A rejection resting on a number nobody can recompute is weaker
+    than one that can, and the difference should be visible in code.
     """
 
     name: str
     reason: str
     measured_value: float
     measurement: str
-    in_committed_artifacts: bool
+    evidence: tuple[MeasurementRef, ...] = ()
+
+    @property
+    def in_committed_artifacts(self) -> bool:
+        return any(m.value == self.measured_value for m in self.evidence)
 
 
 REJECTED_ALTERNATIVES: Final[dict[str, RejectedAlternative]] = {
@@ -279,16 +294,43 @@ REJECTED_ALTERNATIVES: Final[dict[str, RejectedAlternative]] = {
             "the band where its imprint lives (the high-band analysis) and kept "
             "in the band where it does not (the band-limited primary analysis)."
         ),
-        measured_value=0.9903,
+        # Above the band, where the imprint lives and where a uniform round trip
+        # would have had to make Vocos path-identical. The 0.9903 previously
+        # recorded here came from a 60-file run and is NOT in any committed
+        # artifact; the committed 200-file figure replaces it.
+        measured_value=0.9928,
         measurement=(
-            "AUROC, one torchaudio-kaiser round trip vs two, 60 LJSpeech files, "
-            "PCM_16 quantised (Kaggle measurement run)"
+            "AUROC above LADDER_FMAX, one torchaudio-kaiser round trip vs two, "
+            "200 LJSpeech files, PCM_16, GroupKFold(5) by utterance"
         ),
-        # Reported with the Kaggle run, but not present in band_measurements.csv
-        # or meta.json. Commit the underlying per-file features to promote this.
-        in_committed_artifacts=False,
+        evidence=(
+            MeasurementRef(_PROBES, "kaiser_1x_vs_2x", "auroc_above", "recorded", 0.9928),
+            MeasurementRef(_PROBES, "kaiser_1x_vs_2x", "auroc_full", "recorded", 0.9918),
+            # Below the band the two are indistinguishable. Consistent with the
+            # rejection, not against it: below LADDER_FMAX no round trip was
+            # needed in the first place.
+            MeasurementRef(_PROBES, "kaiser_1x_vs_2x", "auroc_below", "recorded", 0.5),
+        ),
     ),
 }
+
+# --- INV-18  Reading a committed paired probe --------------------------------
+# data/measurements/probes.json records grouped-CV AUROCs below LADDER_FMAX,
+# above it, and full-band. A below-band figure is only interpretable next to its
+# above-band CONTROL: the same features, labels, folds and classifier, on the
+# band where the round trip is known to leave an imprint. If the control is not
+# separable, a below-band 0.5 could be a broken pipeline rather than an absent
+# artifact. data.measurements.probe_reading refuses to return one without the
+# other.
+#
+# CONTROL: the above-band probe must reach this. The weakest committed control
+# is kaiser 1x vs 2x at 0.9928.
+PROBE_CONTROL_MIN_AUROC: Final[float] = 0.95
+# AT CHANCE: |auroc_below - 0.5| + 2 * fold_std must not exceed this. The fold
+# std is included so a noisy 0.5 does not pass. Validated against a positive
+# control in the same band: the torchaudio DEFAULT round trip reads 0.5291 +-
+# 0.0024 below the band and must be (and is) classified NOT at chance.
+PROBE_CHANCE_MAX_DEVIATION: Final[float] = 0.01
 
 
 def _derive_ladder_fmax() -> float:
@@ -369,19 +411,79 @@ LADDER_FMAX_ROLE: Final[str] = "analysis band, applied on request; archive is fu
 # on the synthetic corpus, real and Griffin-Lim land at 5.84e-09 and 5.71e-09 --
 # 2% apart, both quantisation-dominated, against a 1.98e-03 gap before filtering.
 #
-# Passband cost, stated two ways because they mean different things:
-#   - energy-weighted loss below 7 kHz on speech-like audio: 0.004 dB. Small
-#     because nearly all speech energy is far below 7 kHz.
-#   - the RESPONSE itself: zero-phase (filtfilt squares the magnitude), so it
-#     is -1 dB at 6420 Hz, -3 dB at 6556 Hz and -20 dB by 6876 Hz. The stopband
-#     EDGE is at LADDER_FMAX; the transition sits below it.
-# So the primary analysis is effectively [0, ~6.5 kHz] in passband terms, and
-# [~6.5, 8] kHz belongs cleanly to neither analysis. The earlier single-number
-# "0.004 dB below 7 kHz" hid that.
-BAND_LIMIT_FILTER_ORDER: Final[int] = 12
-BAND_LIMIT_STOPBAND_DB: Final[float] = 100.0
+# --- The transition band: specified by BOTH edges, order derived ------------
+# The filter used to be specified by an order (12) and a stopband edge
+# (LADDER_FMAX) alone. scipy's cheby2 takes Wn as the frequency where rejection
+# FIRST reaches rs, so the passband edge was never chosen: it fell out of order
+# and attenuation. At order 12 / 100 dB the prewarped -3 dB point sits a factor
+# cosh(acosh(1e5)/12) = 1.56 below the stopband edge, and filtfilt squares the
+# magnitude on top. Measured response of that design, zero-phase:
+#
+#     -0.1 dB 6144 Hz   -1 dB 6419 Hz   -3 dB 6555 Hz   -20 dB 6876 Hz
+#
+# So the primary analysis was effectively [0, ~6.4 kHz] and ~6.4-8 kHz sat in
+# neither analysis -- a 1.6 kHz hole through the fricative region. Nothing
+# pinned the passband and the only passband figure ever quoted was energy
+# weighted ("0.004 dB below 7 kHz"), which speech's low-frequency energy makes
+# small whatever the response does near the edge.
+#
+# Now: passband edge LADDER_FMAX - BAND_LIMIT_TRANSITION_HZ at a total (zero-
+# phase) loss of BAND_LIMIT_PASSBAND_LOSS_DB, stopband edge LADDER_FMAX at
+# BAND_LIMIT_STOPBAND_DB per pass, and the order is whatever satisfies both.
+# Measured three ways (pure tones, impulse through the implementation, analytic
+# sosfreqz), agreeing to 0.1 Hz:
+#
+#     -0.1 dB 7900.0 Hz   -1 dB 7915.5 Hz   -3 dB 7922.9 Hz   -20 dB 7940.3 Hz
+#     -100 dB 7979.1 Hz   full -200 dB stopband from 7998.8 Hz
+#
+# The transition CANNOT straddle LADDER_FMAX, only narrow. Moving it above the
+# band would leak attenuated [8000, 8000+d) content into the primary analysis,
+# where Griffin-Lim has none and real does: the bandwidth cliff INV-18 relies on
+# the band limit to remove. So [7900, 8000) Hz is still in neither analysis at
+# full weight. It is 1.25% of the band and lies inside the falling slope of the
+# top 80-band mel filter (peak ~7.7 kHz, zero at 8 kHz).
+#
+# What the narrower transition costs, measured on this machine:
+#     order 12 -> 53 (6 -> 27 SOS sections), max pole radius 0.9948
+#     impulse response 99.99%-energy span 2.8 ms -> 24 ms (linear, so identical
+#       for every member of a comparison set; smears, does not separate)
+#     ~19 -> ~72 ms per 10 s of audio
+# Stopband residual on harmonic-rich audio is unchanged: the float32 storage
+# floor (~1.8e-16), float64 4.8e-21.
+# Rejected: elliptic (order 17 for the same edges, but 0.1 dB passband ripple
+# and a 41 ms impulse response); Kaiser FIR once (1415 taps, but only 100 dB
+# total stopband, residual 6.8e-16 in float64); a transition wider than 100 Hz
+# (fewer taps, bigger hole); narrower (7950: order 75, 37 ms, 108 ms/10 s).
+BAND_LIMIT_TRANSITION_HZ: Final[float] = 100.0
+BAND_LIMIT_PASSBAND_LOSS_DB: Final[float] = 0.1   # total, zero-phase (0.05 per pass)
+BAND_LIMIT_STOPBAND_DB: Final[float] = 100.0      # per pass; filtfilt gives 200
+
+
+def band_limit_order(sr: int, cutoff_hz: float) -> int:
+    """Chebyshev II order meeting both band-limit edges at ``cutoff_hz``.
+
+    Pure arithmetic so the invariant module stays import-light; the test suite
+    asserts it agrees with ``scipy.signal.cheb2ord``, which the filter uses.
+    """
+    import math
+
+    passband = cutoff_hz - BAND_LIMIT_TRANSITION_HZ
+    if not 0 < passband < cutoff_hz < sr / 2:
+        raise InvariantViolation(
+            f"INV-17: band limit [{passband}, {cutoff_hz}] Hz is not inside (0, {sr / 2})."
+        )
+    wp = math.tan(math.pi * passband / sr)
+    ws = math.tan(math.pi * cutoff_hz / sr)
+    per_pass = BAND_LIMIT_PASSBAND_LOSS_DB / 2
+    ratio = (10 ** (0.1 * BAND_LIMIT_STOPBAND_DB) - 1) / (10 ** (0.1 * per_pass) - 1)
+    return math.ceil(math.acosh(math.sqrt(ratio)) / math.acosh(ws / wp))
+
+
+BAND_LIMIT_FILTER_ORDER: Final[int] = band_limit_order(ARCHIVE_SR, LADDER_FMAX)
 BAND_LIMIT_FILTER_SPEC: Final[str] = (
-    f"cheby2_zerophase_order{BAND_LIMIT_FILTER_ORDER}_rs{BAND_LIMIT_STOPBAND_DB:.0f}db"
+    f"cheby2_zerophase_order{BAND_LIMIT_FILTER_ORDER}"
+    f"_pass{LADDER_FMAX - BAND_LIMIT_TRANSITION_HZ:.0f}hz-{BAND_LIMIT_PASSBAND_LOSS_DB}db"
+    f"_stop{LADDER_FMAX:.0f}hz-{BAND_LIMIT_STOPBAND_DB:.0f}db"
 )
 
 # --- INV-17  Measurement floor (calibrated) ----------------------------------

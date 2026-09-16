@@ -126,18 +126,22 @@ is the resampler. So it is excluded from the high-band analysis and kept in the
 band-limited primary analysis (INV-18). Source:
 [`docs/measurements.md`](docs/measurements.md).
 
-Caveats that still stand: the original finding used synthetic audio, and whether
-the round trip is **at chance below** `LADDER_FMAX` is configuration-sensitive
-(0.50–0.69 across configurations measured locally; see INV-18).
-Reproduced by `TestVocosResampleSignature` and `TestINV18ResampleProbe`.
+The original finding used synthetic audio. Whether the pinned round trip is
+**at chance below** `LADDER_FMAX` on the real corpus is now committed: 0.5000 ±
+0.0000 below, 0.9935 above (`data/measurements/probes.json`, 200 LJSpeech files,
+grouped CV; see INV-18). Reproduced by `TestVocosResampleSignature` and
+`TestINV18ResampleProbe`.
 
 **Vocos's resampler is pinned, and differs from `RESAMPLE_METHOD`.** Both its
 input-side (22050 → 24000) and output-side (24000 → 22050) resamples use
 `vocoders.vocos.VOCOS_RESAMPLER`: torchaudio `sinc_interp_kaiser`,
 `lowpass_filter_width=64`, `rolloff=0.9999`, `beta=14.769656459379492`. The
-torchaudio **default** costs 18% of the energy above `LADDER_FMAX`
-(`real_roundtrip`/`real` = 0.8198, committed). The kaiser pin's own figure
-(ratio 0.9998) is **reported, not committed**.
+torchaudio **default** costs 18–20% of the energy above `LADDER_FMAX` (0.8198 over
+60 files in `band_measurements.csv`, 0.8005 over 200 in `probes.json`) and is
+weakly separable **below** it too (AUROC 0.5291 ± 0.0024). The kaiser pin keeps
+0.9997 and reads 0.5000 below (`probes.json`). So the pin is load-bearing for the
+primary analysis, not only for the high band. The earlier 60-file kaiser figure,
+0.9998, is in no artifact and is superseded.
 
 This is a real tension with *"the method is frozen too"* below, stated rather
 than hidden: `RESAMPLE_METHOD = soxr_hq` still governs every other resample —
@@ -664,9 +668,11 @@ full-band archive; a full-band archive is not recoverable from band-limited
 files. INV-01 applies it to sample rate, INV-17 applies it to bandwidth, and
 INV-17 got it backwards until this was measured.
 
-**What did not change.** The filter itself (`band_limit_to_ladder`, zero-phase
-Chebyshev II order 12 / 100 dB), the measured floors, and the gate. They moved
-from generation to analysis; they were not weakened. `check_band_limit` now
+**What did not change.** The filter family (`band_limit_to_ladder`, zero-phase
+Chebyshev II, 100 dB per pass), the measured floors, and the gate. They moved
+from generation to analysis; they were not weakened. The filter's **order and
+passband edge** changed later, for a separate reason: see *The transition band*
+below. `check_band_limit` now
 gates the *output of the analysis transform* rather than the archive — the
 archive is full-band and would fail that check on every file, which is the point.
 
@@ -684,8 +690,9 @@ in-memory Phase A audio.
 
 **Constants.** `LADDER_FMAX` (derived, 8000.0), `MEASUREMENT_FLOOR = 1e-15`,
 `PCM16_OOB_FLOOR = 2e-8`, `BAND_LIMIT_FLOOR_MARGIN = 50`,
-`BAND_LIMIT_FILTER_ORDER = 12`, `BAND_LIMIT_STOPBAND_DB = 100.0`,
-`BAND_LIMIT_FILTER_SPEC`, `BAND_LIMIT_MAX_STOPBAND_ENERGY = 1e-6`.
+`BAND_LIMIT_TRANSITION_HZ = 100.0`, `BAND_LIMIT_PASSBAND_LOSS_DB = 0.1`,
+`BAND_LIMIT_STOPBAND_DB = 100.0` (per pass), `BAND_LIMIT_FILTER_ORDER` (derived,
+53), `BAND_LIMIT_FILTER_SPEC`, `BAND_LIMIT_MAX_STOPBAND_ENERGY = 1e-6`.
 
 Zero-phase (`sosfiltfilt`) for two reasons: a causal filter's group delay is
 itself a phase artifact sitting in the band under study, and it would shift the
@@ -704,6 +711,49 @@ harmonic-rich 22.05 kHz signal, as a fraction of total energy above the band:
 | **Chebyshev II order 12, 100 dB** | **1.78e-16** | below the floor |
 
 The target is not "small" but **below the noise floor of the delivered format**.
+The current order-53 design (below) lands at the same float32 floor, 1.8e-16
+(float64: 4.8e-21).
+
+**The transition band — the two analyses meet at `LADDER_FMAX`.** The filter used
+to be specified by an order (12) and a stopband edge (`LADDER_FMAX`) alone.
+`scipy.signal.cheby2` takes `Wn` as the frequency where rejection *first reaches*
+`rs`, so the passband edge was never chosen. It fell 1.6 kHz below the band: the
+primary analysis was effectively [0, 6.4 kHz], and 6.4–8 kHz, through the
+fricative region, was in **neither** analysis. It went unnoticed because the only
+passband figure ever quoted, "0.004 dB below 7 kHz", was energy-weighted. Speech
+concentrates its energy low, so that number is small whatever the response does
+near the edge.
+
+The filter is now specified by **both edges** and the order is derived:
+passband to `LADDER_FMAX − BAND_LIMIT_TRANSITION_HZ` at ≤ 0.1 dB total, stopband
+from `LADDER_FMAX` at 100 dB per pass. Zero-phase response, measured directly
+(pure tones, impulse through the implementation, and analytic, agreeing to 0.1 Hz):
+
+| design | order | −1 dB | −3 dB | −20 dB | −100 dB | full stopband |
+|---|---|---|---|---|---|---|
+| old | 12 | 6419 Hz | 6555 Hz | 6876 Hz | 7616 Hz | 8000 Hz |
+| **current** | **53** | **7915.5 Hz** | **7922.9 Hz** | **7940.3 Hz** | **7979.1 Hz** | **7998.8 Hz** |
+
+**The transition can narrow but must not straddle `LADDER_FMAX`.** Moving it
+above the band would leak attenuated [8000, 8000+δ) content into the primary
+analysis, where real has energy and Griffin-Lim has none. That is the bandwidth
+cliff INV-18 relies on the band limit to remove. So **[7900, 8000) Hz is still
+in neither analysis at full weight.** That is 1.25% of the band, inside the
+falling slope of the top 80-band mel filter.
+
+**What it costs,** measured: order 12 → 53 (6 → 27 SOS sections, max pole radius
+0.9948); impulse response 99.99%-energy span 2.8 → 24 ms; ~3.8× the compute
+(~72 ms per 10 s of audio). The longer impulse response is linear and identical
+for every member of a comparison set, so it smears but does not separate.
+Rejected alternatives: elliptic (order 17, 0.1 dB passband ripple, 41 ms); Kaiser
+FIR (cheaper, but its own residual is above `MEASUREMENT_FLOOR`); a narrower
+7950 Hz edge (order 75, 37 ms). Full candidate table:
+[`docs/measurements.md`](docs/measurements.md).
+
+**No regeneration needed.** The band limit is an analysis transform, so changing
+it re-runs analyses and leaves the archive alone. That is INV-17's own argument
+paying out: a generation-time filter would have meant regenerating every
+condition.
 
 **Measuring the stopband needs a Blackman window.** Not Blackman-Harris:
 Blackman-Harris minimises the *peak* sidelobe (−92 dB) but has flat asymptotic
@@ -745,7 +795,12 @@ condition. The contrast it gave is now an analysis choice on `melgan` itself.
 **Enforced by.** `data.preprocess.band_limit_comparison_set` (the only
 sanctioned way to band-limit; refuses a set without `real`),
 `data.preprocess.band_limit_to_ladder` (the filter),
+`data.preprocess.band_limit_sos` (both edges; fails closed if scipy's order
+disagrees with `invariants.band_limit_order`),
 `data.invariants.check_band_limit` (gates the transform's output),
+`TestINV17BandLimitResponse` (pins −1 dB and −20 dB, measured by impulse and by
+tone; asserts nothing at or above `LADDER_FMAX` survives; mutation-checks that the
+order-12 design fails),
 `data.manifest._validate_band` (**asserts the archive is full-band** — the
 inverse of what it used to assert). Membership of the two analyses is INV-18.
 
@@ -826,7 +881,10 @@ analysis removes.
   only above `LADDER_FMAX`.
 - **Vocos's resampler.** Its transition band leaves an imprint in
   [10900, 11025) Hz that makes it indistinguishable from resampled real audio
-  and separable from an unresampled vocoder at AUROC 0.9997.
+  and separable from an unresampled vocoder at AUROC 0.9997. Those figures
+  describe a Vocos resampled with the torchaudio default, before the pin;
+  the pinned kaiser round trip is still separable above the band at 0.9935
+  (`probes.json`), and the exclusion cites both.
 
 A **blanket exclusion loses usable data**: removing Griffin-Lim from every
 analysis throws away its below-band reconstruction behaviour, which is exactly
@@ -857,56 +915,87 @@ This is load-bearing rather than tidy: Griffin-Lim is only safe in the headline
 *because* the headline is band-limited. Admit full-band rows and its cliff comes
 straight back.
 
-**What is NOT established — stated so it is not assumed.** Vocos's inclusion in
-the primary analysis rests on its resampler artifact being absent below
-`LADDER_FMAX`. The evidence for that is weaker than for anything else here:
+**Vocos below the band — established by committed measurement.** Vocos's
+inclusion in the primary analysis rests on its resampler leaving no artifact below
+`LADDER_FMAX`. `data/measurements/probes.json` measures exactly the pinned
+resampler (parameters checked equal to `VOCOS_RESAMPLER`) on 200 LJSpeech files,
+`GroupKFold(5)` by utterance, PCM_16:
 
-| measurement | below `LADDER_FMAX` | above |
-|---|---|---|
-| reported, LJSpeech / torchaudio | 0.502 — **not in `data/measurements/`** | 1.0 |
-| local, committed config, band limit before loudness (old pipeline) | 0.505 | — |
-| local, same config, band limit after loudness (**current pipeline**) | **0.558** | **1.000** |
-| local, noisier signal, passband only, 5 draws | 0.66 – 0.69 | 1.000 |
+| round trip vs real | high-band ratio | AUROC below `LADDER_FMAX` | above (control) |
+|---|---|---|---|
+| **kaiser (pinned)** | 0.9997 | **0.5000 ± 0.0000** | **0.9935 ± 0.0056** |
+| soxr | 0.9922 | 0.5000 ± 0.0000 | 1.0000 |
+| torchaudio default | 0.8005 | **0.5291 ± 0.0024** | 1.0000 |
 
-Above the band: separable in every configuration. Below: **configuration
-sensitive**, 0.50 to 0.69. The local measurements use `soxr_hq`, not the pinned
-kaiser, because torchaudio is absent by INV-13. `TestINV18ResampleProbe` asserts
-the robust claim (concentrated above the band) and carries the stronger one ("at
-chance below") as a **strict xfail** — it will force a decision the moment it
-starts passing. Commit a grouped-CV measurement with the pinned kaiser resampler
-on LJSpeech before treating Vocos's primary-analysis membership as settled.
+**0.5000 ± 0.0000 is degenerate, not noisy chance, and not a bug.** It means the
+classifier gave both versions of every utterance the same score. lbfgs starts at
+zero coefficients, and when the mean paired feature difference is under its
+tolerance it stops at iteration 0. That makes the result a *resolution* (about
+4e-4 in log-feature units), not a proof of identity. Two controls rule out a
+pipeline fault: the same probe separates the same pairs **above** the band (0.9935),
+and in the **same** band it reads a non-degenerate 0.5291 for the lossier default.
+`data.measurements.probe_reading` refuses to hand out a below-band reading whose
+above-band control is under `PROBE_CONTROL_MIN_AUROC`. Full reasoning, with the
+mechanism reproduced: [`docs/measurements.md`](docs/measurements.md).
+
+**The loudness step.** `probes.json` does not record loudness normalisation, and
+the pipeline normalises on the full band. A round trip that removes high-band
+energy therefore gets a slightly larger gain, which shifts every below-band bin.
+Locally this coupling is what moved the synthetic probe to 0.54–0.57. The same
+probe is 0.5000 without loudness normalisation, which explains the earlier
+"configuration-sensitive, 0.50–0.69". Measured resampler-free at the committed
+ratios, through loudness → PCM_16 → band limit, the pinned ratio's gain
+difference is 6.4e-5 dB and the probe stays at 0.5000 ± 0.0000. At the default's
+ratio the same path reads 0.532. `TestINV18LoudnessCoupling` pins both.
+
+The earlier "reported 0.502" is in no artifact and has no counterpart here. If it
+was the default resampler, the committed 0.5291 disagrees with it.
 
 **Rejected: the uniform round trip.** Considered and rejected — recorded so it is
 not proposed again. The idea was to pass *every* condition through the same
 22050 → 24000 → 22050 round trip, so Vocos would no longer be the only condition
 with a resampler imprint. It fails because **resampling is not idempotent**: one
-kaiser round trip versus two is separable at **AUROC 0.9903**. Adding a round trip
-to the other conditions gives every condition an imprint and Vocos a *different*
-one; it does not make them path-identical. The 0.9903 is **reported, not in the
-committed artifacts** — `REJECTED_ALTERNATIVES["uniform_round_trip"]` records it
-with `in_committed_artifacts=False`, so the weakness of that evidence is visible
-in code.
+kaiser round trip versus two is separable at **AUROC 0.9928 above the band**
+(0.9918 full; `probes.json`). Adding a round trip to the other conditions gives
+every condition an imprint and Vocos a *different* one; it does not make them
+path-identical. Below the band once and twice are indistinguishable (0.5000),
+which is consistent: no round trip was needed there. The figure previously
+recorded, 0.9903 from 60 files, is in no artifact. `REJECTED_ALTERNATIVES` now
+cites the committed values, and `in_committed_artifacts` is derived from that
+citation rather than set by hand.
 
 **Cross-validation for any paired probe must be grouped by utterance.** Shuffled
 folds split an utterance's two versions across train and test; because
 utterances differ far more than the two paths do, the classifier is
-systematically inverted — 0.14 against the grouped 0.56 on identical data.
+systematically inverted — 0.13 against the grouped 0.57 on identical data.
 `TestINV18ResampleProbe.test_paired_probe_must_group_by_utterance` pins this.
 
 **Constants.** `PRIMARY_ANALYSIS`, `HIGH_BAND_ANALYSIS`, `ANALYSIS_EXCLUSIONS`,
-`REJECTED_ALTERNATIVES`, `vocoders.vocos.VOCOS_RESAMPLER`.
+`REJECTED_ALTERNATIVES`, `vocoders.vocos.VOCOS_RESAMPLER`,
+`PROBE_CONTROL_MIN_AUROC = 0.95`, `PROBE_CHANCE_MAX_DEVIATION = 0.01`.
 
 **Enforced by.** `data.invariants.ANALYSIS_EXCLUSIONS` (each `Exclusion` carries
-its `MeasurementRef`s), `data.measurements.verify` (recomputes every cited
-statistic from `data/measurements/`), `detectors.protocols.spearman_headline`
+its `MeasurementRef`s; Vocos's also cites the pinned resampler's above-band
+0.9935), `data.measurements.verify` (recomputes every CSV statistic, and checks
+every `probes.json` citation against the file),
+`data.measurements.probe_reading` (a below-band reading never exists without a
+separable above-band control), `vocoders.vocos.VOCOS_RESAMPLER.justification`
+(cites kaiser ratio 0.9997, kaiser below 0.5000, default below 0.5291),
+`detectors.protocols.spearman_headline`
 (refuses excluded conditions with the evidence, refuses controls by membership,
 refuses full-band rows), `detectors.protocols.refuse_excluded`,
 `metrics.spectral.high_band_distance` (refuses excluded conditions; `condition`
 is required so the refusal cannot be skipped), `data.manifest.analysis_frame`,
 `metrics.runner.evaluate_archive` (records exclusions rather than scoring them).
 Tests: `TestINV18PerAnalysisMembership` (every citation recomputed; refusals),
-`TestINV18ResampleProbe` (below/above regression; grouped CV),
-`TestINV18RejectedAlternatives`, `TestResamplerPin`, `TestMeasurementArtifacts`.
+`TestINV18ResampleProbe` (**pinned kaiser at chance below the band, from
+`probes.json`**, formerly a strict xfail; default not at chance; local
+concentration above; grouped CV), `TestINV18ProbeControls` (every probe's
+above-band control separable; a reading without one refused; the exact-0.5
+mechanism reproduced), `TestINV18LoudnessCoupling` (the pinned ratio survives
+loudness normalisation; the default's does not), `TestINV18RejectedAlternatives`,
+`TestResamplerPin`, `TestMeasurementArtifacts` (`probes.json` measured exactly the
+pin).
 
 ---
 
@@ -1049,18 +1138,17 @@ nudge a pipeline toward a preferred answer.
   correlation; `melgan_fullband` was deleted as a duplicate. `LADDER_FMAX` is
   unchanged at 8000. Evidence in [`docs/mel_configs.md`](docs/mel_configs.md).
 
-- **OPEN — Vocos's place in the primary analysis is not established.** It rests
-  on the resampler artifact being absent below `LADDER_FMAX`. The reported 0.502
-  is not in `data/measurements/`, and local measurements span 0.50–0.69
-  depending on configuration (INV-18). Needed: a grouped-by-utterance probe with
-  the **pinned kaiser** resampler on LJSpeech, committed as a per-file artifact.
-  `TestINV18ResampleProbe.test_probe_is_at_chance_below_the_band` is the strict
-  xfail that will force the decision.
-- **OPEN — several reported measurements are not committed.** kaiser (0.9998 /
-  0.9958), soxr_vhq (0.9936 / 1.0), one-vs-two kaiser round trips (0.9903), and
-  the band-limited probe (0.502). None backs an exclusion; two back decisions
-  (the kaiser pin's benefit, the uniform-round-trip rejection). Commit the
-  per-file features. See [`docs/measurements.md`](docs/measurements.md).
+- **RESOLVED — reported resampler measurements are now committed** in
+  `data/measurements/probes.json` (200 files), **with different values** from the
+  60-file reports, recorded rather than reconciled: kaiser 0.9998 / 0.9958 →
+  ratio 0.9997, above 0.9935, full 0.9924. soxr_vhq 0.9936 → `rt_soxr` 0.9922,
+  quality level unrecorded. One-vs-two 0.9903 → above 0.9928, full 0.9918. The
+  band-limited 0.502 has no counterpart; the committed default below-band figure
+  is 0.5291. See [`docs/measurements.md`](docs/measurements.md).
+- **RESOLVED — the band limit left 6.4–8 kHz in neither analysis.** The order-12
+  design put its −1 dB point at 6419 Hz. It is now specified by both edges and is
+  −1 dB at 7915.5 Hz, −20 dB at 7940.3 Hz, at order 53. [7900, 8000) Hz remains
+  the unavoidable transition (INV-17). Analysis-time only; no regeneration.
 - **Regenerate every condition.** The archive changed meaning: files produced
   under the old INV-17 are band-limited at 8 kHz and cannot be reused. Nothing
   generated before this change is valid.
@@ -1115,3 +1203,9 @@ nudge a pipeline toward a preferred answer.
   utterances x 6 conditions x 2 tiers the archive is roughly 2.4x the previous
   footprint, against a 20 GB per-account Kaggle limit. Publish the tiers as
   separate Kaggle Datasets so a session can mount only the one it needs.
+
+
+## Git
+Never run git commit, git push, git rebase, git checkout --, or any
+command that modifies history or the working tree's committed state.
+Stage with git add and stop. The human commits.

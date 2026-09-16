@@ -37,6 +37,7 @@ from data.mel import VOCOS_MEL
 from .base import Vocoder, VocoderSpec
 
 _CSV = "band_measurements.csv"
+_PROBES = "probes.json"
 
 # --- INV-18  The pinned resampler ---------------------------------------------
 # Vocos is 24 kHz native and is resampled to the 22.05 kHz archive on the way in
@@ -48,15 +49,22 @@ _CSV = "band_measurements.csv"
 # produced with the default resampler; its mean high-band fraction over real's is
 # 0.8198).
 #
-# Why these kaiser parameters: reported by the Kaggle measurement run as keeping
-# 99.98% of the high band (ratio 0.9998). NOTE that ratio is NOT present in
-# data/measurements/ -- only the default-resampler round trip was committed -- so
-# the improvement is a reported result, not a verifiable one. See
-# docs/measurements.md. The COST of the default is verified; the BENEFIT of this
-# pin is not yet.
+# Why these kaiser parameters (probes.json, 200 LJSpeech files, GroupKFold(5) by
+# utterance, PCM_16):
 #
-# Pinning does not remove Vocos's resampler signature, and the uniform round
-# trip that would have equalised it was rejected -- see CLAUDE.md INV-18.
+#     round trip vs real      high-band ratio   AUROC below LADDER_FMAX   above
+#     torchaudio default           0.8005          0.5291 +- 0.0024       1.0000
+#     this kaiser pin              0.9997          0.5000 +- 0.0000       0.9935
+#
+# Two separate benefits, both committed. The pin keeps the high band (0.9997,
+# against 0.8005). And it is what makes Vocos admissible in the PRIMARY analysis:
+# the default round trip is weakly but consistently separable BELOW the band
+# (0.5291), the kaiser round trip is not. The earlier 60-file figure for this pin
+# (ratio 0.9998) is not in any committed artifact; 0.9997 replaces it.
+#
+# Pinning does not remove Vocos's resampler signature ABOVE the band (0.9935),
+# and the uniform round trip that would have equalised it was rejected -- see
+# CLAUDE.md INV-18.
 VOCOS_RESAMPLER = ResamplerSpec(
     backend="torchaudio",
     resampling_method="sinc_interp_kaiser",
@@ -64,8 +72,14 @@ VOCOS_RESAMPLER = ResamplerSpec(
     rolloff=0.9999,
     beta=14.769656459379492,
     justification=(
+        # the default's cost, 60 files
         MeasurementRef(_CSV, "real_roundtrip", "hb_8k_nyq", "mean", 1.653462e-02),
         MeasurementRef(_CSV, "real", "hb_8k_nyq", "mean", 2.016939e-02),
+        # the pin's benefit, 200 files
+        MeasurementRef(_PROBES, "real_vs_rt_kaiser", "ratio_highband", "recorded",
+                       0.9997367196968923),
+        MeasurementRef(_PROBES, "real_vs_rt_kaiser", "auroc_below", "recorded", 0.5),
+        MeasurementRef(_PROBES, "real_vs_rt_default", "auroc_below", "recorded", 0.5291),
     ),
 )
 

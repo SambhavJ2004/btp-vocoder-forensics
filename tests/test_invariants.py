@@ -885,13 +885,37 @@ class TestINV18PerAnalysisMembership:
 
     def test_exclusion_references_resolve_to_real_rows(self):
         from data.invariants import ANALYSIS_EXCLUSIONS
-        from data.measurements import load_csv
+        from data.measurements import load_csv, load_probes
 
         conditions = set(load_csv()["condition"])
+        probes = set(load_probes()["probes"])
         for table in ANALYSIS_EXCLUSIONS.values():
             for exc in table.values():
                 for ref in exc.measurements:
-                    assert ref.condition in conditions, ref.describe()
+                    known = probes if ref.artifact.endswith(".json") else conditions
+                    assert ref.condition in known, ref.describe()
+
+    def test_vocos_exclusion_covers_the_pinned_resampler(self):
+        """The CSV sliver figures predate the pin; the exclusion must also hold
+        for the resampler Vocos is generated with now."""
+        from data.invariants import ANALYSIS_EXCLUSIONS
+        from data.measurements import verify
+
+        refs = ANALYSIS_EXCLUSIONS[HIGH_BAND_ANALYSIS]["vocos"].measurements
+        (pinned,) = [r for r in refs if r.condition == "real_vs_rt_kaiser"]
+        assert pinned.metric == "auroc_above"
+        assert verify(pinned) >= 0.99
+
+    def test_a_wrong_recorded_probe_value_is_caught(self):
+        from data.invariants import MeasurementRef
+        from data.measurements import verify
+
+        with pytest.raises(InvariantViolation, match="INV-18.*records"):
+            verify(MeasurementRef("probes.json", "real_vs_rt_kaiser", "auroc_below",
+                                  "recorded", 0.502))
+        with pytest.raises(InvariantViolation, match="recorded"):
+            verify(MeasurementRef("probes.json", "real_vs_rt_kaiser", "auroc_below",
+                                  "mean", 0.5))
 
     # --- membership ----------------------------------------------------------
     def test_primary_analysis_excludes_nothing(self):
@@ -1008,13 +1032,11 @@ class TestHighBandDistance:
 
     def test_hard_bandwidth_zero_is_visible(self):
         """Griffin-Lim's failure mode: no content at all above the band."""
-        from scipy.signal import cheby2, sosfiltfilt
-
+        from data.preprocess import band_limit_to_ladder
         from metrics.spectral import high_band_distance
 
         r = self._real()
-        sos = cheby2(12, 100, LADDER_FMAX / (ARCHIVE_SR / 2), btype="low", output="sos")
-        gl = sosfiltfilt(sos, r).astype(np.float32)
+        gl = band_limit_to_ladder(r, sr=ARCHIVE_SR)
         out = high_band_distance(r, gl, condition="melgan")
         assert out["hb_frac_deg"] == pytest.approx(0.0, abs=1e-12)
         assert out["hb_frac_ratio"] == pytest.approx(0.0, abs=1e-9)
@@ -1846,8 +1868,38 @@ class TestMeasurementArtifacts:
         return r.returncode == 0
 
     def test_measurement_artifacts_are_not_ignored(self):
-        for f in ("data/measurements/band_measurements.csv", "data/measurements/meta.json"):
+        for f in ("data/measurements/band_measurements.csv", "data/measurements/meta.json",
+                  "data/measurements/probes.json"):
             assert not self._git_ignored(f), f"{f} is ignored; INV-18 cites it by row"
+
+    def test_probes_measured_exactly_the_pinned_resampler(self):
+        """The evidence for Vocos's primary membership is about THIS resampler."""
+        from data.measurements import load_probes
+        from vocoders.registry import get_spec
+
+        meta, pin = load_probes(), get_spec("vocos").resampler
+        for k, v in meta["kaiser_params"].items():
+            assert getattr(pin, k) == v, f"probes.json {k}={v!r}, pin {getattr(pin, k)!r}"
+        assert meta["ladder_fmax"] == LADDER_FMAX
+        assert "GroupKFold" in meta["cv"] and "utterance" in meta["cv"]
+        assert meta["n_files"] == 200
+
+    def test_probe_figures_quoted_in_the_docs_are_in_the_file(self):
+        from data.measurements import load_probes
+
+        p = load_probes()["probes"]
+        quoted = {
+            "real_vs_rt_default": (0.8005, 0.5291, 0.0024, 1.0),
+            "real_vs_rt_kaiser": (0.9997, 0.5, 0.0, 0.9935),
+            "real_vs_rt_soxr": (0.9922, 0.5, 0.0, 1.0),
+            "kaiser_1x_vs_2x": (0.9998, 0.5, 0.0, 0.9928),
+        }
+        assert set(p) == set(quoted)
+        for name, (ratio, below, below_std, above) in quoted.items():
+            assert p[name]["ratio_highband"] == pytest.approx(ratio, abs=5e-5), name
+            assert p[name]["auroc_below"] == below, name
+            assert p[name]["auroc_below_std"] == below_std, name
+            assert p[name]["auroc_above"] == above, name
 
     def test_generated_audio_under_data_is_still_ignored(self):
         """The negation must not reopen data/ for generated audio."""
@@ -1928,12 +1980,33 @@ class TestResamplerPin:
         assert r.lowpass_filter_width != 6
         assert r.rolloff != 0.99
 
-    def test_default_resampler_cost_is_a_committed_measurement(self):
+    def _cited(self, condition, metric):
         from data.measurements import verify
         from vocoders.registry import get_spec
 
-        rt_mean, real_mean = (verify(m) for m in get_spec("vocos").resampler.justification)
+        (ref,) = [m for m in get_spec("vocos").resampler.justification
+                  if (m.condition, m.metric) == (condition, metric)]
+        return verify(ref)
+
+    def test_every_justification_resolves(self):
+        from data.measurements import verify
+        from vocoders.registry import get_spec
+
+        for ref in get_spec("vocos").resampler.justification:
+            verify(ref)
+
+    def test_default_resampler_cost_is_a_committed_measurement(self):
+        rt_mean = self._cited("real_roundtrip", "hb_8k_nyq")
+        real_mean = self._cited("real", "hb_8k_nyq")
         assert 1.0 - rt_mean / real_mean == pytest.approx(0.1802, abs=5e-4)
+
+    def test_pin_benefit_is_a_committed_measurement(self):
+        """Formerly 'reported, not committed' (0.9998, 60 files). Now in probes.json."""
+        ratio = self._cited("real_vs_rt_kaiser", "ratio_highband")
+        assert ratio == pytest.approx(0.9997, abs=5e-5)
+        # ...and it is the pin that keeps Vocos admissible below the band.
+        assert self._cited("real_vs_rt_kaiser", "auroc_below") == 0.5
+        assert self._cited("real_vs_rt_default", "auroc_below") == pytest.approx(0.5291)
 
     def test_only_vocos_declares_a_resampler(self):
         from vocoders.registry import ALL_CONDITIONS, get_spec
@@ -2003,12 +2076,19 @@ class TestResamplerPin:
 
 
 class TestINV18ResampleProbe:
-    """TASK 3 regression: where does a resample round trip's signature live?
+    """Where does a resample round trip's signature live?
 
-    Measured with RESAMPLE_METHOD (soxr_hq), NOT the pinned torchaudio kaiser --
-    torchaudio is absent from this environment by INV-13. Uses the configuration
-    that produced the committed 0.502 finding, with folds grouped by utterance
-    (see test_paired_probe_must_group_by_utterance for why that matters).
+    Two sources of evidence, kept apart:
+
+    * COMMITTED -- data/measurements/probes.json: the pinned torchaudio kaiser
+      resampler on 200 LJSpeech files, GroupKFold(5) by utterance. This is what
+      Vocos's primary-analysis membership rests on
+      (test_pinned_resampler_is_at_chance_below_the_band).
+    * LOCAL -- synthetic audio round-tripped with RESAMPLE_METHOD (soxr_hq), since
+      torchaudio is absent by INV-13. It carries loudness normalisation, which the
+      committed probe does not record, and reads 0.55-0.57 below the band for that
+      reason (see TestINV18LoudnessCoupling). It pins what is robust -- the
+      signature is concentrated above the band -- and the grouped-CV trap.
     """
 
     N = 60
@@ -2092,23 +2172,27 @@ class TestINV18ResampleProbe:
         assert below <= 0.75, f"below-band AUROC {below:.3f}"
         assert above - below >= 0.25, f"above {above:.3f} vs below {below:.3f}"
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "INV-18 claim as specified: 'at chance below LADDER_FMAX'. NOT robust. "
-            "Grouped-CV AUROC below the band measured 0.505 (band limit BEFORE "
-            "loudness, the old pipeline), 0.558 (band limit after, the current "
-            "pipeline, this test) and 0.66-0.69 over 5 draws of a noisier signal. "
-            "The reported 0.502 on LJSpeech/torchaudio is NOT in data/measurements/. "
-            "Commit that measurement, or a grouped-CV re-run with the pinned "
-            "kaiser resampler, before Vocos's place in the primary analysis is "
-            "treated as established."
-        ),
-    )
-    def test_probe_is_at_chance_below_the_band(self):
-        x_lo, x_hi, y, g = self._dataset()
-        below = self._auroc(x_lo, y, self._grouped(x_lo, y, g))
-        assert abs(below - 0.5) <= 0.05, f"below-band AUROC {below:.3f}"
+    def test_pinned_resampler_is_at_chance_below_the_band(self):
+        """INV-18: Vocos's primary-analysis membership, from committed evidence.
+
+        Was a strict xfail against the local synthetic probe. Now driven by
+        probes.json, and read through probe_reading, which refuses a below-band
+        figure whose above-band control is not separable.
+        """
+        from data.measurements import probe_reading
+
+        kaiser = probe_reading("real_vs_rt_kaiser")
+        assert kaiser.below_at_chance, f"below-band deviation {kaiser.below_deviation:.4f}"
+        assert kaiser.below_is_degenerate
+        assert kaiser.control_auroc >= 0.99
+
+    def test_the_torchaudio_default_would_not_be_at_chance_below(self):
+        """Why the pin is load-bearing for the PRIMARY analysis, not only the high band."""
+        from data.measurements import probe_reading
+
+        default = probe_reading("real_vs_rt_default")
+        assert not default.below_at_chance
+        assert default.auroc_below - 2 * default.auroc_below_std > 0.52
 
     def test_paired_probe_must_group_by_utterance(self):
         """Shuffled folds split each utterance's two versions across train and
@@ -2129,11 +2213,317 @@ class TestINV18RejectedAlternatives:
         from data.invariants import REJECTED_ALTERNATIVES
 
         rec = REJECTED_ALTERNATIVES["uniform_round_trip"]
-        assert rec.measured_value == pytest.approx(0.9903)
+        # 0.9903 (60 files, never committed) was replaced by the committed figure.
+        assert rec.measured_value == pytest.approx(0.9928)
         assert "not idempotent" in rec.reason
 
-    def test_rejection_evidence_is_flagged_as_not_committed(self):
-        """0.9903 is reported, not in data/measurements/. Say so in code."""
+    def test_rejection_evidence_is_committed_and_resolves(self):
+        from data.invariants import REJECTED_ALTERNATIVES
+        from data.measurements import verify
+
+        rec = REJECTED_ALTERNATIVES["uniform_round_trip"]
+        assert rec.evidence, "a rejection must cite committed evidence"
+        for ref in rec.evidence:
+            verify(ref)
+        assert rec.in_committed_artifacts is True
+
+    def test_committed_flag_cannot_outlive_its_citation(self):
+        """in_committed_artifacts is derived: no citation of the value, no flag."""
+        from dataclasses import replace
+
         from data.invariants import REJECTED_ALTERNATIVES
 
-        assert REJECTED_ALTERNATIVES["uniform_round_trip"].in_committed_artifacts is False
+        rec = REJECTED_ALTERNATIVES["uniform_round_trip"]
+        assert replace(rec, evidence=()).in_committed_artifacts is False
+        assert replace(rec, measured_value=0.9903).in_committed_artifacts is False
+
+
+class TestINV18ProbeControls:
+    """TASK 2: a below-band 0.5000 is never read without its above-band control.
+
+    probes.json reports exactly 0.5000 +- 0.0000 below LADDER_FMAX for three
+    probes. That is a degenerate result -- a decision function that gives both
+    members of every pair the same score -- not noisy chance, and it is only
+    evidence of an absent artifact because the SAME pipeline separates the SAME
+    pairs above the band. See docs/measurements.md, "Why 0.5000 is not a bug".
+    """
+
+    def test_every_committed_probe_has_a_separable_above_band_control(self):
+        from data.invariants import PROBE_CONTROL_MIN_AUROC
+        from data.measurements import load_probes, probe_reading
+
+        for name, fields in load_probes()["probes"].items():
+            assert fields["auroc_above"] >= PROBE_CONTROL_MIN_AUROC, name
+            probe_reading(name)  # would raise without a separable control
+
+    def test_a_below_band_reading_is_refused_without_its_control(self, tmp_path, monkeypatch):
+        import json
+
+        import data.measurements as dm
+
+        broken = {"probes": {"x": {"ratio_highband": 1.0, "auroc_below": 0.5,
+                                   "auroc_below_std": 0.0, "auroc_above": 0.61,
+                                   "auroc_above_std": 0.02}}}
+        (tmp_path / "probes_broken_control.json").write_text(json.dumps(broken))
+        monkeypatch.setattr(dm, "MEASUREMENTS_DIR", tmp_path)
+        with pytest.raises(InvariantViolation, match="above-band control"):
+            dm.probe_reading("x", artifact="probes_broken_control.json")
+
+    def test_same_band_positive_control_reads_live_features(self):
+        """The above-band control rules out a pipeline fault in general. This rules
+        out one confined to the below-band slice: the same probe, same band, reports
+        a non-degenerate 0.5291 for the lossier default resampler."""
+        from data.measurements import probe_reading
+
+        default = probe_reading("real_vs_rt_default")
+        assert not default.below_is_degenerate
+        assert not default.below_at_chance
+
+    @staticmethod
+    def _paired_probe(shift, n=200, d=64, seed=0):
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import roc_auc_score
+        from sklearn.model_selection import GroupKFold
+
+        rng = np.random.default_rng(seed)
+        base = (rng.normal(0, 1, (n, 1)) + rng.normal(-4, 1.5, (1, d))
+                + rng.normal(0, 0.8, (n, d)))
+        x = np.vstack([base + shift, base])
+        y = np.r_[np.ones(n), np.zeros(n)]
+        g = np.r_[np.arange(n), np.arange(n)]
+        aucs, coefs, iters = [], [], []
+        for tr, te in GroupKFold(5).split(x, y, g):
+            clf = LogisticRegression(max_iter=5000).fit(x[tr], y[tr])
+            aucs.append(roc_auc_score(y[te], clf.decision_function(x[te])))
+            coefs.append(float(np.abs(clf.coef_).max()))
+            iters.append(int(clf.n_iter_[0]))
+        return float(np.mean(aucs)), float(np.std(aucs)), max(coefs), max(iters)
+
+    def test_exact_half_is_a_solver_that_never_left_zero(self):
+        """The mechanism, reproduced. lbfgs starts at w = 0, where the gradient of
+        the mean log-loss is 0.25 * (mean paired feature difference). Below its
+        tolerance (1e-4) it stops at iteration 0: every score is the intercept,
+        both members of every pair tie, and AUROC is exactly 0.5 in every fold."""
+        auc, std, coef, it = self._paired_probe(shift=1e-4)
+        assert (auc, std, coef, it) == (0.5, 0.0, 0.0, 0)
+
+    def test_a_real_paired_shift_is_not_exactly_half(self):
+        auc, std, coef, it = self._paired_probe(shift=1e-2)
+        assert coef > 0 and it > 0
+        assert auc > 0.51
+
+    def test_noisy_chance_does_not_look_like_the_committed_result(self):
+        """Genuinely uninformative labels give fold spread, not 0.0000."""
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import roc_auc_score
+        from sklearn.model_selection import GroupKFold
+
+        rng = np.random.default_rng(1)
+        x = rng.normal(0, 1, (400, 64))
+        y = rng.permutation(np.r_[np.ones(200), np.zeros(200)])
+        aucs = [roc_auc_score(y[te], LogisticRegression(max_iter=5000).fit(x[tr], y[tr])
+                              .decision_function(x[te]))
+                for tr, te in GroupKFold(5).split(x, y, np.arange(400))]
+        assert np.std(aucs) > 0.02
+
+
+class TestINV18LoudnessCoupling:
+    """Does the committed probe's result survive the pipeline's loudness step?
+
+    probes.json does not record loudness normalisation. The pipeline normalises
+    on the FULL band (INV-04, INV-07), so a round trip that removes above-band
+    energy gets a slightly larger gain, and that gain shifts every bin BELOW the
+    band. Locally this is what moved the synthetic soxr_hq probe off 0.5000.
+
+    Resampler-free dose-response on synthetic audio with real LJSpeech's
+    high-band fraction, through the pipeline order (loudness -> PCM_16 ->
+    analysis band limit), at the COMMITTED high-band ratios.
+    """
+
+    N = 60
+    _cache: dict = {}
+
+    @classmethod
+    def _probe(cls, ratio):
+        if ratio in cls._cache:
+            return cls._cache[ratio]
+        import librosa
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import roc_auc_score
+        from sklearn.model_selection import GroupKFold
+
+        from data.measurements import load_csv
+        from data.preprocess import band_limit_to_ladder, normalise_loudness
+
+        df = load_csv()
+        hb = float(df[df["condition"] == "real"]["hb_8k_nyq"].mean())
+
+        def src(i):
+            rng = np.random.default_rng(5000 + i)
+            n = int(ARCHIVE_SR * (1.6 + 0.02 * (i % 25)))
+            t = np.arange(n) / ARCHIVE_SR
+            f0 = 100 + 3 * (i % 40)
+            x = sum((0.35 / k) * np.sin(2 * np.pi * f0 * k * t + rng.uniform(0, 6.28))
+                    for k in range(1, int(ARCHIVE_SR / 2 / f0)))
+            x = x * (1 + 0.4 * np.sin(2 * np.pi * (2 + i % 5) * t))
+            x = (x + 0.02 * rng.standard_normal(n)) * np.hanning(n)
+            spec, f = np.fft.rfft(x), np.fft.rfftfreq(n, 1 / ARCHIVE_SR)
+            hi = f >= LADDER_FMAX
+            e_hi, e_lo = np.sum(np.abs(spec[hi]) ** 2), np.sum(np.abs(spec[~hi]) ** 2)
+            spec[hi] *= np.sqrt(hb / (1 - hb) * e_lo / e_hi)
+            x = np.fft.irfft(spec, n)
+            return 0.3 * x / np.max(np.abs(x)), hi
+
+        def pipeline(x):
+            norm, _ = normalise_loudness(x.astype(np.float32), sr=ARCHIVE_SR)
+            q = (np.round(np.clip(norm, -1, 1) * 32767) / 32768).astype(np.float32)
+            w = band_limit_to_ladder(q, sr=ARCHIVE_SR)
+            s = np.abs(librosa.stft(w, n_fft=1024, hop_length=256)).mean(axis=1)
+            fr = librosa.fft_frequencies(sr=ARCHIVE_SR, n_fft=1024)
+            return np.log(s[fr < LADDER_FMAX] + 1e-10)
+
+        a, b = [], []
+        for i in range(cls.N):
+            x, hi = src(i)
+            spec = np.fft.rfft(x)
+            spec[hi] *= np.sqrt(ratio)
+            a.append(pipeline(np.fft.irfft(spec, len(x))))
+            b.append(pipeline(x))
+        x = np.vstack([a, b])
+        y = np.r_[np.ones(cls.N), np.zeros(cls.N)]
+        g = np.r_[np.arange(cls.N), np.arange(cls.N)]
+        aucs = [roc_auc_score(y[te], LogisticRegression(max_iter=5000).fit(x[tr], y[tr])
+                              .decision_function(x[te]))
+                for tr, te in GroupKFold(5).split(x, y, g)]
+        cls._cache[ratio] = (float(np.mean(aucs)), float(np.std(aucs)))
+        return cls._cache[ratio]
+
+    def test_pinned_ratio_survives_loudness_normalisation(self):
+        from data.invariants import PROBE_CHANCE_MAX_DEVIATION
+        from data.measurements import probe_reading
+
+        auc, std = self._probe(probe_reading("real_vs_rt_kaiser").ratio_highband)
+        assert (auc, std) == (0.5, 0.0)
+        assert abs(auc - 0.5) + 2 * std <= PROBE_CHANCE_MAX_DEVIATION
+
+    def test_coupling_path_is_live_at_the_default_ratio(self):
+        """Positive control: the same path DOES leak at the default's high-band
+        loss, so the pinned-ratio 0.5000 is not a test that cannot fail."""
+        from data.invariants import PROBE_CHANCE_MAX_DEVIATION
+        from data.measurements import probe_reading
+
+        auc, std = self._probe(probe_reading("real_vs_rt_default").ratio_highband)
+        assert abs(auc - 0.5) + 2 * std > PROBE_CHANCE_MAX_DEVIATION, f"{auc:.4f} +- {std:.4f}"
+
+
+class TestINV17BandLimitResponse:
+    """TASK 3: the band-limited primary analysis and the high-band analysis meet
+    at LADDER_FMAX.
+
+    Measured DIRECTLY -- impulse through the implementation, and pure tones --
+    never energy-weighted. An energy-weighted passband figure ("0.004 dB below
+    7 kHz") is what hid a design whose -1 dB point was at 6419 Hz.
+    """
+
+    N = 2**17
+    _resp: tuple | None = None
+
+    @classmethod
+    def _response(cls):
+        if cls._resp is None:
+            from data.preprocess import band_limit_to_ladder
+
+            imp = np.zeros(cls.N, dtype=np.float32)
+            imp[cls.N // 2] = 1.0
+            h = band_limit_to_ladder(imp, sr=ARCHIVE_SR).astype(np.float64)
+            db = 20 * np.log10(np.maximum(np.abs(np.fft.rfft(h)), 1e-300))
+            cls._resp = (np.fft.rfftfreq(cls.N, 1 / ARCHIVE_SR), db)
+        return cls._resp
+
+    def _first_below(self, level_db):
+        f, db = self._response()
+        return float(f[np.nonzero(db < level_db)[0][0]])
+
+    def test_minus_1db_point_is_pinned(self):
+        assert self._first_below(-1.0) == pytest.approx(7915.5, abs=2.0)
+
+    def test_minus_20db_point_is_pinned(self):
+        assert self._first_below(-20.0) == pytest.approx(7940.3, abs=2.0)
+
+    def test_minus_3db_point(self):
+        assert self._first_below(-3.0) == pytest.approx(7922.9, abs=2.0)
+
+    def test_tones_agree_with_the_impulse_measurement(self):
+        from data.preprocess import band_limit_to_ladder
+
+        t = np.arange(4 * ARCHIVE_SR) / ARCHIVE_SR
+        for f0, want in ((7915.5, -1.0), (7922.9, -3.0), (7940.3, -20.0)):
+            x = np.sin(2 * np.pi * f0 * t).astype(np.float32)
+            y = band_limit_to_ladder(x, sr=ARCHIVE_SR).astype(np.float64)
+            mid = slice(ARCHIVE_SR, 3 * ARCHIVE_SR)
+            ref = np.mean(x[mid].astype(np.float64) ** 2)
+            got = 10 * np.log10(np.mean(y[mid] ** 2) / ref)
+            assert got == pytest.approx(want, abs=0.1), f"{f0} Hz: {got:.3f} dB"
+
+    def test_passband_is_flat_up_to_the_transition(self):
+        from data.invariants import BAND_LIMIT_PASSBAND_LOSS_DB, BAND_LIMIT_TRANSITION_HZ
+
+        f, db = self._response()
+        passband = f <= LADDER_FMAX - BAND_LIMIT_TRANSITION_HZ
+        assert np.abs(db[passband]).max() <= BAND_LIMIT_PASSBAND_LOSS_DB + 1e-3
+
+    def test_nothing_at_or_above_ladder_fmax_survives(self):
+        """The transition may narrow but never straddle LADDER_FMAX: attenuated
+        above-band content in the primary analysis is Griffin-Lim's cliff again.
+
+        Reads -156 dB: the float32 floor of this impulse measurement (the design
+        is -200 dB zero-phase). A transition straddling LADDER_FMAX reads tens
+        of dB here, so the margin is not what the check depends on."""
+        f, db = self._response()
+        assert db[f >= LADDER_FMAX].max() <= -150.0
+
+    def test_the_gap_between_the_analyses_is_the_declared_transition(self):
+        from data.invariants import BAND_LIMIT_TRANSITION_HZ
+
+        gap = LADDER_FMAX - self._first_below(-0.1)
+        assert 0 < gap <= BAND_LIMIT_TRANSITION_HZ + 1.0
+
+    def test_high_band_analysis_starts_at_the_band_limit_stopband_edge(self):
+        import inspect
+
+        from metrics.spectral import high_band_distance
+
+        assert inspect.signature(high_band_distance).parameters["lo"].default == LADDER_FMAX
+
+    def test_order_is_derived_not_chosen(self):
+        from scipy.signal import cheb2ord
+
+        from data.invariants import (
+            BAND_LIMIT_FILTER_ORDER,
+            BAND_LIMIT_PASSBAND_LOSS_DB,
+            BAND_LIMIT_STOPBAND_DB,
+            BAND_LIMIT_TRANSITION_HZ,
+            band_limit_order,
+        )
+        from data.preprocess import band_limit_sos
+
+        nyq = ARCHIVE_SR / 2
+        for cutoff in (LADDER_FMAX, 7600.0, 10_000.0):
+            n, _ = cheb2ord((cutoff - BAND_LIMIT_TRANSITION_HZ) / nyq, cutoff / nyq,
+                            BAND_LIMIT_PASSBAND_LOSS_DB / 2, BAND_LIMIT_STOPBAND_DB)
+            assert band_limit_order(ARCHIVE_SR, cutoff) == n
+        assert BAND_LIMIT_FILTER_ORDER == 53
+        assert len(band_limit_sos()) == 27
+
+    def test_the_old_order_12_design_fails_these_pins(self):
+        """Mutation check: the pins would have caught the 1.6 kHz hole."""
+        from scipy.signal import cheby2, sosfiltfilt
+
+        sos = cheby2(12, 100, LADDER_FMAX / (ARCHIVE_SR / 2), btype="low", output="sos")
+        imp = np.zeros(self.N)
+        imp[self.N // 2] = 1.0
+        db = 20 * np.log10(np.maximum(np.abs(np.fft.rfft(sosfiltfilt(sos, imp))), 1e-300))
+        f = np.fft.rfftfreq(self.N, 1 / ARCHIVE_SR)
+        minus1 = float(f[np.nonzero(db < -1.0)[0][0]])
+        assert minus1 == pytest.approx(6418.7, abs=2.0)
+        assert minus1 != pytest.approx(7915.5, abs=2.0)

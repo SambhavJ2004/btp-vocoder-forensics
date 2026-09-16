@@ -122,18 +122,22 @@ floor on no signal content, with 4 of 60 files above `PCM16_OOB_FLOOR` (2e-8)
 itself. The structural claim holds — real's **minimum** (6.38e-4) is four orders
 of magnitude above Griffin-Lim's **maximum** — but "exactly zero" does not.
 
-### Reported with the Kaggle run, NOT committed
+### Committed: resample probes, 200 LJSpeech files
 
-These appear alongside the run but are **absent** from both artifacts, so they
-cannot be recomputed here. No exclusion depends on them.
+Source: `data/measurements/probes.json`. `GroupKFold(5)` by utterance, PCM_16.
+The 60-file figures reported earlier are in no artifact and differ; they are
+listed for the record, not used.
 
-| resampler, 8 kHz to Nyquist, round trip vs direct | ratio | AUROC |
-|---|---|---|
-| torchaudio default | 0.8198 (**verified** above) | 1.0000 (consistent with `meta.json`) |
-| torchaudio kaiser (width 64, rolloff 0.9999, beta 14.7697) | 0.9998 — *not committed* | 0.9958 — *not committed* |
-| soxr_vhq | 0.9936 — *not committed* | 1.0000 — *not committed* |
-| one kaiser round trip vs two | — | 0.9903 — *not committed* |
-| resample probe through an 8 kHz band limit | — | 0.502 — *not committed* |
+| round trip vs direct | ratio (8 kHz–Nyquist) | AUROC below 8 kHz | above | earlier 60-file report |
+|---|---|---|---|---|
+| torchaudio default | 0.8005 | **0.5291 ± 0.0024** | 1.0000 | ratio 0.8198 (**verified** in the CSV above) |
+| torchaudio kaiser (width 64, rolloff 0.9999, beta 14.7697) | **0.9997** | **0.5000 ± 0.0000** | 0.9935 | 0.9998 / 0.9958 |
+| soxr (quality not recorded) | 0.9922 | 0.5000 ± 0.0000 | 1.0000 | soxr_vhq 0.9936 / 1.0000 |
+| one kaiser round trip vs two | 0.9998 | 0.5000 ± 0.0000 | 0.9928 | 0.9903 |
+| through an 8 kHz band limit | — | — | — | 0.502 (no counterpart) |
+
+Exactly 0.5000 ± 0.0000 is a degenerate probe, not noisy chance. It is read only
+next to its above-band control; see [`measurements.md`](measurements.md).
 
 ### What this overturned
 
@@ -198,12 +202,14 @@ names a committed measurement.
 | every other rung | included | included | — |
 
 Griffin-Lim is back **in** the primary correlation: its cliff is above the band
-the primary analysis keeps. Vocos's inclusion there is the least established
-decision in the table — see INV-18 and [`measurements.md`](measurements.md).
+the primary analysis keeps. Vocos is in it because the pinned resampler reads
+0.5000 below the band with a 0.9935 above-band control (committed, 200 files; see
+INV-18 and [`measurements.md`](measurements.md)).
 
 **The resampler pin,** `vocoders.vocos.VOCOS_RESAMPLER`, cites the committed
-real_roundtrip / real ratio (0.8198) for the cost of the torchaudio default. The
-kaiser pin's benefit (0.9998) is reported, not committed.
+real_roundtrip / real ratio (0.8198) for the cost of the torchaudio default, and
+`probes.json` for the pin's benefit (ratio 0.9997) and for why it matters to the
+primary analysis (below-band 0.5000 against the default's 0.5291).
 
 `metrics.spectral.high_band_distance` exists because BigVGAN's 0.01480 answers
 only *how much* high-band energy there is. Whether the **content** is right is a
