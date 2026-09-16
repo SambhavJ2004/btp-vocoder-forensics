@@ -122,24 +122,171 @@ PRIMARY_LADDER: Final[tuple[str, ...]] = (
     "bigvgan_112m",
 )
 
-# Conditions that are generated, measured and REPORTED like any other, but are
-# refused by the primary correlation. Two different reasons, both recorded so
-# the refusal message can say which applies -- a bare exclusion set invites
-# someone to delete an entry without knowing what it was protecting.
-CORRELATION_EXCLUDED: Final[dict[str, str]] = {
-    "griffin_lim": (
-        "floor reference. Griffin-Lim inverts the mel to a linear spectrogram "
-        "and runs ISTFT, so it genuinely cannot emit above its mel fmax -- "
-        "measured high-band fraction 0.00000 against real's 0.01803. Its "
-        "detectability is therefore driven by a hard bandwidth zero, not by the "
-        "fine reconstruction artifacts the study is about. Sitting at the "
-        "low-quality end of the ladder it would anchor a strong positive "
-        "Spearman for a reason unrelated to the hypothesis."
-    ),
-    "bigvgan_v2_22khz_fullband": (
-        "paired control. Differs from bigvgan_112m in training mel fmax alone "
-        "(11025 vs 8000), which is the variable it exists to isolate; pooling "
-        "it into the ladder would put that variable into the headline number."
+# --- INV-18  Per-analysis membership, justified by measurement --------------
+# Two analyses run over the ladder, and they have DIFFERENT membership, because
+# the confounds that disqualify a condition are band-localised.
+#
+#   PRIMARY_ANALYSIS    the headline correlation, BAND-LIMITED to LADDER_FMAX.
+#   HIGH_BAND_ANALYSIS  [LADDER_FMAX, Nyquist) on the full-band archive.
+#
+# A condition is excluded from an analysis only when its processing history
+# introduces an artifact INSIDE that analysis's band, and every exclusion names
+# the committed measurement that shows it. See CLAUDE.md INV-18.
+PRIMARY_ANALYSIS: Final[str] = "primary_band_limited"
+HIGH_BAND_ANALYSIS: Final[str] = "high_band"
+ANALYSES: Final[tuple[str, ...]] = (PRIMARY_ANALYSIS, HIGH_BAND_ANALYSIS)
+
+
+@dataclass(frozen=True)
+class MeasurementRef:
+    """A citation of one statistic in a committed measurement artifact.
+
+    Resolved and re-checked against ``data/measurements/`` by
+    :func:`data.measurements.verify` -- the value here is a claim about the file,
+    not a number to be trusted on its own.
+    """
+
+    artifact: str       # file under data/measurements/
+    condition: str      # row selector, in the ARTIFACT's own condition naming
+    metric: str         # a column, or "colA-colB" for a derived band difference
+    statistic: str      # mean | median | min | max | auroc_vs:<condition>
+    value: float        # what that statistic evaluated to
+    rel_tol: float = 1e-4
+
+    def describe(self) -> str:
+        return (
+            f"{self.artifact}[condition={self.condition}] "
+            f"{self.statistic}({self.metric})"
+        )
+
+
+@dataclass(frozen=True)
+class ResamplerSpec:
+    """A resampler, pinned by every parameter that changes its output.
+
+    Declared per condition, because the one condition that resamples on its way
+    to the archive (Vocos) needs a sharper resampler than RESAMPLE_METHOD, and
+    the choice is not cosmetic: the torchaudio DEFAULT round trip costs 18% of
+    the band above LADDER_FMAX (committed measurement, real_roundtrip vs real).
+    A parameter left to a library default is a parameter that changes when the
+    library does.
+    """
+
+    backend: str                      # "torchaudio"
+    resampling_method: str            # e.g. "sinc_interp_kaiser"
+    lowpass_filter_width: int
+    rolloff: float
+    beta: float | None = None
+    justification: tuple[MeasurementRef, ...] = ()
+
+
+@dataclass(frozen=True)
+class Exclusion:
+    """Why one condition is kept out of one analysis, and the evidence for it."""
+
+    condition: str
+    analysis: str
+    reason: str
+    measurements: tuple[MeasurementRef, ...]
+
+    def render(self) -> str:
+        cites = "; ".join(f"{m.describe()} = {m.value:.4g}" for m in self.measurements)
+        return f"{self.condition} ({self.analysis}): {self.reason} [evidence: {cites}]"
+
+
+_BAND_CSV = "band_measurements.csv"
+# Energy in [rt_edge, Nyquist) = [10900, 11025) Hz: the sliver where a resampler's
+# transition band leaves its fingerprint. meta.json records rt_edge = 10900.
+_EDGE = "hb_8k_nyq-hb_8k_rtedge"
+
+ANALYSIS_EXCLUSIONS: Final[dict[str, dict[str, Exclusion]]] = {
+    # Nothing is excluded from the band-limited primary analysis. Both artifacts
+    # that disqualify conditions elsewhere -- Griffin-Lim's mel-inversion cliff
+    # and Vocos's resampler edge -- live ABOVE LADDER_FMAX, and this analysis
+    # removes that band. griffin_lim is back in the headline correlation on
+    # purpose, not by oversight.
+    PRIMARY_ANALYSIS: {},
+    HIGH_BAND_ANALYSIS: {
+        "griffin_lim": Exclusion(
+            condition="griffin_lim",
+            analysis=HIGH_BAND_ANALYSIS,
+            reason=(
+                "mel-inversion bandwidth cliff. Griffin-Lim inverts the mel to a "
+                "linear spectrogram and runs ISTFT, so it cannot emit above its "
+                "mel fmax: its high-band fraction sits at the PCM_16 quantisation "
+                "floor, four orders of magnitude below real's minimum. Anything "
+                "measured for it in this band measures that absence, not a "
+                "reconstruction artifact."
+            ),
+            measurements=(
+                MeasurementRef(_BAND_CSV, "griffin_lim", "hb_8k_nyq", "max", 5.492221e-08),
+                MeasurementRef(_BAND_CSV, "real", "hb_8k_nyq", "min", 6.383930e-04),
+            ),
+        ),
+        "vocos": Exclusion(
+            condition="vocos",
+            analysis=HIGH_BAND_ANALYSIS,
+            reason=(
+                "resampler signature. Vocos is 24 kHz native and is the only "
+                "ladder condition resampled to the archive rate. In the band "
+                "[rt_edge, Nyquist) it carries ~118x the energy of BigVGAN, is "
+                "separable from BigVGAN at AUROC 0.9997, and is INDISTINGUISHABLE "
+                "from resampled real audio (AUROC 0.507) -- so what distinguishes "
+                "it there is the resampler, not the vocoder."
+            ),
+            measurements=(
+                MeasurementRef(_BAND_CSV, "vocos", _EDGE, "mean", 8.630273e-07),
+                MeasurementRef(_BAND_CSV, "bigvgan", _EDGE, "mean", 7.295493e-09),
+                MeasurementRef(_BAND_CSV, "vocos", _EDGE, "auroc_vs:bigvgan", 0.999722),
+                MeasurementRef(
+                    _BAND_CSV, "vocos", _EDGE, "auroc_vs:real_roundtrip", 0.507222,
+                    rel_tol=1e-3,
+                ),
+            ),
+        ),
+    },
+}
+
+
+@dataclass(frozen=True)
+class RejectedAlternative:
+    """A design considered and rejected, kept so it is not proposed again.
+
+    ``in_committed_artifacts`` says whether the deciding measurement can be
+    re-checked from data/measurements/. A rejection resting on a number nobody
+    can recompute is weaker than one that can, and the difference should be
+    visible in code rather than discovered later.
+    """
+
+    name: str
+    reason: str
+    measured_value: float
+    measurement: str
+    in_committed_artifacts: bool
+
+
+REJECTED_ALTERNATIVES: Final[dict[str, RejectedAlternative]] = {
+    "uniform_round_trip": RejectedAlternative(
+        name="uniform round trip",
+        reason=(
+            "Proposed fix for the Vocos resampler signature: pass EVERY condition "
+            "through the same 22050 -> 24000 -> 22050 round trip, so Vocos is no "
+            "longer the only one carrying a resampler imprint. Rejected because "
+            "resampling is not idempotent. A second round trip is itself "
+            "separable from one, so adding a round trip to the other conditions "
+            "does not make Vocos path-identical to them; it gives every condition "
+            "an imprint and Vocos a different one. Vocos is instead excluded from "
+            "the band where its imprint lives (the high-band analysis) and kept "
+            "in the band where it does not (the band-limited primary analysis)."
+        ),
+        measured_value=0.9903,
+        measurement=(
+            "AUROC, one torchaudio-kaiser round trip vs two, 60 LJSpeech files, "
+            "PCM_16 quantised (Kaggle measurement run)"
+        ),
+        # Reported with the Kaggle run, but not present in band_measurements.csv
+        # or meta.json. Commit the underlying per-file features to promote this.
+        in_committed_artifacts=False,
     ),
 }
 
@@ -179,7 +326,13 @@ LADDER_FMAX: Final[float] = _derive_ladder_fmax()
 #
 #     real           0.01803
 #     BigVGAN        0.01480    tracks real per-file
-#     Griffin-Lim    0.00000    exactly zero
+#     Griffin-Lim    0.00000    to 5 d.p. -- NOT exactly zero; see below
+#
+# The 60-file committed measurement (data/measurements/band_measurements.csv)
+# shows Griffin-Lim's high-band fraction at median 5.1e-9, max 5.5e-8: the PCM_16
+# quantisation floor, on no signal content. "Exactly zero" was a rounding
+# artifact of a 5-decimal table. The conclusion survives -- real's MINIMUM is
+# 6.4e-4, 1e4 x Griffin-Lim's maximum -- but the literal claim does not.
 #
 # Griffin-Lim is the exception, and it is the exception that produced the error:
 # it inverts the mel to a linear spectrogram and runs ISTFT, so it genuinely
@@ -216,7 +369,15 @@ LADDER_FMAX_ROLE: Final[str] = "analysis band, applied on request; archive is fu
 # on the synthetic corpus, real and Griffin-Lim land at 5.84e-09 and 5.71e-09 --
 # 2% apart, both quantisation-dominated, against a 1.98e-03 gap before filtering.
 #
-# Passband cost: 0.004 dB below 7 kHz.
+# Passband cost, stated two ways because they mean different things:
+#   - energy-weighted loss below 7 kHz on speech-like audio: 0.004 dB. Small
+#     because nearly all speech energy is far below 7 kHz.
+#   - the RESPONSE itself: zero-phase (filtfilt squares the magnitude), so it
+#     is -1 dB at 6420 Hz, -3 dB at 6556 Hz and -20 dB by 6876 Hz. The stopband
+#     EDGE is at LADDER_FMAX; the transition sits below it.
+# So the primary analysis is effectively [0, ~6.5 kHz] in passband terms, and
+# [~6.5, 8] kHz belongs cleanly to neither analysis. The earlier single-number
+# "0.004 dB below 7 kHz" hid that.
 BAND_LIMIT_FILTER_ORDER: Final[int] = 12
 BAND_LIMIT_STOPBAND_DB: Final[float] = 100.0
 BAND_LIMIT_FILTER_SPEC: Final[str] = (
@@ -275,14 +436,20 @@ BAND_LIMIT_FLOOR_MARGIN: Final[float] = 50.0
 BAND_LIMIT_MAX_STOPBAND_ENERGY: Final[float] = PCM16_OOB_FLOOR * BAND_LIMIT_FLOOR_MARGIN
 
 
-def is_correlation_excluded(condition: str) -> bool:
-    """INV-17/INV-18. True for conditions reported but kept out of the headline rho."""
-    return condition in CORRELATION_EXCLUDED
+def _check_analysis(analysis: str) -> None:
+    if analysis not in ANALYSES:
+        raise InvariantViolation(f"INV-18: unknown analysis {analysis!r}; known {ANALYSES}.")
 
 
-def exclusion_reason(condition: str) -> str | None:
-    """Why a condition is excluded, for the refusal message. None if included."""
-    return CORRELATION_EXCLUDED.get(condition)
+def exclusion_for(analysis: str, condition: str) -> Exclusion | None:
+    """INV-18. The Exclusion keeping ``condition`` out of ``analysis``, or None."""
+    _check_analysis(analysis)
+    return ANALYSIS_EXCLUSIONS[analysis].get(condition)
+
+
+def is_excluded(analysis: str, condition: str) -> bool:
+    """INV-18. True if ``condition`` is kept out of ``analysis``."""
+    return exclusion_for(analysis, condition) is not None
 
 
 # --- INV-07  Pipeline order --------------------------------------------------

@@ -57,6 +57,7 @@ from .invariants import (
     TRUE_PEAK_CEILING_DBFS,
     ZEROSHOT_SR,
     InvariantViolation,
+    ResamplerSpec,
     check_band_limit,
     check_derived_loudness,
     out_of_band_energy,
@@ -103,6 +104,49 @@ def resample_once(wav: np.ndarray, sr_in: int, target_sr: int = ARCHIVE_SR) -> n
         target_sr=target_sr,
         res_type=RESAMPLE_METHOD,
     )
+
+
+def resample_with_spec(
+    wav: np.ndarray, sr_in: int, sr_out: int, spec: ResamplerSpec
+) -> np.ndarray:
+    """INV-01/INV-18. Resample with a condition's PINNED resampler.
+
+    Fails closed. If the pinned backend is unavailable this raises rather than
+    falling back to another resampler: a different resampler leaves a different
+    rolloff, and a rolloff is a per-condition signature -- the committed
+    measurements show exactly that for Vocos in [rt_edge, Nyquist). Falling back
+    silently would change the condition without changing its name.
+
+    torchaudio is imported here, not at module level (INV-13).
+    """
+    if sr_in == sr_out:
+        return wav.astype(np.float32, copy=False)
+    if spec.backend != "torchaudio":
+        raise InvariantViolation(f"INV-18: unsupported resampler backend {spec.backend!r}.")
+    try:
+        import torch
+        import torchaudio.functional as taf
+    except ImportError as err:  # pragma: no cover - exercised on Kaggle only
+        raise InvariantViolation(
+            "INV-18: this condition pins a torchaudio resampler and torchaudio is "
+            "not installed. Do NOT substitute another resampler -- install "
+            "torchaudio in this condition's isolated environment (INV-13)."
+        ) from err
+
+    kwargs = {
+        "lowpass_filter_width": spec.lowpass_filter_width,
+        "rolloff": spec.rolloff,
+        "resampling_method": spec.resampling_method,
+    }
+    if spec.beta is not None:
+        kwargs["beta"] = spec.beta
+    out = taf.resample(
+        torch.from_numpy(np.ascontiguousarray(wav, dtype=np.float32)),
+        orig_freq=sr_in,
+        new_freq=sr_out,
+        **kwargs,
+    )
+    return out.numpy().astype(np.float32)
 
 
 def derive_zeroshot(
@@ -370,8 +414,13 @@ def process_condition_output(
     *,
     condition: str,
     meter: pyln.Meter | None = None,
+    resampler: ResamplerSpec | None = None,
 ) -> tuple[np.ndarray, float, float | None]:
     """INV-07, the vocoder entry point. Full pipeline on raw generator output.
+
+    ``resampler`` is the condition's pinned native->archive resampler, if it
+    declares one (Vocos). Otherwise RESAMPLE_METHOD applies -- which is a no-op
+    for every other ladder condition, since they are 22.05 kHz native.
 
     Steps, in this order and no other:
       resample_once -> align_length -> apply_trim_span -> band_limit
@@ -382,7 +431,10 @@ def process_condition_output(
     Produces the ARCHIVE artifact. The derived zero-shot artifact comes from
     :func:`derive_zeroshot`, applied to this output after it is written.
     """
-    wav = resample_once(wav_native, sr_native, ARCHIVE_SR)
+    if resampler is not None:
+        wav = resample_with_spec(wav_native, sr_native, ARCHIVE_SR, resampler)
+    else:
+        wav = resample_once(wav_native, sr_native, ARCHIVE_SR)
     wav = align_length(wav, span.ref_length, sr=ARCHIVE_SR)
     wav = apply_trim_span(wav, span)
     return finalise_trimmed(wav, condition=condition, meter=meter)

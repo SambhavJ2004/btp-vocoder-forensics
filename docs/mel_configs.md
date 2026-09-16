@@ -78,15 +78,62 @@ replaced.
 ## Measured bandwidth — generated audio, not config
 
 **Everything above this section is config-derived. This section is measured, and
-where the two disagree the measurement wins.**
+where the two disagree the measurement wins.** Committed evidence lives in
+[`data/measurements/`](../data/measurements/) and is described in
+[`measurements.md`](measurements.md); citations to it are recomputed by the test
+suite (INV-18).
 
-20 LJSpeech files, resynthesized, fraction of total energy above 8 kHz:
+### Committed: 60 LJSpeech files, PCM_16 quantised
 
-| condition | >8 kHz fraction | reads as |
+Source: `data/measurements/band_measurements.csv`. Fraction of total energy in
+[8000, 11025) Hz (`hb_8k_nyq`) and in the resampler-edge sliver [10900, 11025) Hz
+(`hb_8k_nyq − hb_8k_rtedge`, with `rt_edge = 10900` from `meta.json`).
+
+| condition | `hb_8k_nyq` mean | ratio to real | [10900, 11025) mean |
+|---|---|---|---|
+| real | 0.020169 | 1.0000 | 2.24e-08 |
+| real_roundtrip (torchaudio default) | 0.016535 | **0.8198** | 9.03e-07 |
+| BigVGAN v2 fmax8k | 0.016246 | 0.8055 | 7.30e-09 |
+| Vocos | 0.016216 | 0.8040 | **8.63e-07** |
+| Griffin-Lim | median 5.1e-09, max 5.5e-08 | ~0 | ~0 |
+
+Separability on the [10900, 11025) sliver (unpaired AUROC, orientation-free):
+
+| pair | AUROC | reads as |
 |---|---|---|
-| real | **0.01803** | the reference |
-| BigVGAN | **0.01480** | tracks real per-file; ~82% of real's high-band energy |
-| Griffin-Lim | **0.00000** | exactly zero — a structural bandwidth cliff |
+| Vocos vs BigVGAN | **0.9997** | Vocos carries something BigVGAN does not |
+| real vs real_roundtrip | 0.9928 | a resample round trip leaves this imprint |
+| **Vocos vs real_roundtrip** | **0.507** | and Vocos's imprint IS that one — the resampler |
+
+### Earlier: 20 LJSpeech files
+
+The first measurement, which overturned the original INV-17. Superseded in
+precision by the 60-file set above, consistent with it in direction.
+
+| condition | >8 kHz fraction |
+|---|---|
+| real | 0.01803 |
+| BigVGAN | 0.01480 |
+| Griffin-Lim | 0.00000 **to five decimals** — see below |
+
+**Griffin-Lim is not exactly zero.** "0.00000" was a five-decimal table. The
+60-file measurement gives median 5.1e-9 and max 5.5e-8: the PCM_16 quantisation
+floor on no signal content, with 4 of 60 files above `PCM16_OOB_FLOOR` (2e-8)
+itself. The structural claim holds — real's **minimum** (6.38e-4) is four orders
+of magnitude above Griffin-Lim's **maximum** — but "exactly zero" does not.
+
+### Reported with the Kaggle run, NOT committed
+
+These appear alongside the run but are **absent** from both artifacts, so they
+cannot be recomputed here. No exclusion depends on them.
+
+| resampler, 8 kHz to Nyquist, round trip vs direct | ratio | AUROC |
+|---|---|---|
+| torchaudio default | 0.8198 (**verified** above) | 1.0000 (consistent with `meta.json`) |
+| torchaudio kaiser (width 64, rolloff 0.9999, beta 14.7697) | 0.9998 — *not committed* | 0.9958 — *not committed* |
+| soxr_vhq | 0.9936 — *not committed* | 1.0000 — *not committed* |
+| one kaiser round trip vs two | — | 0.9903 — *not committed* |
+| resample probe through an 8 kHz band limit | — | 0.502 — *not committed* |
 
 ### What this overturned
 
@@ -95,7 +142,7 @@ premise that an `fmax = 8000` mel front-end yields no output above 8 kHz.
 **That premise is false.** `fmax` constrains the *analysis* a vocoder consumes,
 not the *synthesis* it performs: a time-domain upsampling vocoder produces
 content across the full band whatever the mel carried. BigVGAN has `fmax = 8000`
-and emits 0.01480 above 8 kHz.
+and emits 0.01480 above 8 kHz on 20 files, 0.016246 on 60.
 
 Griffin-Lim is the sole exception and the source of the error. It inverts the mel
 to a linear spectrogram and runs ISTFT, so it structurally cannot exceed `fmax`.
@@ -126,12 +173,37 @@ Concretely, before relying on a bandwidth claim:
    mel itself (Griffin-Lim, and any future ISTFT-style condition) should be
    expected to show a hard zero.
 
+### The same lesson, twice more
+
+The config-to-audio rule above has now been confirmed by two further cases where
+reasoning pointed one way and measurement another:
+
+- **Vocos's resampler.** Argued erased by the (then generation-time) 8 kHz band
+  limit. True below the band. False in a full-band archive, where Vocos is
+  indistinguishable from resampled real audio at [10900, 11025) Hz.
+- **Griffin-Lim's zero.** Read as exact from a rounded table; it is the
+  quantisation floor.
+
+Both became INV-18: analysis membership is decided per band, and every exclusion
+names a committed measurement.
+
 ### Where the numbers are used
 
-`griffin_lim`'s zero is why it is a **floor reference** rather than a ladder rung
-in the correlation (`invariants.CORRELATION_EXCLUDED`): its detectability is
-driven by a bandwidth cliff, not by the fine reconstruction artifacts the study
-is about.
+**Per-analysis membership (INV-18),** in `invariants.ANALYSIS_EXCLUSIONS`:
+
+| condition | primary (band-limited to 8 kHz) | high-band [8 kHz, Nyquist) | evidence |
+|---|---|---|---|
+| `griffin_lim` | **included** | excluded | GL max 5.49e-08 vs real min 6.38e-04 |
+| `vocos` | **included** | excluded | [10900, 11025) energy 8.63e-07 vs BigVGAN 7.30e-09; AUROC 0.9997 vs BigVGAN, 0.507 vs real_roundtrip |
+| every other rung | included | included | — |
+
+Griffin-Lim is back **in** the primary correlation: its cliff is above the band
+the primary analysis keeps. Vocos's inclusion there is the least established
+decision in the table — see INV-18 and [`measurements.md`](measurements.md).
+
+**The resampler pin,** `vocoders.vocos.VOCOS_RESAMPLER`, cites the committed
+real_roundtrip / real ratio (0.8198) for the cost of the torchaudio default. The
+kaiser pin's benefit (0.9998) is reported, not committed.
 
 `metrics.spectral.high_band_distance` exists because BigVGAN's 0.01480 answers
 only *how much* high-band energy there is. Whether the **content** is right is a

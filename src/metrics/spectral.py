@@ -89,6 +89,7 @@ def high_band_distance(
     reference: np.ndarray,
     degraded: np.ndarray,
     *,
+    condition: str,
     sr: int = ARCHIVE_SR,
     lo: float = LADDER_FMAX,
     hi: float | None = None,
@@ -117,10 +118,20 @@ def high_band_distance(
       ``hb_frac_ratio``   deg/ref. 1.0 means the right amount of energy, which
                           is necessary and nowhere near sufficient.
 
-    A condition with a hard bandwidth zero (Griffin-Lim) yields
-    ``hb_frac_deg == 0`` and an ``hb_lsd`` dominated by the spectral floor; read
-    those rows as "structurally absent", not as "badly reconstructed".
+    ``condition`` is REQUIRED, not decorative (INV-18). This is the high-band
+    analysis, and its membership excludes griffin_lim (mel-inversion cliff) and
+    vocos (resampler edge): for both, a number here would measure a processing
+    artifact rather than a vocoder. It has no default so the refusal cannot be
+    skipped by omitting it.
     """
+    from data.invariants import HIGH_BAND_ANALYSIS, exclusion_for
+
+    exc = exclusion_for(HIGH_BAND_ANALYSIS, condition)
+    if exc is not None:
+        raise InvariantViolation(
+            f"INV-18: high_band_distance refuses {exc.render()}. Report it as "
+            "excluded from the high-band analysis rather than as a distance."
+        )
     if len(reference) != len(degraded):
         raise InvariantViolation("High-band distance needs aligned pairs; see INV-06.")
     hi = sr / 2.0 if hi is None else hi

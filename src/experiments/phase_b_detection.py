@@ -9,7 +9,7 @@ Both default to scoring ALL_CONDITIONS, the band-exempt control included: the
 paired bandwidth contrast needs its EER, so it has to be measured. Filtering
 happens later, at analysis time -- `spearman_headline` refuses an exempt
 condition outright, and `analysis.main_plot` drops it via
-`primary_ladder_frame` before correlating (INV-17).
+`analysis_frame(df, PRIMARY_ANALYSIS)` before correlating (INV-18).
 
 They also default to different tiers (INV-01), and that is not incidental:
 

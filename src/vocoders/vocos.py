@@ -21,17 +21,53 @@ rather than smoothed over:
   unlike the rest of the ladder -- see the INV-02 note in CLAUDE.md, which the
   Vocos substitution partly un-narrows.
 
-Neither matters for the delivered band: INV-17 low-passes it to LADDER_FMAX like
-everything else, and 12000 was never the ladder minimum anyway.
+Neither the band count nor the fmax moves LADDER_FMAX -- 12000 was never the
+minimum. The RESAMPLE does matter: it leaves a signature in [rt_edge, Nyquist),
+which is why vocos is excluded from the high-band analysis while staying in the
+band-limited primary one (INV-18), and why its resampler is pinned below.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
+from data.invariants import MeasurementRef, ResamplerSpec
 from data.mel import VOCOS_MEL
 
 from .base import Vocoder, VocoderSpec
+
+_CSV = "band_measurements.csv"
+
+# --- INV-18  The pinned resampler ---------------------------------------------
+# Vocos is 24 kHz native and is resampled to the 22.05 kHz archive on the way in
+# (analysis) and on the way out (delivery). Both use THIS resampler.
+#
+# Why not the torchaudio default: its round trip keeps only 81.98% of the energy
+# above LADDER_FMAX -- an 18% cost to exactly the band the high-band analysis
+# measures. That number is committed (justification below: real_roundtrip was
+# produced with the default resampler; its mean high-band fraction over real's is
+# 0.8198).
+#
+# Why these kaiser parameters: reported by the Kaggle measurement run as keeping
+# 99.98% of the high band (ratio 0.9998). NOTE that ratio is NOT present in
+# data/measurements/ -- only the default-resampler round trip was committed -- so
+# the improvement is a reported result, not a verifiable one. See
+# docs/measurements.md. The COST of the default is verified; the BENEFIT of this
+# pin is not yet.
+#
+# Pinning does not remove Vocos's resampler signature, and the uniform round
+# trip that would have equalised it was rejected -- see CLAUDE.md INV-18.
+VOCOS_RESAMPLER = ResamplerSpec(
+    backend="torchaudio",
+    resampling_method="sinc_interp_kaiser",
+    lowpass_filter_width=64,
+    rolloff=0.9999,
+    beta=14.769656459379492,
+    justification=(
+        MeasurementRef(_CSV, "real_roundtrip", "hb_8k_nyq", "mean", 1.653462e-02),
+        MeasurementRef(_CSV, "real", "hb_8k_nyq", "mean", 2.016939e-02),
+    ),
+)
 
 SPEC = VocoderSpec(
     key="vocos",
@@ -42,6 +78,7 @@ SPEC = VocoderSpec(
     mel=VOCOS_MEL,
     checkpoint="charactr/vocos-mel-24khz",
     checkpoint_revision="0feb3fdd929bcd6649e0e7c5a688cf7dd012ef21",
+    resampler=VOCOS_RESAMPLER,
     notes=(
         "Substitutes specdiff_gan, whose weights are unavailable. Predicts STFT "
         "coefficients and reconstructs by inverse FFT rather than modelling the "

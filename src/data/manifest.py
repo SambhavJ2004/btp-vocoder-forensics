@@ -39,6 +39,7 @@ import pandas as pd
 
 from .invariants import (
     ALIGNMENT_REQUIRED_LAG,
+    ANALYSES,
     ARCHIVE_SR,
     ARCHIVE_TIER,
     MAX_RESAMPLE_STEPS,
@@ -51,7 +52,7 @@ from .invariants import (
     ZEROSHOT_TIER,
     InvariantViolation,
     check_pairing,
-    is_correlation_excluded,
+    is_excluded,
 )
 
 MANIFEST_COLUMNS: tuple[str, ...] = (
@@ -392,23 +393,29 @@ def band_report(df: pd.DataFrame) -> pd.DataFrame:
                 "archive_band_hz": g["archive_band_hz"].iloc[0],
                 "high_band_mean": f"{hb.mean():.5f}" if len(hb) else "n/a",
                 "high_band_max": f"{hb.max():.5f}" if len(hb) else "n/a",
-                "in_correlation": not is_correlation_excluded(str(cond)),
+                **{
+                    f"in_{a}": not is_excluded(a, str(cond))
+                    for a in ANALYSES
+                },
             }
         )
     return pd.DataFrame(rows)
 
 
-def primary_ladder_frame(df: pd.DataFrame, *, why: str) -> pd.DataFrame:
-    """INV-17. Drop correlation-excluded conditions before a ladder-wide series.
+def analysis_frame(df: pd.DataFrame, analysis: str, *, why: str) -> pd.DataFrame:
+    """INV-18. The rows of ``df`` that belong to ``analysis``.
 
-    Use this wherever conditions are pooled. Excluded conditions are generated,
-    measured and reported like any other; what they are not is comparable on the
-    headline axis. See `invariants.CORRELATION_EXCLUDED` for the reason attached
-    to each.
+    Drops conditions excluded from that analysis, and paired controls, which are
+    not ladder rungs. Membership differs per analysis: griffin_lim is IN the
+    band-limited primary analysis and OUT of the high-band one. See
+    `invariants.ANALYSIS_EXCLUSIONS` for each exclusion and its evidence.
     """
     if "condition" not in df.columns:
-        raise InvariantViolation(f"INV-17: cannot filter conditions for {why}.")
-    keep = ~df["condition"].map(is_correlation_excluded).astype(bool)
+        raise InvariantViolation(f"INV-18: cannot filter conditions for {why}.")
+    from vocoders.registry import CONTROL_CONDITIONS
+
+    keep = ~df["condition"].map(lambda c: is_excluded(analysis, str(c))).astype(bool)
+    keep &= ~df["condition"].isin(CONTROL_CONDITIONS)
     return df[keep]
 
 
