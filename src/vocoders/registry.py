@@ -32,11 +32,11 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from data.invariants import (
-    CORRELATION_EXCLUDED,
+    ANALYSES,
     PRIMARY_LADDER,
     UNAVAILABLE_CONDITIONS,
     InvariantViolation,
-    is_correlation_excluded,
+    is_excluded,
 )
 
 from .base import Vocoder, VocoderSpec
@@ -111,12 +111,10 @@ if _declared_controls != set(CONTROL_CONDITIONS):
         f"{sorted(_declared_controls)}, registry.CONTROL_CONDITIONS says "
         f"{sorted(CONTROL_CONDITIONS)}."
     )
-_missing_reason = set(CONTROL_CONDITIONS) - set(CORRELATION_EXCLUDED)
-if _missing_reason:
+if set(LADDER) & set(CONTROL_CONDITIONS):
     raise InvariantViolation(
-        f"INV-17: controls {sorted(_missing_reason)} have no entry in "
-        "CORRELATION_EXCLUDED, so spearman_headline would silently pool them "
-        "into the headline number."
+        "INV-18: a paired control is also a ladder rung. Controls are refused by "
+        "membership, not by exclusion, so they must not be in LADDER."
     )
 
 
@@ -132,9 +130,9 @@ def get_spec(key: str) -> VocoderSpec:
     return SPECS[key]
 
 
-def primary_ladder_only(conditions) -> list[str]:
-    """Drop correlation-excluded conditions, preserving order."""
-    return [c for c in conditions if not is_correlation_excluded(c)]
+def members_of(analysis: str, conditions=LADDER) -> list[str]:
+    """INV-18. The ladder conditions that belong to ``analysis``, in order."""
+    return [c for c in conditions if not is_excluded(analysis, c)]
 
 
 def checkpoint_audit(include_unavailable: bool = True) -> list[dict[str, object]]:
@@ -156,7 +154,9 @@ def checkpoint_audit(include_unavailable: bool = True) -> list[dict[str, object]
         unavailable = key in UNAVAILABLE_CONDITIONS
         needs_ckpt = spec.family != "signal_processing"
 
-        if spec.checkpoint_revision:
+        if spec.checkpoint_revision and spec.checkpoint_sha256:
+            pin = "hf-revision+sha256"
+        elif spec.checkpoint_revision:
             pin = "hf-revision"
         elif spec.checkpoint_sha256:
             pin = "sha256"
@@ -176,7 +176,7 @@ def checkpoint_audit(include_unavailable: bool = True) -> list[dict[str, object]
                 "role": "unavailable"
                 if unavailable
                 else ("ladder" if spec.primary_ladder else "control"),
-                "in_rho": not is_correlation_excluded(key),
+                **{f"in_{a}": not is_excluded(a, key) for a in ANALYSES},
                 "checkpoint": spec.checkpoint or "(none required)",
                 "pin": pin,
                 "mel_verified": mel_verified,

@@ -1,0 +1,10 @@
+# Committed measurement evidence (INV-18) is stored byte-for-byte, with no
+# line-ending conversion in either direction. Without this, core.autocrlf would
+# rewrite it on checkout, so the working copy would stop matching the committed
+# artifact byte for byte -- harmless to pandas, not to anyone hashing or diffing
+# the evidence.
+#
+# Note: these files arrived with CRLF endings, which a Kaggle (Linux) run would
+# not produce, so they were most likely converted in transit before being
+# committed. Values are unaffected; exact bytes may differ from the run's output.
+data/measurements/** -text

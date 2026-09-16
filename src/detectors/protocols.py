@@ -32,14 +32,15 @@ import pandas as pd
 
 from data.invariants import (
     ARCHIVE_TIER,
-    CORRELATION_EXCLUDED,
+    HIGH_BAND_ANALYSIS,
+    LADDER_FMAX,
+    PRIMARY_ANALYSIS,
     REAL_CONDITION,
     TIER_RATES,
     TIERS,
     ZEROSHOT_TIER,
     InvariantViolation,
-    exclusion_reason,
-    is_correlation_excluded,
+    exclusion_for,
 )
 
 from .eer import bootstrap_eer_ci, compute_eer
@@ -169,6 +170,54 @@ def score_condition(
     )
 
 
+def refuse_excluded(conditions, analysis: str, *, where: str) -> None:
+    """INV-18. Raise if any condition is excluded from ``analysis``, quoting why.
+
+    Refuses rather than filtering silently. A caller that passed an excluded
+    condition has a different question in mind and should say so; and the
+    message carries the measurement, so nobody has to go looking for the reason
+    before deciding whether to override it.
+    """
+    hits = [exclusion_for(analysis, str(c)) for c in sorted(set(conditions))]
+    hits = [h for h in hits if h is not None]
+    if hits:
+        body = "\n".join(f"  - {h.render()}" for h in hits)
+        raise InvariantViolation(
+            f"INV-18: {where} refuses conditions excluded from the {analysis!r} "
+            f"analysis:\n{body}\n"
+            "Filter with data.manifest.analysis_frame(df, analysis) first."
+        )
+
+
+def _effective_band_hz(row) -> float:
+    """The highest frequency a detection row's audio can carry.
+
+    An explicit analysis band-limit if one was applied; otherwise the Nyquist of
+    the tier it was measured on.
+    """
+    bl = row.get("band_limit_hz") if hasattr(row, "get") else None
+    if bl is not None and not pd.isna(bl):
+        return float(bl)
+    return TIER_RATES[str(row["tier"])] / 2.0
+
+
+def _assert_band_limited(det: pd.DataFrame, *, where: str) -> None:
+    """INV-18. Every row of a primary-analysis frame is at or below LADDER_FMAX."""
+    if det.empty:
+        return
+    bands = det.apply(_effective_band_hz, axis=1)
+    over = det[bands > LADDER_FMAX + 1e-9]
+    if not over.empty:
+        seen = sorted(set(zip(over["condition"], over["tier"], strict=True)))
+        raise InvariantViolation(
+            f"INV-18: {where} is the band-limited primary analysis, but rows for "
+            f"{seen} carry content above LADDER_FMAX ({LADDER_FMAX:.0f} Hz). Run "
+            "detection on data.preprocess.band_limit_comparison_set output and "
+            "record band_limit_hz, or use the zero-shot tier. Admitting full-band "
+            "rows brings griffin_lim's mel-inversion cliff back into the headline."
+        )
+
+
 def results_to_frame(results: list[DetectionResult]) -> pd.DataFrame:
     df = pd.DataFrame([r.to_row() for r in results])
     assert_protocols_not_pooled(df)
@@ -198,8 +247,17 @@ def spearman_headline(
     quality_col: str = "utmos_mean",
     protocol: Protocol = Protocol.MATCHED,
     detector: str | None = None,
+    analysis: str = PRIMARY_ANALYSIS,
 ) -> dict[str, float]:
     """The headline analysis: Spearman rank correlation, quality vs EER.
+
+    **Runs band-limited to LADDER_FMAX (INV-18).** Every detection row must have
+    been measured on audio carrying nothing above LADDER_FMAX -- either the
+    archive tier passed through the analysis band-limit, or the zero-shot tier
+    whose Nyquist does not exceed it. This is not decoration: griffin_lim is IN
+    this analysis precisely because its disqualifying cliff lives above
+    LADDER_FMAX. Feed it full-band detection results and the cliff comes straight
+    back into the headline number. So full-band rows are refused, not tolerated.
 
     Computed on the MATCHED protocol by default, because that is the one that
     measures the signal rather than a particular deployed detector's blind spots.
@@ -226,26 +284,30 @@ def spearman_headline(
             "different rates were measured on different audio and are not one series."
         )
 
+    if analysis != PRIMARY_ANALYSIS:
+        raise InvariantViolation(
+            f"INV-18: spearman_headline is the {PRIMARY_ANALYSIS!r} analysis; got "
+            f"{analysis!r}. The high-band analysis has its own membership and is "
+            "reported through metrics.spectral.high_band_distance."
+        )
+    _assert_band_limited(det, where="spearman_headline")
+
     merged = quality_by_condition.merge(det, on="condition", how="inner")
 
-    # INV-17. The primary correlation runs over the primary ladder only. Band
-    # exempt conditions keep their full native band by design, so a rho computed
-    # across them would be reading the exemption as a vocoder property -- which
-    # is exactly the confound the ladder band exists to remove. This refuses
-    # rather than silently filtering: a caller that passed an exempt condition
-    # has a different question in mind and should say so.
-    smuggled = sorted(set(merged["condition"]) & set(CORRELATION_EXCLUDED))
-    if smuggled:
-        reasons = "\n".join(f"  - {c}: {exclusion_reason(c)}" for c in smuggled)
+    # Membership, not exclusion: controls are not rungs. They were never part of
+    # the ladder, so refusing them needs no measurement -- unlike an INV-18
+    # exclusion, which removes a rung and must cite evidence.
+    from vocoders.registry import CONTROL_CONDITIONS
+
+    controls = sorted(set(merged["condition"]) & set(CONTROL_CONDITIONS))
+    if controls:
         raise InvariantViolation(
-            f"INV-17: {smuggled} are excluded from the primary correlation.\n"
-            f"{reasons}\n"
-            "They are generated and reported like any other condition; what they "
-            "are not is comparable on the headline axis. Filter with "
-            "data.manifest.primary_ladder_frame, or use "
-            "detectors.protocols.paired_bandwidth_contrast for the paired "
-            "bandwidth question."
+            f"INV-18: {controls} are paired controls, not ladder rungs, and are not "
+            "members of the primary correlation. Use "
+            "detectors.protocols.paired_bandwidth_contrast for what they measure."
         )
+
+    refuse_excluded(merged["condition"], analysis, where="spearman_headline")
 
     if len(merged) < 3:
         raise InvariantViolation(f"Need >=3 conditions to correlate, got {len(merged)}.")
@@ -310,10 +372,12 @@ def paired_bandwidth_contrast(
                 f"unknown bandwidth pair '{pair}'. Known: {sorted(BANDWIDTH_PAIRS)}"
             )
         band_limited, full_band = BANDWIDTH_PAIRS[pair]
-    if not is_correlation_excluded(full_band):
+    from vocoders.registry import CONTROL_CONDITIONS
+
+    if full_band not in CONTROL_CONDITIONS:
         raise InvariantViolation(
-            f"INV-17: '{full_band}' is not a correlation-excluded control, so this "
-            "is not a paired bandwidth contrast."
+            f"INV-18: '{full_band}' is not a paired control, so this is not a "
+            "paired bandwidth contrast."
         )
     assert_protocols_not_pooled(detection)
     det = detection[detection["protocol"] == protocol.value]
@@ -379,6 +443,9 @@ def orthogonality_verdict(rho: float, n_conditions: int) -> str:
 
 
 __all__ = [
+    "HIGH_BAND_ANALYSIS",
+    "PRIMARY_ANALYSIS",
+    "refuse_excluded",
     "BANDWIDTH_PAIRS",
     "DetectionResult",
     "Protocol",

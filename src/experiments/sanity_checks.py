@@ -23,12 +23,13 @@ import pandas as pd
 from data.audio_io import read_processed
 from data.invariants import (
     ARCHIVE_TIER,
+    HIGH_BAND_ANALYSIS,
     REAL_CONDITION,
     SANITY_EER_FLOOR,
     TIER_RATES,
     TIERS,
     InvariantViolation,
-    is_correlation_excluded,
+    is_excluded,
 )
 from data.manifest import select_tier
 from detectors.eer import compute_eer
@@ -142,17 +143,22 @@ def bandwidth_probe(
 def _verdict(probe: str, condition: str, eer: float, tier: str) -> dict[str, object]:
     """One probe result.
 
-    Two conditions are expected to separate on bandwidth *by design*, and
-    flagging them as leaks would train the team to ignore the column:
-    ``griffin_lim`` (structurally cannot emit above its mel fmax) and
-    ``bigvgan_v2_22khz_fullband`` (trained at a wider fmax than the ladder). Both
-    are reported as ``expected_by_design`` instead -- visible, not a blocker.
+    Some conditions are expected to separate on bandwidth *by design*, and
+    flagging them as leaks would train the team to ignore the column. Those are
+    exactly the conditions excluded from the high-band analysis (INV-18) --
+    ``griffin_lim`` (mel-inversion cliff) and ``vocos`` (resampler edge) -- plus
+    the paired control, trained at a wider fmax. They are reported as
+    ``expected_by_design`` instead: visible, not a blocker.
 
     Every OTHER condition firing this probe is a genuine finding now that the
     archive is full-band: a time-domain vocoder should track real in the high
     band, and one that does not is telling you something.
     """
-    by_design = is_correlation_excluded(condition) and probe == "bandwidth_rolloff"
+    from vocoders.registry import CONTROL_CONDITIONS
+
+    by_design = probe == "bandwidth_rolloff" and (
+        is_excluded(HIGH_BAND_ANALYSIS, condition) or condition in CONTROL_CONDITIONS
+    )
     return {
         "probe": probe,
         "condition": condition,

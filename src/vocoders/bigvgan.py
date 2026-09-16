@@ -28,15 +28,91 @@ the way to the archive (INV-01).
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 
+from data.invariants import AUDITED_MEL_FMAX, InvariantViolation
+from data.measurements import load_meta
 from data.mel import (
     BIGVGAN_BASE_22K_MEL,
     BIGVGAN_V2_22K_FMAX8K_MEL,
     BIGVGAN_V2_22K_FULLBAND_MEL,
+    MelConfig,
 )
 
 from .base import Vocoder, VocoderSpec
+
+# --- bigvgan_112m: pin and mel config sourced from the measurement run --------
+# data/measurements/meta.json was written by the Kaggle run that produced the
+# committed band measurements. Reading the pin and the mel config from it gives
+# them PROVENANCE: the checkpoint these specs describe is the one that generated
+# the measured audio, rather than a literal pasted in afterwards.
+#
+# Two identifiers, and they are not interchangeable:
+#   checkpoint_revision  40-hex git commit of the HF repo. Pins which version of
+#                        the repo is fetched. Not in meta.json; audited earlier.
+#   checkpoint_sha256    64-hex digest of the weight FILE the run actually loaded.
+#                        From meta.json. Verifies the bytes, not the repo state.
+# meta.json's key is named `bigvgan_sha256`; it is a file digest, so it fills
+# checkpoint_sha256 and leaves checkpoint_revision alone.
+_META_REPO = "nvidia/bigvgan_v2_22khz_80band_fmax8k_256x"
+_META_MEL_SOURCE = "data/measurements/meta.json[bigvgan_cfg]"
+
+
+def _mel_from_meta(meta: dict) -> MelConfig:
+    cfg = meta["bigvgan_cfg"]
+    return MelConfig(
+        sample_rate=int(cfg["sr"]),
+        n_fft=int(cfg["n_fft"]),
+        hop_length=int(cfg["hop"]),
+        win_length=int(cfg["win"]),
+        n_mels=int(cfg["n_mels"]),
+        fmin=float(cfg["fmin"]),
+        fmax=float(cfg["fmax"]),
+        source=_META_MEL_SOURCE,
+    )
+
+
+def _validated_meta() -> dict:
+    """Load meta.json and cross-check it against the config audit.
+
+    Two independent sources now describe bigvgan_112m -- the audit read from the
+    HF config (docs/mel_configs.md) and the measurement run's own record. They
+    must agree, and a disagreement is loud rather than one silently winning:
+    either the run used a different checkpoint than the ladder declares, or the
+    audit is wrong, and both invalidate the measurements.
+    """
+    meta = load_meta()
+    if meta.get("bigvgan_repo") != _META_REPO:
+        raise InvariantViolation(
+            f"INV-08: meta.json measured {meta.get('bigvgan_repo')!r} but bigvgan_112m "
+            f"is {_META_REPO!r}. The committed measurements are not of this condition."
+        )
+    sha = str(meta.get("bigvgan_sha256", ""))
+    if not re.fullmatch(r"[0-9a-f]{64}", sha):
+        raise InvariantViolation(
+            f"INV-08: meta.json bigvgan_sha256 {sha!r} is not a 64-hex SHA-256 digest."
+        )
+
+    measured = _mel_from_meta(meta)
+    audited = BIGVGAN_V2_22K_FMAX8K_MEL
+    for field in ("sample_rate", "n_fft", "hop_length", "win_length", "n_mels", "fmin", "fmax"):
+        if getattr(measured, field) != getattr(audited, field):
+            raise InvariantViolation(
+                f"INV-02/INV-08: bigvgan_112m {field} is {getattr(measured, field)} in "
+                f"meta.json but {getattr(audited, field)} in the config audit. The "
+                "measurement run and the audit describe different front-ends."
+            )
+    if measured.fmax != AUDITED_MEL_FMAX["bigvgan_112m"]:
+        raise InvariantViolation(
+            "INV-17: meta.json fmax disagrees with AUDITED_MEL_FMAX; LADDER_FMAX "
+            "would be derived from a value the measured checkpoint does not have."
+        )
+    return meta
+
+
+_META = _validated_meta()
 
 BASE_SPEC = VocoderSpec(
     key="bigvgan_base",
@@ -56,9 +132,10 @@ LARGE_SPEC = VocoderSpec(
     family="gan",
     year=2024,
     params_m=112.0,
-    mel=BIGVGAN_V2_22K_FMAX8K_MEL,
-    checkpoint="nvidia/bigvgan_v2_22khz_80band_fmax8k_256x",
+    mel=_mel_from_meta(_META),
+    checkpoint=_META["bigvgan_repo"],
     checkpoint_revision="a9d8b711c344f3c49cc1a05d0c8b6741cf733aa8",
+    checkpoint_sha256=_META["bigvgan_sha256"],
     notes="Top of the primary ladder. The interesting cell of the main plot.",
 )
 

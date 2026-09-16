@@ -128,12 +128,27 @@ Conflating these two is a recurring weakness in the literature. Separating them 
 
 **Detectors:** AASIST (~300k parameters, trains on a single T4), RawNet2, and a frozen wav2vec2 frontend with a trainable AASIST backend where compute permits.
 
-**Headline analysis:** Spearman rank correlation between the quality metric and matched EER across the vocoder set.
+**Two analyses, with different membership.** A mel front-end audit and a committed 60-file measurement on LJSpeech (`data/measurements/`) showed that the confounds which disqualify a condition are **band-localised** — they live above 8 kHz, not everywhere. So membership is decided per (condition, band), and every exclusion names the committed measurement that justifies it.
+
+| analysis | band | membership |
+|---|---|---|
+| **Primary** — the headline correlation | band-limited to `LADDER_FMAX` = 8 kHz | **every ladder rung**, including Griffin-Lim and Vocos |
+| **High-band** | 8 kHz to Nyquist (11.025 kHz), on the full-band archive | every rung **except** Griffin-Lim and Vocos |
+
+*Griffin-Lim* is included in the primary analysis and excluded from the high-band one. It reconstructs by inverting the mel and running ISTFT, so it structurally cannot emit above its mel `fmax`: its energy above 8 kHz sits at the 16-bit quantisation floor (max 5.5e-8), four orders of magnitude below real audio's minimum. In the high band that absence would be scored as an artifact; below 8 kHz it is an ordinary, low-quality rung, and excluding it there would discard the ladder's floor.
+
+*Vocos* is included in the primary analysis and excluded from the high-band one. It is 24 kHz native and is the only condition resampled to the archive rate. In the top sliver of the band (10.9–11.025 kHz) it is separable from a never-resampled vocoder at AUROC 0.9997 and **indistinguishable from resampled real audio** (AUROC 0.507) — so what distinguishes it there is the resampler, not the vocoder. Its resampler is pinned to a high-quality kaiser configuration, since the library default discards 18% of the high band. **Its inclusion in the primary analysis is the least-established decision in the design**: it rests on the resampler artifact being absent below 8 kHz, which is configuration-sensitive in local measurement (AUROC 0.50–0.69) and not yet confirmed on the real corpus with the pinned resampler.
+
+A tempting alternative — passing *every* condition through the same resample round trip so that Vocos is no longer unique — was considered and rejected: resampling is not idempotent (one round trip versus two is separable at AUROC 0.9903), so it would give every condition an imprint and Vocos a different one.
+
+**Headline analysis:** Spearman rank correlation between the quality metric and matched EER across the vocoder set, **on the primary (band-limited) analysis**.
 
 | Outcome | Interpretation |
 |---|---|
 | Strong positive correlation | Quality and detectability are coupled. The field's assumption holds, and we have quantified the exchange rate. |
 | Weak or absent correlation | The two are orthogonal. Perceptual optimisation and forensic evasion are independent objectives, implying an undetectable vocoder need not be a high-quality one. |
+
+**High-band analysis.** Above 8 kHz the vocoders' mel front-ends carried no information, so everything they emit there is *invented* from the model's prior. The high-band analysis asks how well each vocoder invents it — not just how much energy it puts there (BigVGAN produces about 80% of real audio's high-band energy, which says nothing about whether the content is right), but a band-restricted spectral distance and profile correlation against the real reference. Right amount of energy with wrong structure is a strong detection cue that an energy measure cannot see.
 
 **Mechanism ablation — band-limited detection.** Apply low-pass filtering at varying cutoffs, retrain the detector on each band-limited variant, and identify where detection performance collapses. Retraining at every cutoff is what makes this an ablation rather than a domain-shift measurement: evaluating an unmodified detector on filtered audio would show a collapse for every condition regardless of mechanism.
 

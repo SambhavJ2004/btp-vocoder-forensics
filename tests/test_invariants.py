@@ -7,6 +7,7 @@ indistinguishable from a correct pipeline until the results are already wrong.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -18,14 +19,16 @@ from data.invariants import (
     ARCHIVE_SR,
     ARCHIVE_TIER,
     BAND_LIMIT_MAX_STOPBAND_ENERGY,
+    HIGH_BAND_ANALYSIS,
     LADDER_FMAX,
     LOUDNESS_TARGET_LUFS,
+    PRIMARY_ANALYSIS,
     ZEROSHOT_SR,
     ZEROSHOT_TIER,
     InvariantViolation,
     check_pairing,
     check_waveform,
-    is_correlation_excluded,
+    is_excluded,
     tier_for_rate,
 )
 from data.preprocess import TrimSpan, align_length, apply_trim_span, resample_once
@@ -590,10 +593,12 @@ class TestLadder:
         assert rows["griffin_lim"]["blocked"] is False
 
         # HuggingFace-hosted: pinned by revision SHA.
-        for key in ("vocos", "bigvgan_base", "bigvgan_112m",
-                    "bigvgan_v2_22khz_fullband"):
+        for key in ("vocos", "bigvgan_base", "bigvgan_v2_22khz_fullband"):
             assert rows[key]["pin"] == "hf-revision", key
             assert rows[key]["blocked"] is False, key
+        # bigvgan_112m additionally carries the weight-file digest from meta.json.
+        assert rows["bigvgan_112m"]["pin"] == "hf-revision+sha256"
+        assert rows["bigvgan_112m"]["blocked"] is False
 
         # Not on HuggingFace: no revision exists, so still unpinned.
         for key in ("hifigan_v1", "melgan"):
@@ -610,23 +615,25 @@ class TestLadder:
         keys = {r["condition"] for r in checkpoint_audit(include_unavailable=False)}
         assert "specdiff_gan" not in keys
 
-    def test_control_and_exclusion_declarations_agree(self):
-        from data.invariants import CORRELATION_EXCLUDED, UNAVAILABLE_CONDITIONS
-        from vocoders.registry import CONTROL_CONDITIONS, SPECS
+    def test_controls_are_membership_not_exclusions(self):
+        """INV-18 keeps two concepts apart: a paired control is not a rung (a
+        membership fact, no measurement needed); an exclusion removes a RUNG
+        from one analysis and must cite evidence."""
+        from data.invariants import ANALYSIS_EXCLUSIONS, UNAVAILABLE_CONDITIONS
+        from vocoders.registry import CONTROL_CONDITIONS, LADDER, SPECS
 
-        # registry.py cross-checks these at import; assert it stays true.
         declared = {
             k
             for k, v in SPECS.items()
             if not v.primary_ladder and k not in UNAVAILABLE_CONDITIONS
         }
         assert declared == set(CONTROL_CONDITIONS)
-        # Every control must carry an exclusion reason, or spearman_headline
-        # would silently pool it into the headline number.
-        assert set(CONTROL_CONDITIONS) <= set(CORRELATION_EXCLUDED)
-        # griffin_lim is excluded WITHOUT being a control: it is a rung.
-        assert "griffin_lim" in CORRELATION_EXCLUDED
-        assert "griffin_lim" not in CONTROL_CONDITIONS
+        assert not set(CONTROL_CONDITIONS) & set(LADDER)
+        for table in ANALYSIS_EXCLUSIONS.values():
+            assert not set(table) & set(CONTROL_CONDITIONS), (
+                "a control appears as an exclusion; controls are refused by "
+                "membership and need no measurement"
+            )
 
 
 class TestBandlimit:
@@ -830,10 +837,10 @@ class TestINV17FullBandArchive:
         assert max(cuts) < nyquist(ARCHIVE_SR)
 
 
-class TestINV17CorrelationExclusions:
-    """griffin_lim is a floor reference, not a rung in the correlation."""
+class TestINV18PerAnalysisMembership:
+    """Two analyses, different membership, every exclusion backed by evidence."""
 
-    def _frames(self, conditions):
+    def _frames(self, conditions, *, tier=ARCHIVE_TIER, band_limit_hz=LADDER_FMAX):
         quality = pd.DataFrame(
             {"condition": conditions, "utmos_mean": np.linspace(2.0, 4.5, len(conditions))}
         )
@@ -841,85 +848,142 @@ class TestINV17CorrelationExclusions:
             {
                 "condition": conditions,
                 "protocol": ["matched"] * len(conditions),
-                "tier": [ARCHIVE_TIER] * len(conditions),
+                "tier": [tier] * len(conditions),
                 "detector": ["aasist"] * len(conditions),
                 "eer": np.linspace(0.01, 0.3, len(conditions)),
+                "band_limit_hz": [band_limit_hz] * len(conditions),
             }
         )
         return quality, detection
 
-    def test_griffin_lim_is_excluded_with_a_reason(self):
-        from data.invariants import CORRELATION_EXCLUDED, exclusion_reason
+    # --- the evidence ------------------------------------------------------
+    def test_every_exclusion_cites_committed_evidence(self):
+        """THE INV-18 enforcement: each cited statistic is recomputed from
+        data/measurements/ and must match. An exclusion cannot quote a number the
+        committed evidence does not contain."""
+        from data.invariants import ANALYSIS_EXCLUSIONS
+        from data.measurements import verify
 
-        assert is_correlation_excluded("griffin_lim")
-        assert "griffin_lim" in CORRELATION_EXCLUDED
-        reason = exclusion_reason("griffin_lim")
-        assert "floor reference" in reason
-        assert "0.00000" in reason
+        n = 0
+        for table in ANALYSIS_EXCLUSIONS.values():
+            for exc in table.values():
+                assert exc.measurements, f"{exc.condition}: exclusion names no measurement"
+                for ref in exc.measurements:
+                    verify(ref)
+                    n += 1
+        assert n >= 4
 
-    def test_griffin_lim_is_still_a_generated_rung(self):
-        """Excluded from rho, not from the dataset: it is still reported."""
-        from vocoders.registry import ALL_CONDITIONS, LADDER
+    def test_a_wrong_citation_is_caught(self):
+        from dataclasses import replace
 
-        assert "griffin_lim" in LADDER
-        assert "griffin_lim" in ALL_CONDITIONS
+        from data.invariants import ANALYSIS_EXCLUSIONS
+        from data.measurements import verify
 
-    def test_primary_correlation_refuses_griffin_lim(self):
+        ref = ANALYSIS_EXCLUSIONS[HIGH_BAND_ANALYSIS]["griffin_lim"].measurements[0]
+        with pytest.raises(InvariantViolation, match="INV-18.*records"):
+            verify(replace(ref, value=0.0))
+
+    def test_exclusion_references_resolve_to_real_rows(self):
+        from data.invariants import ANALYSIS_EXCLUSIONS
+        from data.measurements import load_csv
+
+        conditions = set(load_csv()["condition"])
+        for table in ANALYSIS_EXCLUSIONS.values():
+            for exc in table.values():
+                for ref in exc.measurements:
+                    assert ref.condition in conditions, ref.describe()
+
+    # --- membership ----------------------------------------------------------
+    def test_primary_analysis_excludes_nothing(self):
+        from data.invariants import ANALYSIS_EXCLUSIONS
+
+        assert ANALYSIS_EXCLUSIONS[PRIMARY_ANALYSIS] == {}
+
+    def test_griffin_lim_is_back_in_primary_and_out_of_high_band(self):
+        """Intended: its cliff lives above LADDER_FMAX, which primary removes."""
+        assert not is_excluded(PRIMARY_ANALYSIS, "griffin_lim")
+        assert is_excluded(HIGH_BAND_ANALYSIS, "griffin_lim")
+
+    def test_vocos_is_in_primary_and_out_of_high_band(self):
+        assert not is_excluded(PRIMARY_ANALYSIS, "vocos")
+        assert is_excluded(HIGH_BAND_ANALYSIS, "vocos")
+
+    def test_neural_rungs_are_in_both(self):
+        for cond in ("melgan", "hifigan_v1", "bigvgan_base", "bigvgan_112m"):
+            assert not is_excluded(PRIMARY_ANALYSIS, cond)
+            assert not is_excluded(HIGH_BAND_ANALYSIS, cond)
+
+    def test_analysis_frame_membership_differs_per_analysis(self):
+        from data.manifest import analysis_frame
+        from vocoders.registry import ALL_CONDITIONS
+
+        df = pd.DataFrame({"condition": list(ALL_CONDITIONS)})
+        primary = set(analysis_frame(df, PRIMARY_ANALYSIS, why="t")["condition"])
+        high = set(analysis_frame(df, HIGH_BAND_ANALYSIS, why="t")["condition"])
+        assert "griffin_lim" in primary and "griffin_lim" not in high
+        assert "vocos" in primary and "vocos" not in high
+        assert "bigvgan_v2_22khz_fullband" not in primary  # a control, not a rung
+        assert "bigvgan_v2_22khz_fullband" not in high
+
+    # --- spearman_headline ----------------------------------------------------
+    def test_spearman_includes_griffin_lim_when_band_limited(self):
         from detectors.protocols import Protocol, spearman_headline
 
         quality, detection = self._frames(
-            ["griffin_lim", "melgan", "hifigan_v1", "vocos", "bigvgan_112m"]
+            ["griffin_lim", "melgan", "hifigan_v1", "vocos", "bigvgan_base", "bigvgan_112m"]
         )
-        with pytest.raises(InvariantViolation, match="INV-17.*griffin_lim"):
+        stats = spearman_headline(quality, detection, protocol=Protocol.MATCHED)
+        assert stats["n_conditions"] == 6
+
+    def test_spearman_refuses_full_band_rows(self):
+        """The load-bearing check: griffin_lim is only safe in the headline
+        because the headline is band-limited. Full-band rows bring its cliff back."""
+        from detectors.protocols import Protocol, spearman_headline
+
+        quality, detection = self._frames(
+            ["griffin_lim", "melgan", "hifigan_v1", "vocos"], band_limit_hz=None
+        )
+        with pytest.raises(InvariantViolation, match="INV-18.*above LADDER_FMAX"):
             spearman_headline(quality, detection, protocol=Protocol.MATCHED)
 
-    def test_refusal_quotes_the_reason(self):
+    def test_spearman_accepts_zero_shot_rows(self):
+        """Zero-shot Nyquist is 8 kHz, so those rows are inherently band-limited."""
         from detectors.protocols import Protocol, spearman_headline
 
         quality, detection = self._frames(
-            ["griffin_lim", "melgan", "hifigan_v1", "vocos"]
+            ["griffin_lim", "melgan", "hifigan_v1", "vocos"],
+            tier=ZEROSHOT_TIER, band_limit_hz=None,
         )
+        detection["protocol"] = "mismatched"
+        stats = spearman_headline(quality, detection, protocol=Protocol.MISMATCHED)
+        assert stats["n_conditions"] == 4
+
+    def test_spearman_refuses_the_paired_control_by_membership(self):
+        from detectors.protocols import Protocol, spearman_headline
+
+        quality, detection = self._frames(
+            ["melgan", "hifigan_v1", "bigvgan_112m", "bigvgan_v2_22khz_fullband"]
+        )
+        with pytest.raises(InvariantViolation, match="paired controls"):
+            spearman_headline(quality, detection, protocol=Protocol.MATCHED)
+
+    def test_spearman_refuses_a_non_primary_analysis(self):
+        from detectors.protocols import Protocol, spearman_headline
+
+        quality, detection = self._frames(["melgan", "hifigan_v1", "bigvgan_112m"])
+        with pytest.raises(InvariantViolation, match="INV-18"):
+            spearman_headline(
+                quality, detection, protocol=Protocol.MATCHED, analysis=HIGH_BAND_ANALYSIS
+            )
+
+    def test_refuse_excluded_quotes_the_measurement(self):
+        from detectors.protocols import refuse_excluded
+
         with pytest.raises(InvariantViolation) as exc:
-            spearman_headline(quality, detection, protocol=Protocol.MATCHED)
-        assert "floor reference" in str(exc.value)
-
-    def test_correlation_succeeds_once_excluded_conditions_are_filtered(self):
-        from data.manifest import primary_ladder_frame
-        from detectors.protocols import Protocol, spearman_headline
-
-        conds = [
-            "griffin_lim", "melgan", "hifigan_v1", "vocos",
-            "bigvgan_base", "bigvgan_112m", "bigvgan_v2_22khz_fullband",
-        ]
-        quality, detection = self._frames(conds)
-        stats = spearman_headline(
-            primary_ladder_frame(quality, why="test"),
-            primary_ladder_frame(detection, why="test"),
-            protocol=Protocol.MATCHED,
-        )
-        # 7 conditions minus griffin_lim and the paired control.
-        assert stats["n_conditions"] == 5
-
-    def test_melgan_fullband_is_gone(self):
-        """It was the same checkpoint as melgan differing only in the
-        generation-time filter; with a full-band archive it is a duplicate."""
-        from vocoders.registry import ALL_CONDITIONS, SPECS
-
-        assert "melgan_fullband" not in SPECS
-        assert "melgan_fullband" not in ALL_CONDITIONS
-
-    def test_bandwidth_probe_hit_is_by_design_for_excluded_conditions(self):
-        from experiments.sanity_checks import _verdict
-
-        leak = _verdict("bandwidth_rolloff", "hifigan_v1", 0.0, ARCHIVE_TIER)
-        assert leak["leaked"] is True
-
-        for cond in ("griffin_lim", "bigvgan_v2_22khz_fullband"):
-            v = _verdict("bandwidth_rolloff", cond, 0.0, ARCHIVE_TIER)
-            assert v["leaked"] is False and v["expected_by_design"] is True
-
-        still = _verdict("silence_duration", "griffin_lim", 0.0, ARCHIVE_TIER)
-        assert still["leaked"] is True
+            refuse_excluded(["vocos"], HIGH_BAND_ANALYSIS, where="test")
+        msg = str(exc.value)
+        assert "resampler signature" in msg
+        assert "evidence" in msg and "band_measurements.csv" in msg
 
 
 class TestHighBandDistance:
@@ -937,7 +1001,7 @@ class TestHighBandDistance:
         from metrics.spectral import high_band_distance
 
         r = self._real()
-        out = high_band_distance(r, r)
+        out = high_band_distance(r, r, condition="bigvgan_112m")
         assert out["hb_lsd"] == pytest.approx(0.0, abs=1e-9)
         assert out["hb_corr"] == pytest.approx(1.0, abs=1e-9)
         assert out["hb_frac_ratio"] == pytest.approx(1.0, abs=1e-9)
@@ -951,7 +1015,7 @@ class TestHighBandDistance:
         r = self._real()
         sos = cheby2(12, 100, LADDER_FMAX / (ARCHIVE_SR / 2), btype="low", output="sos")
         gl = sosfiltfilt(sos, r).astype(np.float32)
-        out = high_band_distance(r, gl)
+        out = high_band_distance(r, gl, condition="melgan")
         assert out["hb_frac_deg"] == pytest.approx(0.0, abs=1e-12)
         assert out["hb_frac_ratio"] == pytest.approx(0.0, abs=1e-9)
         assert out["hb_lsd"] > 50.0
@@ -979,7 +1043,7 @@ class TestHighBandDistance:
         noise_high *= np.sqrt(np.mean(real_high**2) / np.mean(noise_high**2))
         fake = (low + noise_high).astype(np.float32)
 
-        out = high_band_distance(r, fake)
+        out = high_band_distance(r, fake, condition="hifigan_v1")
         assert 0.5 < out["hb_frac_ratio"] < 2.0, "energy should look about right"
         assert out["hb_lsd"] > 3.0, "but the structure should not"
         assert out["hb_corr"] < 0.9
@@ -988,14 +1052,47 @@ class TestHighBandDistance:
         from metrics.spectral import high_band_distance
 
         with pytest.raises(InvariantViolation, match="INV-06"):
-            high_band_distance(self._real(), self._real(ARCHIVE_SR // 2))
+            high_band_distance(self._real(), self._real(ARCHIVE_SR // 2), condition="melgan")
 
     def test_rejects_a_band_outside_nyquist(self):
         from metrics.spectral import high_band_distance
 
         r = self._real()
         with pytest.raises(InvariantViolation, match="not inside"):
-            high_band_distance(r, r, lo=12_000.0)
+            high_band_distance(r, r, condition="melgan", lo=12_000.0)
+
+    @pytest.mark.parametrize("cond", ["griffin_lim", "vocos"])
+    def test_refuses_high_band_excluded_conditions(self, cond):
+        from metrics.spectral import high_band_distance
+
+        r = self._real()
+        with pytest.raises(InvariantViolation, match="INV-18.*high_band_distance refuses"):
+            high_band_distance(r, r, condition=cond)
+
+    def test_refusal_quotes_the_reason(self):
+        from metrics.spectral import high_band_distance
+
+        r = self._real()
+        with pytest.raises(InvariantViolation) as exc:
+            high_band_distance(r, r, condition="griffin_lim")
+        assert "mel-inversion" in str(exc.value)
+
+    def test_condition_is_required(self):
+        """No default, so the refusal cannot be bypassed by omitting it."""
+        from metrics.spectral import high_band_distance
+
+        r = self._real()
+        with pytest.raises(TypeError):
+            high_band_distance(r, r)
+
+    def test_runner_records_exclusion_instead_of_scoring(self):
+        import inspect
+
+        from metrics import runner
+
+        src = inspect.getsource(runner.evaluate_archive)
+        assert "exclusion_for(HIGH_BAND_ANALYSIS" in src
+        assert "hb_excluded" in src
 
     def test_wired_into_the_runner(self):
         import inspect
@@ -1735,3 +1832,308 @@ class TestINV11CropPolicy:
 
         with pytest.raises(ValueError, match="INV-01"):
             crop_samples_for_rate(44_100)
+
+
+class TestMeasurementArtifacts:
+    """TASK 0: the evidence is committed, and the BigVGAN pin traces to it."""
+
+    def _git_ignored(self, rel):
+        import subprocess
+
+        r = subprocess.run(
+            ["git", "check-ignore", "-q", rel], cwd=str(REPO_ROOT), capture_output=True
+        )
+        return r.returncode == 0
+
+    def test_measurement_artifacts_are_not_ignored(self):
+        for f in ("data/measurements/band_measurements.csv", "data/measurements/meta.json"):
+            assert not self._git_ignored(f), f"{f} is ignored; INV-18 cites it by row"
+
+    def test_generated_audio_under_data_is_still_ignored(self):
+        """The negation must not reopen data/ for generated audio."""
+        for f in ("data/resynth/archive/real/x.wav", "data/LJSpeech-1.1/metadata.csv",
+                  "data/stray.json", "data/measurements/x.wav"):
+            assert self._git_ignored(f), f"{f} should be ignored"
+
+    def test_csv_shape_matches_its_description(self):
+        from data.measurements import load_csv
+
+        df = load_csv()
+        assert df.shape == (300, 6)
+        assert set(df["condition"]) == {
+            "real", "bigvgan", "vocos", "griffin_lim", "real_roundtrip"
+        }
+        assert df["utt_id"].nunique() == 60
+        assert (df.groupby("utt_id")["samples"].nunique() == 1).all()
+
+    def test_quoted_default_resampler_ratio_is_in_the_csv(self):
+        """The one resampler row the artifacts DO contain: torchaudio default."""
+        from data.measurements import load_csv
+
+        df = load_csv()
+        m = df.groupby("condition")["hb_8k_nyq"].mean()
+        assert m["real_roundtrip"] / m["real"] == pytest.approx(0.8198, abs=5e-5)
+
+    def test_bigvgan_file_digest_comes_from_meta(self):
+        from data.measurements import load_meta
+        from vocoders.registry import get_spec
+
+        spec = get_spec("bigvgan_112m")
+        assert spec.checkpoint_sha256 == load_meta()["bigvgan_sha256"]
+        assert spec.checkpoint == load_meta()["bigvgan_repo"]
+
+    def test_file_digest_does_not_overwrite_the_repo_revision(self):
+        """Two different identifiers: a 40-hex commit and a 64-hex file digest."""
+        from vocoders.registry import get_spec
+
+        spec = get_spec("bigvgan_112m")
+        assert re.fullmatch(r"[0-9a-f]{40}", spec.checkpoint_revision)
+        assert re.fullmatch(r"[0-9a-f]{64}", spec.checkpoint_sha256)
+
+    def test_bigvgan_mel_comes_from_meta_and_matches_the_audit(self):
+        from data.mel import BIGVGAN_V2_22K_FMAX8K_MEL
+        from vocoders.registry import get_spec
+
+        mel = get_spec("bigvgan_112m").mel
+        assert "meta.json" in mel.source
+        for field in ("sample_rate", "n_fft", "hop_length", "win_length",
+                      "n_mels", "fmin", "fmax"):
+            assert getattr(mel, field) == getattr(BIGVGAN_V2_22K_FMAX8K_MEL, field), field
+
+
+class TestResamplerPin:
+    """TASK 2: Vocos resamples with pinned kaiser parameters, and only those."""
+
+    PINNED = {
+        "backend": "torchaudio",
+        "resampling_method": "sinc_interp_kaiser",
+        "lowpass_filter_width": 64,
+        "rolloff": 0.9999,
+        "beta": 14.769656459379492,
+    }
+
+    def test_vocos_resampler_parameters_are_pinned(self):
+        from vocoders.registry import get_spec
+
+        r = get_spec("vocos").resampler
+        assert r is not None
+        for k, v in self.PINNED.items():
+            assert getattr(r, k) == v, f"{k} is {getattr(r, k)!r}, pinned {v!r}"
+
+    def test_pin_is_not_the_torchaudio_default(self):
+        """The default (width 6, rolloff 0.99) costs 18% of the high band."""
+        from vocoders.registry import get_spec
+
+        r = get_spec("vocos").resampler
+        assert r.lowpass_filter_width != 6
+        assert r.rolloff != 0.99
+
+    def test_default_resampler_cost_is_a_committed_measurement(self):
+        from data.measurements import verify
+        from vocoders.registry import get_spec
+
+        rt_mean, real_mean = (verify(m) for m in get_spec("vocos").resampler.justification)
+        assert 1.0 - rt_mean / real_mean == pytest.approx(0.1802, abs=5e-4)
+
+    def test_only_vocos_declares_a_resampler(self):
+        from vocoders.registry import ALL_CONDITIONS, get_spec
+
+        declared = {c for c in ALL_CONDITIONS if get_spec(c).resampler is not None}
+        assert declared == {"vocos"}
+
+    def test_resample_with_spec_passes_exactly_the_pinned_kwargs(self, monkeypatch):
+        """Verified against a stand-in, since torchaudio is absent by INV-13."""
+        import types
+
+        from data.preprocess import resample_with_spec
+        from vocoders.registry import get_spec
+
+        seen = {}
+
+        class FakeTensor:
+            def __init__(self, a):
+                self.a = a
+
+            def numpy(self):
+                return self.a
+
+        def fake_resample(x, orig_freq, new_freq, **kw):
+            seen.update(kw, orig_freq=orig_freq, new_freq=new_freq)
+            return FakeTensor(np.zeros(4, dtype=np.float32))
+
+        torch_mod = types.ModuleType("torch")
+        torch_mod.from_numpy = lambda a: a
+        ta = types.ModuleType("torchaudio")
+        taf = types.ModuleType("torchaudio.functional")
+        taf.resample = fake_resample
+        ta.functional = taf
+        monkeypatch.setitem(sys.modules, "torch", torch_mod)
+        monkeypatch.setitem(sys.modules, "torchaudio", ta)
+        monkeypatch.setitem(sys.modules, "torchaudio.functional", taf)
+
+        resample_with_spec(np.ones(8, dtype=np.float32), 24_000, ARCHIVE_SR,
+                           get_spec("vocos").resampler)
+        assert seen == {
+            "lowpass_filter_width": 64,
+            "rolloff": 0.9999,
+            "resampling_method": "sinc_interp_kaiser",
+            "beta": 14.769656459379492,
+            "orig_freq": 24_000,
+            "new_freq": ARCHIVE_SR,
+        }
+
+    def test_fails_closed_without_torchaudio(self, monkeypatch):
+        """No silent fallback: another resampler leaves another rolloff."""
+        from data.preprocess import resample_with_spec
+        from vocoders.registry import get_spec
+
+        monkeypatch.setitem(sys.modules, "torchaudio", None)
+        monkeypatch.setitem(sys.modules, "torchaudio.functional", None)
+        with pytest.raises(InvariantViolation, match="Do NOT substitute"):
+            resample_with_spec(np.ones(8, dtype=np.float32), 24_000, ARCHIVE_SR,
+                               get_spec("vocos").resampler)
+
+    def test_same_rate_is_a_no_op(self):
+        from data.preprocess import resample_with_spec
+        from vocoders.registry import get_spec
+
+        w = np.arange(8, dtype=np.float32)
+        out = resample_with_spec(w, ARCHIVE_SR, ARCHIVE_SR, get_spec("vocos").resampler)
+        assert np.array_equal(out, w)
+
+
+class TestINV18ResampleProbe:
+    """TASK 3 regression: where does a resample round trip's signature live?
+
+    Measured with RESAMPLE_METHOD (soxr_hq), NOT the pinned torchaudio kaiser --
+    torchaudio is absent from this environment by INV-13. Uses the configuration
+    that produced the committed 0.502 finding, with folds grouped by utterance
+    (see test_paired_probe_must_group_by_utterance for why that matters).
+    """
+
+    N = 60
+
+    @classmethod
+    def _dataset(cls):
+        if getattr(cls, "_cache", None) is not None:
+            return cls._cache
+        import librosa
+
+        from data.invariants import RESAMPLE_METHOD
+        from data.preprocess import band_limit_to_ladder, normalise_loudness
+
+        def src(i):
+            rng = np.random.default_rng(1000 + i)
+            n = int(ARCHIVE_SR * (1.2 + 0.03 * (i % 10)))
+            t = np.arange(n) / ARCHIVE_SR
+            f0 = 120 + 7 * (i % 13)
+            x = sum((0.35 / k) * np.sin(2 * np.pi * f0 * k * t + rng.uniform(0, 6.28))
+                    for k in range(1, int(ARCHIVE_SR / 2 / f0)))
+            x = x * (1 + 0.3 * np.sin(2 * np.pi * 3.1 * t)) + 0.02 * rng.standard_normal(n)
+            x = x * np.hanning(n)
+            return (0.35 * x / np.max(np.abs(x))).astype(np.float32)
+
+        def pcm(w):
+            return (np.round(np.clip(w, -1, 1) * 32767) / 32768).astype(np.float32)
+
+        def rt(w):
+            up = librosa.resample(w, orig_sr=ARCHIVE_SR, target_sr=24_000,
+                                  res_type=RESAMPLE_METHOD)
+            d = librosa.resample(up, orig_sr=24_000, target_sr=ARCHIVE_SR,
+                                 res_type=RESAMPLE_METHOD)
+            return d[:len(w)] if len(d) >= len(w) else np.pad(d, (0, len(w) - len(d)))
+
+        def bands(w, edges):
+            spec = np.abs(librosa.stft(w, n_fft=2048, hop_length=512)) ** 2
+            f = librosa.fft_frequencies(sr=ARCHIVE_SR, n_fft=2048)
+            return np.log10(np.array([spec[(f >= a) & (f < b)].mean()
+                                      for a, b in edges]) + 1e-20)
+
+        # The CURRENT pipeline: loudness on the full band, PCM_16, then the
+        # analysis-time band limit (INV-17).
+        sources = [src(i) for i in range(cls.N)]
+        a = [pcm(normalise_loudness(rt(x), sr=ARCHIVE_SR)[0]) for x in sources]
+        b = [pcm(normalise_loudness(x, sr=ARCHIVE_SR)[0]) for x in sources]
+        lo_edges = [(f, f + 250) for f in range(0, int(LADDER_FMAX), 250)]
+        hi_edges = [(f, f + 250) for f in range(int(LADDER_FMAX), 11_000, 250)]
+        x_lo = np.vstack([[bands(band_limit_to_ladder(w, sr=ARCHIVE_SR), lo_edges) for w in a],
+                          [bands(band_limit_to_ladder(w, sr=ARCHIVE_SR), lo_edges) for w in b]])
+        x_hi = np.vstack([[bands(w, hi_edges) for w in a], [bands(w, hi_edges) for w in b]])
+        y = np.r_[np.ones(cls.N), np.zeros(cls.N)]
+        groups = np.r_[np.arange(cls.N), np.arange(cls.N)]
+        cls._cache = (x_lo, x_hi, y, groups)
+        return cls._cache
+
+    @staticmethod
+    def _auroc(x, y, cv):
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.model_selection import cross_val_score
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        clf = make_pipeline(StandardScaler(), LogisticRegression(max_iter=5000))
+        return float(cross_val_score(clf, x, y, cv=cv, scoring="roc_auc").mean())
+
+    def _grouped(self, x, y, groups):
+        from sklearn.model_selection import GroupKFold
+
+        return list(GroupKFold(5).split(x, y, groups))
+
+    def test_signature_is_separable_above_the_band(self):
+        x_lo, x_hi, y, g = self._dataset()
+        assert self._auroc(x_hi, y, self._grouped(x_hi, y, g)) >= 0.95
+
+    def test_signature_is_concentrated_above_the_band(self):
+        """What IS robust across every configuration measured: the round trip
+        is far more separable above LADDER_FMAX than below it."""
+        x_lo, x_hi, y, g = self._dataset()
+        cv = self._grouped(x_lo, y, g)
+        below, above = self._auroc(x_lo, y, cv), self._auroc(x_hi, y, cv)
+        assert below <= 0.75, f"below-band AUROC {below:.3f}"
+        assert above - below >= 0.25, f"above {above:.3f} vs below {below:.3f}"
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "INV-18 claim as specified: 'at chance below LADDER_FMAX'. NOT robust. "
+            "Grouped-CV AUROC below the band measured 0.505 (band limit BEFORE "
+            "loudness, the old pipeline), 0.558 (band limit after, the current "
+            "pipeline, this test) and 0.66-0.69 over 5 draws of a noisier signal. "
+            "The reported 0.502 on LJSpeech/torchaudio is NOT in data/measurements/. "
+            "Commit that measurement, or a grouped-CV re-run with the pinned "
+            "kaiser resampler, before Vocos's place in the primary analysis is "
+            "treated as established."
+        ),
+    )
+    def test_probe_is_at_chance_below_the_band(self):
+        x_lo, x_hi, y, g = self._dataset()
+        below = self._auroc(x_lo, y, self._grouped(x_lo, y, g))
+        assert abs(below - 0.5) <= 0.05, f"below-band AUROC {below:.3f}"
+
+    def test_paired_probe_must_group_by_utterance(self):
+        """Shuffled folds split each utterance's two versions across train and
+        test. Utterances differ far more than the two paths do, so the classifier
+        is systematically inverted. Same data, wildly different answer."""
+        from sklearn.model_selection import StratifiedKFold
+
+        x_lo, _, y, g = self._dataset()
+        grouped = self._auroc(x_lo, y, self._grouped(x_lo, y, g))
+        leaky = self._auroc(x_lo, y, StratifiedKFold(5, shuffle=True, random_state=0))
+        assert abs(grouped - leaky) >= 0.2, f"grouped {grouped:.3f} leaky {leaky:.3f}"
+
+
+class TestINV18RejectedAlternatives:
+    """The uniform round trip was considered and rejected; keep it from recurring."""
+
+    def test_uniform_round_trip_rejection_is_recorded(self):
+        from data.invariants import REJECTED_ALTERNATIVES
+
+        rec = REJECTED_ALTERNATIVES["uniform_round_trip"]
+        assert rec.measured_value == pytest.approx(0.9903)
+        assert "not idempotent" in rec.reason
+
+    def test_rejection_evidence_is_flagged_as_not_committed(self):
+        """0.9903 is reported, not in data/measurements/. Say so in code."""
+        from data.invariants import REJECTED_ALTERNATIVES
+
+        assert REJECTED_ALTERNATIVES["uniform_round_trip"].in_committed_artifacts is False

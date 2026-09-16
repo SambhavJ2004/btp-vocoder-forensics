@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from data.manifest import primary_ladder_frame
+from data.invariants import PRIMARY_ANALYSIS
+from data.manifest import analysis_frame
 from detectors.protocols import (
     Protocol,
     assert_protocols_not_pooled,
@@ -42,9 +43,9 @@ def main_plot(
     # is measured and reported, but never plotted as a rung -- its bandwidth
     # differs by design, so a point for it on this axis would read as a vocoder
     # property.
-    detection = primary_ladder_frame(detection, why="the main plot")
-    quality_by_condition = primary_ladder_frame(
-        quality_by_condition, why="the main plot"
+    detection = analysis_frame(detection, PRIMARY_ANALYSIS, why="the main plot")
+    quality_by_condition = analysis_frame(
+        quality_by_condition, PRIMARY_ANALYSIS, why="the main plot"
     )
     det = detection[detection["protocol"] == protocol.value]
     if detector is not None:
@@ -86,9 +87,9 @@ def main_plot(
 
 def summarise(quality_by_condition: pd.DataFrame, detection: pd.DataFrame, **kwargs) -> str:
     """One-paragraph reading of the result, for the thesis draft."""
-    detection = primary_ladder_frame(detection, why="the headline summary")
-    quality_by_condition = primary_ladder_frame(
-        quality_by_condition, why="the headline summary"
+    detection = analysis_frame(detection, PRIMARY_ANALYSIS, why="the headline summary")
+    quality_by_condition = analysis_frame(
+        quality_by_condition, PRIMARY_ANALYSIS, why="the headline summary"
     )
     stats = spearman_headline(quality_by_condition, detection, **kwargs)
     return orthogonality_verdict(stats["rho"], stats["n_conditions"])

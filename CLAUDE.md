@@ -19,7 +19,7 @@ produces a clean, plausible, publishable-looking plot of the wrong thing.
 ## The invariants
 
 INV-01 to INV-05 are the confound controls from the plan's Phase A table.
-INV-06 to INV-17 are their operational consequences — decisions the table
+INV-06 to INV-18 are their operational consequences — decisions the table
 implies but does not spell out. Both kinds are binding.
 
 Machine-readable copy: [`src/data/invariants.py`](src/data/invariants.py).
@@ -107,14 +107,50 @@ cannot beat chance, and that the two paths produce **byte-identical PCM_16
 output for 99.98% of samples**. The round trip is erased before quantisation and
 quantisation finishes the job.
 
-So Vocos's resample is exempted from the "rolloff is a signature" concern on
-evidence. Two caveats on that evidence: it was measured on synthetic
-speech-like audio (harmonic stacks with broadband noise), not on LJSpeech, and
-it holds *because* `LADDER_FMAX` sits well below the resampler transition band.
-**Re-run it if `LADDER_FMAX` ever rises above ~10 kHz, or if a condition is
-added whose native rate is closer to 22.05 kHz** — a 22.05 → 22.05 "resample" is
-a no-op, but 32 kHz → 22.05 kHz would put the transition somewhere new.
-Reproduced by `TestVocosResampleSignature`.
+**Superseded in scope by INV-17's move to a full-band archive, and then by the
+committed measurement.** The finding above was made when INV-17 band-limited at
+generation, so both paths passed through the 8 kHz filter before being compared.
+It shows the round trip is erased *below* `LADDER_FMAX` — it never showed the
+round trip is invisible in a **full-band** archive, and it is not:
+
+| committed evidence (60 LJSpeech files, PCM_16) | value |
+|---|---|
+| [10900, 11025) Hz energy, `vocos` | **8.63e-07** |
+| same band, `bigvgan` (no resample) | 7.30e-09 — ~118x less |
+| AUROC `vocos` vs `bigvgan` on that band | **0.9997** |
+| AUROC `vocos` vs `real_roundtrip` on that band | **0.507** — indistinguishable |
+
+Vocos is indistinguishable from *resampled real audio* in that band and trivially
+separable from a vocoder that was never resampled. What distinguishes it there
+is the resampler. So it is excluded from the high-band analysis and kept in the
+band-limited primary analysis (INV-18). Source:
+[`docs/measurements.md`](docs/measurements.md).
+
+Caveats that still stand: the original finding used synthetic audio, and whether
+the round trip is **at chance below** `LADDER_FMAX` is configuration-sensitive
+(0.50–0.69 across configurations measured locally; see INV-18).
+Reproduced by `TestVocosResampleSignature` and `TestINV18ResampleProbe`.
+
+**Vocos's resampler is pinned, and differs from `RESAMPLE_METHOD`.** Both its
+input-side (22050 → 24000) and output-side (24000 → 22050) resamples use
+`vocoders.vocos.VOCOS_RESAMPLER`: torchaudio `sinc_interp_kaiser`,
+`lowpass_filter_width=64`, `rolloff=0.9999`, `beta=14.769656459379492`. The
+torchaudio **default** costs 18% of the energy above `LADDER_FMAX`
+(`real_roundtrip`/`real` = 0.8198, committed). The kaiser pin's own figure
+(ratio 0.9998) is **reported, not committed**.
+
+This is a real tension with *"the method is frozen too"* below, stated rather
+than hidden: `RESAMPLE_METHOD = soxr_hq` still governs every other resample —
+archive → zero-shot for all conditions, and native → archive for the 22.05 kHz
+conditions, where it is a no-op. Vocos is the only condition that takes a
+native → archive step at all, so "frozen across conditions" is vacuous for that
+step, and a condition-specific pin is the honest representation. The pin fails
+closed: without torchaudio `resample_with_spec` raises rather than substituting
+another resampler, because another resampler leaves another rolloff.
+
+Found while wiring this: the input-side resample previously called
+`librosa.resample` with **no `res_type` at all** — neither `RESAMPLE_METHOD` nor
+any pin.
 
 **Constants.** `ARCHIVE_SR = 22_050`, `ZEROSHOT_SR = 16_000`,
 `MAX_RESAMPLE_STEPS = 1`, `RESAMPLE_METHOD = "soxr_hq"` — the method is frozen
@@ -689,15 +725,17 @@ to −200 dB, so the measurement is never the limit:
 `format_oob()` renders anything at or below `MEASUREMENT_FLOOR` as "below
 measurement floor" rather than quoting a number.
 
-**Correlation exclusions.** `invariants.CORRELATION_EXCLUDED` maps each excluded
-condition to *why*, and `spearman_headline` refuses a frame containing one,
-quoting the reason. Excluded conditions are generated, measured and **reported**
-like any other; what they are not is comparable on the headline axis.
+**Exclusions are per analysis — see INV-18.** This section used to hold a single
+`CORRELATION_EXCLUDED` set that kept `griffin_lim` out of the headline
+correlation. That was wrong in the same way the original INV-17 was: the
+disqualifying artifact is **band-localised**, above `LADDER_FMAX`, so a blanket
+exclusion discarded usable data. INV-18 replaces it.
 
-| condition | reason |
-|---|---|
-| `griffin_lim` | **floor reference.** Structurally cannot emit above its mel fmax (ISTFT of an inverted mel), measured 0.00000. Its detectability is a bandwidth artifact, not a reconstruction artifact, and at the low-quality end of the ladder it would anchor a strong positive Spearman for a reason unrelated to the hypothesis. |
-| `bigvgan_v2_22khz_fullband` | **paired control.** Differs from `bigvgan_112m` in training mel fmax alone, which is the variable it exists to isolate. |
+**Griffin-Lim is not exactly zero.** The 20-file table above reads 0.00000 to
+five decimals. The committed 60-file measurement gives median **5.1e-9**, max
+**5.5e-8** — the PCM_16 quantisation floor on no signal content, and 4 of 60 files
+exceed `PCM16_OOB_FLOOR` itself. The conclusion survives: real's *minimum* is
+6.4e-4, four orders of magnitude above Griffin-Lim's maximum.
 
 **`melgan_fullband` was removed.** It was the same checkpoint as `melgan`
 differing only in whether the generation-time filter ran. With a full-band
@@ -709,10 +747,7 @@ sanctioned way to band-limit; refuses a set without `real`),
 `data.preprocess.band_limit_to_ladder` (the filter),
 `data.invariants.check_band_limit` (gates the transform's output),
 `data.manifest._validate_band` (**asserts the archive is full-band** — the
-inverse of what it used to assert), `detectors.protocols.spearman_headline`
-(refuses a `CORRELATION_EXCLUDED` condition, with the reason),
-`data.manifest.primary_ladder_frame`, `vocoders.registry` import-time
-cross-check.
+inverse of what it used to assert). Membership of the two analyses is INV-18.
 
 **Manifest columns.** `archive_band_hz`, `archive_band` (always `full_band`),
 `high_band_fraction` (measured per file — evidence, not a gate).
@@ -767,6 +802,114 @@ five conditions that share 1024/256/1024 at 80 bands.
 
 ---
 
+### INV-18 — Analysis membership is per band, and every exclusion cites a measurement
+
+**Rule.** An analysis band may only include conditions whose processing history
+introduces **no artifact within that band**, and **every exclusion must name a
+measurement rather than an argument**.
+
+Two analyses run over the ladder, with different membership:
+
+| analysis | band | excluded |
+|---|---|---|
+| **primary** (`PRIMARY_ANALYSIS`) — the headline correlation | band-limited to `LADDER_FMAX` | **nothing** |
+| **high-band** (`HIGH_BAND_ANALYSIS`) | [`LADDER_FMAX`, Nyquist) on the full-band archive | `griffin_lim`, `vocos` |
+
+`griffin_lim` is **in** the primary correlation. That is intended, not an
+oversight: its disqualifying artifact lives above `LADDER_FMAX`, which the primary
+analysis removes.
+
+**Why.** Two confounds found in this study are **band-localised**:
+
+- **Griffin-Lim's mel-inversion cliff.** It inverts the mel to a linear
+  spectrogram and runs ISTFT, so it cannot emit above `fmax`. The artifact exists
+  only above `LADDER_FMAX`.
+- **Vocos's resampler.** Its transition band leaves an imprint in
+  [10900, 11025) Hz that makes it indistinguishable from resampled real audio
+  and separable from an unresampled vocoder at AUROC 0.9997.
+
+A **blanket exclusion loses usable data**: removing Griffin-Lim from every
+analysis throws away its below-band reconstruction behaviour, which is exactly
+the low-quality anchor the ladder needs. A **blanket inclusion manufactures
+results**: keeping it in the high-band analysis would score a structural absence
+as a reconstruction artifact. The unit of membership has to be (condition,
+band), not condition.
+
+Both confounds were **found by measuring rather than by reasoning from
+configuration**, and the reasoning that preceded them was wrong both times:
+config inspection said `fmax = 8000` meant no output above 8 kHz (false for every
+neural vocoder, INV-17), and argument said INV-17's band limit erased the Vocos
+resample (true below the band, false in a full-band archive, INV-01). Hence the
+second half of the rule. An exclusion justified by argument is a claim nobody has
+checked; one that names a row can be recomputed.
+
+**Exclusions and membership are different things.** An INV-18 exclusion removes
+a ladder **rung** from one analysis and must cite evidence. A paired control
+(`bigvgan_v2_22khz_fullband`) is not a rung at all — it is refused by
+**membership**, needs no measurement, and never appears in
+`ANALYSIS_EXCLUSIONS`. Conflating the two would either force a fake measurement
+onto a design fact or let a real confound hide behind a design label.
+
+**The primary analysis must actually be band-limited.** `spearman_headline`
+refuses any detection row whose audio can carry content above `LADDER_FMAX` —
+archive rows without `band_limit_hz`, or a tier whose Nyquist exceeds the band.
+This is load-bearing rather than tidy: Griffin-Lim is only safe in the headline
+*because* the headline is band-limited. Admit full-band rows and its cliff comes
+straight back.
+
+**What is NOT established — stated so it is not assumed.** Vocos's inclusion in
+the primary analysis rests on its resampler artifact being absent below
+`LADDER_FMAX`. The evidence for that is weaker than for anything else here:
+
+| measurement | below `LADDER_FMAX` | above |
+|---|---|---|
+| reported, LJSpeech / torchaudio | 0.502 — **not in `data/measurements/`** | 1.0 |
+| local, committed config, band limit before loudness (old pipeline) | 0.505 | — |
+| local, same config, band limit after loudness (**current pipeline**) | **0.558** | **1.000** |
+| local, noisier signal, passband only, 5 draws | 0.66 – 0.69 | 1.000 |
+
+Above the band: separable in every configuration. Below: **configuration
+sensitive**, 0.50 to 0.69. The local measurements use `soxr_hq`, not the pinned
+kaiser, because torchaudio is absent by INV-13. `TestINV18ResampleProbe` asserts
+the robust claim (concentrated above the band) and carries the stronger one ("at
+chance below") as a **strict xfail** — it will force a decision the moment it
+starts passing. Commit a grouped-CV measurement with the pinned kaiser resampler
+on LJSpeech before treating Vocos's primary-analysis membership as settled.
+
+**Rejected: the uniform round trip.** Considered and rejected — recorded so it is
+not proposed again. The idea was to pass *every* condition through the same
+22050 → 24000 → 22050 round trip, so Vocos would no longer be the only condition
+with a resampler imprint. It fails because **resampling is not idempotent**: one
+kaiser round trip versus two is separable at **AUROC 0.9903**. Adding a round trip
+to the other conditions gives every condition an imprint and Vocos a *different*
+one; it does not make them path-identical. The 0.9903 is **reported, not in the
+committed artifacts** — `REJECTED_ALTERNATIVES["uniform_round_trip"]` records it
+with `in_committed_artifacts=False`, so the weakness of that evidence is visible
+in code.
+
+**Cross-validation for any paired probe must be grouped by utterance.** Shuffled
+folds split an utterance's two versions across train and test; because
+utterances differ far more than the two paths do, the classifier is
+systematically inverted — 0.14 against the grouped 0.56 on identical data.
+`TestINV18ResampleProbe.test_paired_probe_must_group_by_utterance` pins this.
+
+**Constants.** `PRIMARY_ANALYSIS`, `HIGH_BAND_ANALYSIS`, `ANALYSIS_EXCLUSIONS`,
+`REJECTED_ALTERNATIVES`, `vocoders.vocos.VOCOS_RESAMPLER`.
+
+**Enforced by.** `data.invariants.ANALYSIS_EXCLUSIONS` (each `Exclusion` carries
+its `MeasurementRef`s), `data.measurements.verify` (recomputes every cited
+statistic from `data/measurements/`), `detectors.protocols.spearman_headline`
+(refuses excluded conditions with the evidence, refuses controls by membership,
+refuses full-band rows), `detectors.protocols.refuse_excluded`,
+`metrics.spectral.high_band_distance` (refuses excluded conditions; `condition`
+is required so the refusal cannot be skipped), `data.manifest.analysis_frame`,
+`metrics.runner.evaluate_archive` (records exclusions rather than scoring them).
+Tests: `TestINV18PerAnalysisMembership` (every citation recomputed; refusals),
+`TestINV18ResampleProbe` (below/above regression; grouped CV),
+`TestINV18RejectedAlternatives`, `TestResamplerPin`, `TestMeasurementArtifacts`.
+
+---
+
 ## Repository layout
 
 ```
@@ -808,11 +951,12 @@ path.
 and call into it. Logic that lives only in a notebook is not in the
 reproducibility record.
 
-**Never pool an exempt condition into a ladder-wide number.**
-`bigvgan_v2_22khz_fullband` is generated and measured like any other condition,
-but it differs from the ladder in bandwidth by design. `spearman_headline`
-refuses it outright; use `paired_bandwidth_contrast` for the comparison it
-exists to support.
+**Membership is per analysis, and exclusions cite rows.** Filter with
+`data.manifest.analysis_frame(df, analysis)` before pooling anything. Do not add
+a condition to `ANALYSIS_EXCLUSIONS` without a `MeasurementRef` that resolves
+against `data/measurements/` — an argument is not an exclusion (INV-18). The
+paired control is refused by membership; use `paired_bandwidth_contrast` for what
+it measures.
 
 **Never compare EERs across tiers.** A 16 kHz zero-shot EER and a 22.05 kHz
 matched EER were measured on different audio. `spearman_headline` refuses a
@@ -905,6 +1049,18 @@ nudge a pipeline toward a preferred answer.
   correlation; `melgan_fullband` was deleted as a duplicate. `LADDER_FMAX` is
   unchanged at 8000. Evidence in [`docs/mel_configs.md`](docs/mel_configs.md).
 
+- **OPEN — Vocos's place in the primary analysis is not established.** It rests
+  on the resampler artifact being absent below `LADDER_FMAX`. The reported 0.502
+  is not in `data/measurements/`, and local measurements span 0.50–0.69
+  depending on configuration (INV-18). Needed: a grouped-by-utterance probe with
+  the **pinned kaiser** resampler on LJSpeech, committed as a per-file artifact.
+  `TestINV18ResampleProbe.test_probe_is_at_chance_below_the_band` is the strict
+  xfail that will force the decision.
+- **OPEN — several reported measurements are not committed.** kaiser (0.9998 /
+  0.9958), soxr_vhq (0.9936 / 1.0), one-vs-two kaiser round trips (0.9903), and
+  the band-limited probe (0.502). None backs an exclusion; two back decisions
+  (the kaiser pin's benefit, the uniform-round-trip rejection). Commit the
+  per-file features. See [`docs/measurements.md`](docs/measurements.md).
 - **Regenerate every condition.** The archive changed meaning: files produced
   under the old INV-17 are band-limited at 8 kHz and cannot be reused. Nothing
   generated before this change is valid.

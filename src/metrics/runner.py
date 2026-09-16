@@ -29,7 +29,15 @@ import pandas as pd
 from tqdm import tqdm
 
 from data.audio_io import read_processed
-from data.invariants import ARCHIVE_SR, ARCHIVE_TIER, REAL_CONDITION, ZEROSHOT_SR, ZEROSHOT_TIER
+from data.invariants import (
+    ARCHIVE_SR,
+    ARCHIVE_TIER,
+    HIGH_BAND_ANALYSIS,
+    REAL_CONDITION,
+    ZEROSHOT_SR,
+    ZEROSHOT_TIER,
+    exclusion_for,
+)
 from data.manifest import require_primary, select_tier
 
 from .f0 import f0_error
@@ -56,10 +64,18 @@ def evaluate_archive(df: pd.DataFrame, *, with_f0: bool = True) -> pd.DataFrame:
             "mcd": mcd(ref, wav, sr=ARCHIVE_SR),
         }
         rec.update(log_spectral_distance_by_band(ref, wav, sr=ARCHIVE_SR))
-        # INV-17: the band the vocoder was never told about. Reported alongside
+        # INV-17/18: the band the vocoder was never told about. Reported beside
         # the energy fraction because the right amount of energy with the wrong
         # structure is a strong detection cue an energy measure cannot see.
-        rec.update(high_band_distance(ref, wav, sr=ARCHIVE_SR))
+        # Conditions excluded from the high-band analysis are RECORDED as
+        # excluded, with the reason, rather than scored or silently dropped --
+        # a blank would read as a missing measurement.
+        exc = exclusion_for(HIGH_BAND_ANALYSIS, row.condition)
+        if exc is None:
+            rec.update(high_band_distance(ref, wav, condition=row.condition, sr=ARCHIVE_SR))
+            rec["hb_excluded"] = ""
+        else:
+            rec["hb_excluded"] = exc.reason.split(".")[0]
         if with_f0:
             rec.update(f0_error(ref, wav, sr=ARCHIVE_SR))
         rows.append(rec)

@@ -46,6 +46,7 @@ from data.audio_io import read_native, write_audio
 from data.corpus import Corpus, assign_splits
 from data.invariants import (
     ALIGNMENT_PROBE_FILES,
+    ANALYSES,
     ARCHIVE_SR,
     ARCHIVE_TIER,
     GLOBAL_SEED,
@@ -54,8 +55,7 @@ from data.invariants import (
     ZEROSHOT_SR,
     ZEROSHOT_TIER,
     InvariantViolation,
-    exclusion_reason,
-    is_correlation_excluded,
+    exclusion_for,
 )
 from data.manifest import ManifestRow, dump_provenance, write_manifest
 from data.preprocess import (
@@ -66,6 +66,7 @@ from data.preprocess import (
     finalise_reference,
     process_condition_output,
     resample_once,
+    resample_with_spec,
     would_clip,
 )
 from vocoders.registry import get_spec, get_vocoder
@@ -238,8 +239,10 @@ def build_vocoder_condition(
     archive_meter = pyln.Meter(ARCHIVE_SR)
     zs_meter = pyln.Meter(ZEROSHOT_SR)
 
-    if is_correlation_excluded(condition):
-        print(f"[INV-17] '{condition}': {exclusion_reason(condition)}")
+    for analysis in ANALYSES:
+        exc = exclusion_for(analysis, condition)
+        if exc is not None:
+            print(f"[INV-18] generated, but excluded from {exc.render()}")
     staged: list[tuple[str, np.ndarray, float, int, str, float | None]] = []
     probe_pairs: list[tuple[np.ndarray, np.ndarray]] = []
 
@@ -252,9 +255,15 @@ def build_vocoder_condition(
         # input-side path; the single sanctioned output resample (native ->
         # archive) happens below, in process_condition_output (INV-01).
         if sr_src != spec.mel.sample_rate:
-            import librosa
+            if spec.resampler is not None:
+                # INV-18: the input-side resample uses the SAME pinned resampler
+                # as the output side. Previously this called librosa.resample
+                # with no res_type at all -- neither RESAMPLE_METHOD nor a pin.
+                src = resample_with_spec(src, sr_src, spec.mel.sample_rate, spec.resampler)
+            else:
+                import librosa
 
-            src = librosa.resample(src, orig_sr=sr_src, target_sr=spec.mel.sample_rate)
+                src = librosa.resample(src, orig_sr=sr_src, target_sr=spec.mel.sample_rate)
 
         wav_native = voc.resynthesize(src, spec.mel.sample_rate)
         wav, measured, high_band = process_condition_output(
@@ -263,6 +272,7 @@ def build_vocoder_condition(
             spans[utt.utt_id],
             condition=condition,
             meter=archive_meter,
+            resampler=spec.resampler,
         )
         if would_clip(wav):
             raise InvariantViolation(
@@ -357,9 +367,10 @@ def run(
             "zeroshot_sr": ZEROSHOT_SR,
             "ladder_fmax": LADDER_FMAX,
             "archive_band": "full_band",
-            "correlation_excluded": [
-                c for c in conditions if is_correlation_excluded(c)
-            ],
+            "analysis_exclusions": {
+                a: [c for c in conditions if exclusion_for(a, c) is not None]
+                for a in ANALYSES
+            },
             "n_utterances": len(spans),
             "dropped_for_peak": sorted(dropped),
             "corpus": corpus.name,

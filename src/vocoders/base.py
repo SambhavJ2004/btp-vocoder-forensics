@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from data.invariants import ResamplerSpec
 from data.mel import MelConfig
 
 
@@ -40,10 +41,14 @@ class VocoderSpec:
     checkpoint_sha256: str = ""
     upstream_commit: str = ""
     isolated_env: bool = True   # INV-13: never co-installed with other vocoders
-    # INV-17. False for paired controls: generated and reported, but not a rung.
-    # Correlation exclusion is declared in invariants.CORRELATION_EXCLUDED, which
-    # also covers rungs excluded for other reasons (griffin_lim).
+    # INV-18. False for paired controls: generated and reported, but not a rung.
+    # Per-analysis exclusion of RUNGS (griffin_lim, vocos) is a different thing,
+    # declared with its evidence in invariants.ANALYSIS_EXCLUSIONS.
     primary_ladder: bool = True
+    # INV-01/INV-18. The pinned native->archive resampler, for a condition whose
+    # native rate differs from the archive. None means RESAMPLE_METHOD applies
+    # (a no-op for 22.05 kHz-native conditions).
+    resampler: ResamplerSpec | None = None
     notes: str = ""
 
 

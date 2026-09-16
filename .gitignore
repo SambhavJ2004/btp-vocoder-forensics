@@ -37,7 +37,14 @@ secrets/
 # These are anchored with a leading slash on purpose: an unanchored "data/"
 # also matches src/data/, which would silently exclude Person A's package.
 # ---------------------------------------------------------------------------
-/data/
+# /data/* rather than /data/: git does not descend into a directory ignored as
+# a whole, so a negation for anything inside it would silently do nothing.
+# Ignoring the CONTENTS lets the one exception below take effect while every
+# other path under data/ -- generated audio included -- stays excluded.
+/data/*
+# Measured evidence is committed: invariants cite it by row (INV-18), so it must
+# be in history rather than on someone's Kaggle scratch disk.
+!/data/measurements/
 /datasets/
 /corpora/
 /checkpoints/

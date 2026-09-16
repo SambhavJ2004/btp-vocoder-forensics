@@ -1,0 +1,24 @@
+{
+  "bigvgan_repo": "nvidia/bigvgan_v2_22khz_80band_fmax8k_256x",
+  "bigvgan_sha256": "5011c15a31a8d04fb511c1813ef4b0c2fcc0c48043f3952ce06a3b65201a5aaa",
+  "bigvgan_cfg": {
+    "sr": 22050,
+    "n_fft": 1024,
+    "hop": 256,
+    "win": 1024,
+    "n_mels": 80,
+    "fmin": 0,
+    "fmax": 8000
+  },
+  "vocos_repo": "charactr/vocos-mel-24khz",
+  "corpus_example": "/kaggle/input/datasets/mathurinache/the-lj-speech-dataset/LJSpeech-1.1/wavs/LJ001-0001.wav",
+  "corpus_files": 13100,
+  "n_measured": 60,
+  "archive_sr": 22050,
+  "ladder_fmax": 8000,
+  "rt_edge": 10900,
+  "resample_probe_auroc": {
+    "full": 1.0,
+    "high_band": 1.0
+  }
+}

@@ -18,7 +18,11 @@ produces full-band output regardless of what the mel carried. That makes
 Griffin-Lim's detectability a bandwidth artifact rather than a reconstruction
 artifact, and at the low-quality end of the ladder it would anchor a strong
 positive Spearman for a reason unrelated to the hypothesis. It is generated and
-reported; `spearman_headline` refuses it (INV-17, CORRELATION_EXCLUDED).
+reported.
+
+Superseded in part by INV-18: the cliff lives ABOVE LADDER_FMAX, so griffin_lim
+is back IN the band-limited primary correlation and excluded only from the
+high-band analysis, with the measurement cited in ANALYSIS_EXCLUSIONS.
 """
 
 from __future__ import annotations

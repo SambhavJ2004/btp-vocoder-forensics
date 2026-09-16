@@ -2,12 +2,14 @@
 
 from .alignment import AlignmentReport, assert_aligned, check_vocoder_alignment
 from .invariants import (
+    ANALYSIS_EXCLUSIONS,
     ARCHIVE_SR,
     ARCHIVE_TIER,
     CONTRACTS,
-    CORRELATION_EXCLUDED,
+    HIGH_BAND_ANALYSIS,
     LADDER_FMAX,
     LOUDNESS_TARGET_LUFS,
+    PRIMARY_ANALYSIS,
     REAL_CONDITION,
     SUBTYPE,
     ZEROSHOT_SR,
@@ -16,17 +18,19 @@ from .invariants import (
     check_band_limit,
     check_pairing,
     check_waveform,
-    exclusion_reason,
-    is_correlation_excluded,
+    exclusion_for,
+    is_excluded,
     tier_for_rate,
 )
 
 __all__ = [
     "ARCHIVE_SR",
     "ARCHIVE_TIER",
-    "CORRELATION_EXCLUDED",
+    "ANALYSIS_EXCLUSIONS",
+    "HIGH_BAND_ANALYSIS",
     "CONTRACTS",
     "LADDER_FMAX",
+    "PRIMARY_ANALYSIS",
     "LOUDNESS_TARGET_LUFS",
     "REAL_CONDITION",
     "SUBTYPE",
@@ -39,7 +43,7 @@ __all__ = [
     "check_pairing",
     "check_vocoder_alignment",
     "check_waveform",
-    "exclusion_reason",
-    "is_correlation_excluded",
+    "exclusion_for",
+    "is_excluded",
     "tier_for_rate",
 ]
