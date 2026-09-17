@@ -192,6 +192,194 @@ class TestINV04Loudness:
             check_derived_loudness(LOUDNESS_TARGET_LUFS - 6.0, where="test")
 
 
+class TestINV04LoudnessRecord:
+    """The loudness gain is recorded per file, so a real run can MEASURE the
+    full-band normaliser's effect on the band-limited primary analysis instead of
+    estimating it (CLAUDE.md, open item on per-condition gain deltas).
+
+    The loudness logic itself must not move: recording is observation only.
+    """
+
+    @staticmethod
+    def _wideband(seconds=2.0, seed=0, hb_scale=1.0, level_db=0.0):
+        """Harmonic stack carrying real LJSpeech's committed 2.02% of energy above
+        LADDER_FMAX. ``hb_scale`` then scales amplitude at and above LADDER_FMAX;
+        ``level_db`` is a broadband gain. Either alone is a controlled difference
+        from real."""
+        rng = np.random.default_rng(seed)
+        n = int(ARCHIVE_SR * seconds)
+        t = np.arange(n) / ARCHIVE_SR
+        x = sum((0.3 / k) * np.sin(2 * np.pi * 140 * k * t + rng.uniform(0, 6.28))
+                for k in range(1, 78))
+        x = x * (1 + 0.3 * np.sin(2 * np.pi * 3 * t)) + 0.01 * rng.standard_normal(n)
+        spec, f = np.fft.rfft(x), np.fft.rfftfreq(n, 1 / ARCHIVE_SR)
+        hi = f >= LADDER_FMAX
+        e_hi, e_lo = np.sum(np.abs(spec[hi]) ** 2), np.sum(np.abs(spec[~hi]) ** 2)
+        spec[hi] *= np.sqrt(0.0202 / (1 - 0.0202) * e_lo / e_hi) * hb_scale
+        x = np.fft.irfft(spec, n) * 10 ** (level_db / 20)
+        return (0.2 * x / 3.0).astype(np.float32)
+
+    # --- the logic did not change -----------------------------------------
+    def test_normalisation_is_byte_identical_to_the_unrecorded_logic(self):
+        """The pre-change implementation, inlined: one meter reading, one gain."""
+        import pyloudnorm as pyln
+
+        from data.preprocess import normalise_loudness, normalise_loudness_recorded
+
+        x = self._wideband()
+        meter = pyln.Meter(ARCHIVE_SR)
+        before = pyln.normalize.loudness(x, meter.integrated_loudness(x), LOUDNESS_TARGET_LUFS)
+        ref_wav, ref_lufs = before.astype(np.float32), float(meter.integrated_loudness(before))
+
+        wav, lufs = normalise_loudness(x)
+        rec_wav, rec = normalise_loudness_recorded(x)
+        assert np.array_equal(wav, ref_wav) and lufs == ref_lufs
+        assert np.array_equal(rec_wav, ref_wav) and rec.lufs_out == ref_lufs
+
+    def test_band_measurement_does_not_touch_the_output(self):
+        from data.preprocess import finalise_trimmed, normalise_loudness
+
+        x = self._wideband()
+        fin = finalise_trimmed(x, condition="hifigan_v1")
+        wav, lufs = normalise_loudness(x)
+        assert np.array_equal(fin.wav, wav) and fin.lufs_out == lufs
+
+    # --- what is recorded -------------------------------------------------
+    def test_recorded_gain_is_the_gain_the_file_carries(self):
+        from data.invariants import LOUDNESS_GAIN_RECORD_TOLERANCE_DB
+        from data.preprocess import finalise_trimmed
+
+        x = self._wideband()
+        rec = finalise_trimmed(x, condition="real").loudness
+        assert rec.target_lufs == LOUDNESS_TARGET_LUFS
+        assert rec.gain_db == pytest.approx(rec.target_lufs - rec.lufs_in, abs=1e-6)
+        assert abs(rec.gain_db - (rec.target_lufs - rec.lufs_in)) < (
+            LOUDNESS_GAIN_RECORD_TOLERANCE_DB
+        )
+        assert rec.lufs_out == pytest.approx(LOUDNESS_TARGET_LUFS, abs=1e-3)
+        assert np.isfinite(rec.lufs_in_band) and rec.lufs_in_band < rec.lufs_in
+
+    def test_pipeline_order_records_both_measurements_before_the_gain(self):
+        from data.invariants import PIPELINE_ORDER
+
+        i = PIPELINE_ORDER.index
+        assert i("measure_high_band") < i("measure_band_loudness") < i("normalise_loudness")
+
+    # --- the report measures the right quantity ---------------------------
+    def _frame(self, variants):
+        """Archive rows for real + each variant, from the pipeline's own records."""
+        from data.preprocess import finalise_trimmed
+
+        rows = []
+        for cond, kwargs in variants.items():
+            for seed in range(4):
+                fin = finalise_trimmed(self._wideband(seed=seed, **kwargs), condition=cond)
+                rec = fin.loudness
+                rows.append({
+                    "utt_id": f"u{seed}", "condition": cond, "tier": ARCHIVE_TIER,
+                    "high_band_fraction": fin.high_band_fraction,
+                    "lufs_in": rec.lufs_in, "loudness_gain_db": rec.gain_db,
+                    "loudness_target_lufs": rec.target_lufs, "lufs_in_band": rec.lufs_in_band,
+                })
+        return pd.DataFrame(rows)
+
+    def test_a_quieter_condition_has_a_gain_delta_but_no_in_band_offset(self):
+        """Why the report carries band_offset_db and not only gain_delta_db: the
+        full-band normaliser is SUPPOSED to equalise a plain level difference, and
+        that part never reaches the primary analysis."""
+        from data.manifest import loudness_gain_report
+
+        df = self._frame({"real": {}, "hifigan_v1": {"level_db": -1.0}})
+        r = loudness_gain_report(df).set_index("condition").loc["hifigan_v1"]
+        assert r["gain_delta_db_mean"] == pytest.approx(1.0, abs=1e-3)
+        assert abs(r["band_offset_db_mean"]) < 1e-3
+
+    def test_a_high_band_deficit_lands_inside_the_band(self):
+        """The coupling itself: less energy above LADDER_FMAX -> larger gain -> the
+        whole band-limited signal sits higher than real's, by the same amount."""
+        from data.manifest import loudness_gain_report
+
+        df = self._frame({"real": {}, "hifigan_v1": {"hb_scale": np.sqrt(0.8)}})
+        r = loudness_gain_report(df).set_index("condition").loc["hifigan_v1"]
+        # ~0.04 dB: the size estimated for BigVGAN, whose ratio to real is 0.8055.
+        assert 0.02 < r["gain_delta_db_mean"] < 0.06
+        assert r["band_offset_db_mean"] == pytest.approx(r["gain_delta_db_mean"], rel=0.01)
+        assert r["high_band_fraction_delta_mean"] < 0
+        assert r["n"] == 4 and r["gain_delta_db_std"] >= 0
+
+    def test_report_refuses_unpaired_conditions(self):
+        from data.manifest import loudness_gain_report
+
+        df = self._frame({"real": {}, "hifigan_v1": {}})
+        df = df[~((df["condition"] == "hifigan_v1") & (df["utt_id"] == "u0"))]
+        with pytest.raises(InvariantViolation, match="INV-06"):
+            loudness_gain_report(df)
+
+    def test_report_refuses_a_manifest_without_the_record(self):
+        from data.manifest import loudness_gain_report
+
+        df = self._frame({"real": {}, "hifigan_v1": {}}).drop(columns=["lufs_in_band"])
+        with pytest.raises(InvariantViolation, match="INV-04"):
+            loudness_gain_report(df)
+
+    # --- the manifest gate --------------------------------------------------
+    def test_valid_manifest_records_the_gain(self):
+        from data.manifest import validate_manifest
+
+        validate_manifest(_manifest_frame())
+
+    def test_archive_row_without_a_gain_is_rejected(self):
+        from data.manifest import validate_manifest
+
+        df = _manifest_frame()
+        df.loc[(df["tier"] == ARCHIVE_TIER) & (df["condition"] == "hifigan_v1"),
+               "loudness_gain_db"] = np.nan
+        with pytest.raises(InvariantViolation, match="INV-04.*hifigan_v1"):
+            validate_manifest(df)
+
+    def test_gain_that_is_not_target_minus_input_is_rejected(self):
+        from data.manifest import validate_manifest
+
+        df = _manifest_frame()
+        df.loc[df["tier"] == ARCHIVE_TIER, "loudness_gain_db"] += 0.5
+        with pytest.raises(InvariantViolation, match="INV-04.*target - lufs_in"):
+            validate_manifest(df)
+
+    def test_wrong_target_is_rejected(self):
+        from data.manifest import validate_manifest
+
+        df = _manifest_frame()
+        df.loc[df["tier"] == ARCHIVE_TIER, "loudness_target_lufs"] = -23.0
+        with pytest.raises(InvariantViolation, match="INV-04.*target"):
+            validate_manifest(df)
+
+    def test_derived_row_with_a_gain_is_a_second_gain_stage(self):
+        from data.manifest import validate_manifest
+
+        df = _manifest_frame()
+        df.loc[df["tier"] == ZEROSHOT_TIER, "loudness_gain_db"] = 1.0
+        with pytest.raises(InvariantViolation, match="INV-01.*re-normalised"):
+            validate_manifest(df)
+
+    def test_manifest_without_the_columns_is_rejected(self):
+        from data.manifest import validate_manifest
+
+        with pytest.raises(InvariantViolation, match="INV-04"):
+            validate_manifest(_manifest_frame().drop(columns=["lufs_in"]))
+
+    def test_cli_writes_the_report(self, tmp_path):
+        from data.manifest import MANIFEST_COLUMNS
+        from experiments.cli import main
+
+        path = tmp_path / "m.csv"
+        _manifest_frame().reindex(columns=list(MANIFEST_COLUMNS)).to_csv(path, index=False)
+        out = tmp_path / "loudness.csv"
+        assert main(["loudness", "--manifest", str(path), "--out", str(out)]) == 0
+        report = pd.read_csv(out)
+        assert list(report["condition"]) == ["hifigan_v1"]
+        assert report["n"].iloc[0] == 3
+
+
 class TestINV05Encoding:
     def test_non_finite_rejected(self):
         wav = _quiet_tone()
@@ -499,6 +687,11 @@ def _manifest_frame(**overrides) -> pd.DataFrame:
                         "archive_band_hz": ARCHIVE_SR / 2.0,
                         "archive_band": "full_band",
                         "high_band_fraction": 0.015,
+                        # INV-04: the normaliser's record, archive rows only.
+                        "lufs_in": -30.0 if not derived else np.nan,
+                        "loudness_gain_db": 3.0 if not derived else np.nan,
+                        "loudness_target_lufs": LOUDNESS_TARGET_LUFS if not derived else np.nan,
+                        "lufs_in_band": -30.2 if not derived else np.nan,
                         "vocoder_checkpoint": "", "vocoder_commit": "", "seed": 1,
                     }
                 )
@@ -802,7 +995,7 @@ class TestINV17FullBandArchive:
 
         wav = self._wideband(2.0)
         span = TrimSpan(utt_id="u", start=0, end=len(wav), ref_length=len(wav))
-        out, _, high_band = process_condition_output(
+        out, _, high_band, _ = process_condition_output(
             wav, ARCHIVE_SR, span, condition="hifigan_v1"
         )
         measured = out_of_band_energy(out, ARCHIVE_SR, LADDER_FMAX)
@@ -818,7 +1011,7 @@ class TestINV17FullBandArchive:
 
         wav = self._wideband(2.0)
         span = TrimSpan(utt_id="u", start=0, end=len(wav), ref_length=len(wav))
-        _, _, high_band = finalise_reference(wav, span)
+        _, _, high_band, _ = finalise_reference(wav, span)
         assert high_band is not None and high_band > 0.1
 
     def test_pipeline_order_has_no_band_limit_step(self):
@@ -1695,10 +1888,10 @@ class TestINV07SingleOrdering:
             wav = self._speechlike(seed=seed)
             span = derive_trim_span(wav, f"u{seed}")
 
-            ref_wav, ref_lufs, ref_oob = finalise_reference(
+            ref_wav, ref_lufs, ref_oob, ref_loud = finalise_reference(
                 wav, span, condition="hifigan_v1"
             )
-            voc_wav, voc_lufs, voc_oob = process_condition_output(
+            voc_wav, voc_lufs, voc_oob, voc_loud = process_condition_output(
                 wav, ARCHIVE_SR, span, condition="hifigan_v1"
             )
 
@@ -1708,6 +1901,7 @@ class TestINV07SingleOrdering:
             )
             assert ref_lufs == voc_lufs
             assert ref_oob == voc_oob
+            assert ref_loud == voc_loud, "the recorded gain diverged between entry points"
 
     def test_control_condition_also_agrees(self):
         """Every condition runs the identical pipeline now -- INV-17 no longer
@@ -1722,10 +1916,10 @@ class TestINV07SingleOrdering:
         span = derive_trim_span(wav, "u7")
         cond = "bigvgan_v2_22khz_fullband"
 
-        a, la, ha = finalise_reference(wav, span, condition=cond)
-        b, lb, hb = process_condition_output(wav, ARCHIVE_SR, span, condition=cond)
+        a, la, ha, ra = finalise_reference(wav, span, condition=cond)
+        b, lb, hb, rb = process_condition_output(wav, ARCHIVE_SR, span, condition=cond)
         assert np.array_equal(a, b)
-        assert la == lb and ha == hb
+        assert la == lb and ha == hb and ra == rb
 
     def test_phase_a_real_and_identity_vocoder_produce_identical_files(
         self, tmp_path, monkeypatch
@@ -1796,6 +1990,20 @@ class TestINV07SingleOrdering:
             )
             n += 1
         assert n >= 15
+
+        # INV-04: the manifest Phase A wrote records the gain on archive rows
+        # only, and an identity vocoder received exactly real's gain.
+        from data.manifest import _validate_loudness_record, loudness_gain_report
+
+        manifest = pd.DataFrame([r.to_dict() for r in rows + cond_rows])
+        _validate_loudness_record(manifest)
+        archive = manifest[manifest["tier"] == "archive"]
+        assert archive[["lufs_in", "loudness_gain_db", "lufs_in_band"]].notna().all().all()
+        assert manifest[manifest["tier"] == "zeroshot"]["loudness_gain_db"].isna().all()
+        report = loudness_gain_report(manifest).set_index("condition").loc["hifigan_v1"]
+        assert report["n"] == n
+        assert report["gain_delta_db_mean"] == 0.0 and report["gain_delta_db_std"] == 0.0
+        assert report["band_offset_db_mean"] == 0.0
 
 
 class TestINV09FailsClosedOnSpeakers:

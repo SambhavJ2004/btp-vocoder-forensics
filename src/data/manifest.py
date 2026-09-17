@@ -15,6 +15,16 @@ Manifest columns exist to answer specific questions:
   - ``trim_*``       : INV-03. Proves every condition used the reference span.
   - ``lufs_out``     : INV-04. Proves loudness landed on target (archive), and
                        records the band-limiting drift (derived).
+  - ``lufs_in`` / ``loudness_gain_db`` / ``loudness_target_lufs``
+                     : INV-04, archive rows. What the normaliser measured, the
+                       gain it applied, and the target. Normalisation is
+                       full-band, so a condition with less high-band energy is
+                       given a larger gain; recording it makes that measurable.
+                       NaN on derived rows, which are never re-normalised.
+  - ``lufs_in_band`` : INV-04, archive rows. Pre-normalisation loudness on the
+                       analysis band. Recorded, never used for the gain. With
+                       the gain it gives the in-band level the primary analysis
+                       sees, which is what loudness_gain_report compares.
   - ``split``        : INV-09. Frozen once, shared across conditions and tiers.
   - ``alignment_*``  : INV-16. Proves the vocoder is sample-aligned.
   - ``archive_band_hz`` / ``archive_band``
@@ -42,7 +52,11 @@ from .invariants import (
     ANALYSES,
     ARCHIVE_SR,
     ARCHIVE_TIER,
+    LOUDNESS_GAIN_RECORD_TOLERANCE_DB,
+    LOUDNESS_PROBE_RESOLUTION_DB,
+    LOUDNESS_TARGET_LUFS,
     MAX_RESAMPLE_STEPS,
+    PRIMARY_ANALYSIS,
     REAL_CONDITION,
     SANCTIONED_RATES,
     SUBTYPE,
@@ -70,6 +84,10 @@ MANIFEST_COLUMNS: tuple[str, ...] = (
     "subtype",
     "duration_s",
     "lufs_out",
+    "lufs_in",
+    "loudness_gain_db",
+    "loudness_target_lufs",
+    "lufs_in_band",
     "trim_start",
     "trim_end",
     "trim_ref_length",
@@ -124,6 +142,12 @@ class ManifestRow:
     archive_band_hz: float = ARCHIVE_SR / 2.0
     archive_band: str = "full_band"
     high_band_fraction: float | None = None
+    # INV-04, archive rows only: the normaliser's input, gain and target, and the
+    # pre-normalisation loudness on the analysis band. None on derived rows.
+    lufs_in: float | None = None
+    loudness_gain_db: float | None = None
+    loudness_target_lufs: float | None = None
+    lufs_in_band: float | None = None
     vocoder_checkpoint: str | None = None
     vocoder_commit: str | None = None
     seed: int | None = None
@@ -292,6 +316,9 @@ def validate_manifest(df: pd.DataFrame, *, require_zeroshot: bool = False) -> No
     # --- INV-17: the ladder band ---
     _validate_band(df)
 
+    # --- INV-04: the recorded loudness gain ---
+    _validate_loudness_record(df)
+
     # --- INV-16: sample alignment, per vocoder condition ---
     for cond, group in df[df["condition"] != REAL_CONDITION].groupby("condition"):
         if not group["alignment_checked"].astype(bool).all():
@@ -349,6 +376,141 @@ def _validate_band(df: pd.DataFrame) -> None:
             "the evidence that distinguishes a genuine bandwidth zero from a "
             "vocoder tracking real, and is measured during Phase A."
         )
+
+
+_LOUDNESS_RECORD = ("lufs_in", "loudness_gain_db", "loudness_target_lufs", "lufs_in_band")
+
+
+def _validate_loudness_record(df: pd.DataFrame) -> None:
+    """INV-04. Every archive row records its gain; no derived row has one.
+
+    Evidence, like high_band_fraction: gated on being present and internally
+    consistent, never on its value. A derived row carrying a gain would mean the
+    16 kHz tier was re-normalised -- a second gain stage proportional to
+    high-band content, which INV-01 forbids.
+    """
+    absent = [c for c in _LOUDNESS_RECORD if c not in df.columns]
+    if absent:
+        raise InvariantViolation(
+            f"INV-04: manifest has no {absent} columns. Regenerate it with a Phase A "
+            "that records the loudness gain."
+        )
+    archive = df[df["tier"] == ARCHIVE_TIER]
+    if not archive.empty:
+        rec = archive[list(_LOUDNESS_RECORD)].apply(pd.to_numeric, errors="coerce")
+        missing = rec.isna().any(axis=1)
+        if missing.any():
+            conds = sorted(set(archive[missing]["condition"]))
+            raise InvariantViolation(
+                f"INV-04: archive rows for {conds} do not record the loudness gain "
+                f"({', '.join(_LOUDNESS_RECORD)}). Without it the gain each condition "
+                "received is an estimate, and the full-band normaliser's effect on "
+                "the band-limited primary analysis cannot be measured."
+            )
+        if (rec["loudness_target_lufs"] != LOUDNESS_TARGET_LUFS).any():
+            raise InvariantViolation(
+                f"INV-04: archive rows record targets "
+                f"{sorted(set(rec['loudness_target_lufs']))}, expected "
+                f"{LOUDNESS_TARGET_LUFS} LUFS for every condition."
+            )
+        implied = rec["loudness_target_lufs"] - rec["lufs_in"]
+        off = (rec["loudness_gain_db"] - implied).abs() > LOUDNESS_GAIN_RECORD_TOLERANCE_DB
+        if off.any():
+            raise InvariantViolation(
+                f"INV-04: {int(off.sum())} archive rows record a gain that is not "
+                "target - lufs_in. Normalisation is one gain to one target; anything "
+                "else means a second gain stage or a mis-recorded row."
+            )
+    derived = df[df["tier"] != ARCHIVE_TIER]
+    gain_cols = ["lufs_in", "loudness_gain_db", "loudness_target_lufs"]
+    if not derived.empty and derived[gain_cols].notna().any().any():
+        raise InvariantViolation(
+            "INV-01: derived rows record a loudness gain. The 16 kHz tier is never "
+            "re-normalised: doing so applies a gain proportional to each file's "
+            "high-band energy."
+        )
+
+
+def _spread(values: pd.Series, prefix: str) -> dict:
+    v = values.astype(float)
+    return {
+        f"{prefix}_mean": v.mean(),
+        f"{prefix}_std": v.std(ddof=1) if len(v) > 1 else float("nan"),
+        f"{prefix}_p05": v.quantile(0.05),
+        f"{prefix}_median": v.median(),
+        f"{prefix}_p95": v.quantile(0.95),
+    }
+
+
+def loudness_gain_report(df: pd.DataFrame) -> pd.DataFrame:
+    """INV-04 / INV-18. Each condition's loudness gain against real, per utterance.
+
+    Archive tier only -- the only tier that is normalised. For every condition
+    and every utterance it pairs with real (INV-06), two deltas, each summarised
+    with n and spread rather than a bare mean:
+
+      ``gain_delta_db``    the gain this condition received minus real's.
+                           Mixes two things: level differences the full-band
+                           normaliser is meant to equalise, and the part driven
+                           by high-band energy.
+      ``band_offset_db``   the in-band level after normalisation minus real's,
+                           ``(lufs_in_band + gain)`` differenced. The level
+                           offset the band-limited primary analysis actually
+                           sees. A condition that is simply quieter than real
+                           has a large gain delta and a ~0 band offset; one that
+                           only lacks high-band energy has the two equal.
+
+    ``band_offset_x_resolution`` is the mean band offset in units of
+    LOUDNESS_PROBE_RESOLUTION_DB, the smallest uniform offset the committed
+    linear probe resolves. Context, not a verdict: a stronger detector could
+    resolve less.
+    """
+    archive = select_tier(df, ARCHIVE_TIER)
+    need = ["utt_id", "condition", "high_band_fraction", *_LOUDNESS_RECORD]
+    missing = [c for c in need if c not in archive.columns]
+    if missing:
+        raise InvariantViolation(
+            f"INV-04: manifest lacks {missing}; regenerate it with a Phase A that "
+            "records the loudness gain."
+        )
+    real = archive[archive["condition"] == REAL_CONDITION].set_index("utt_id")
+    if real.empty:
+        raise InvariantViolation("INV-06: no real rows to measure gain deltas against.")
+
+    def in_band_level(frame: pd.DataFrame) -> pd.Series:
+        return frame["lufs_in_band"].astype(float) + frame["loudness_gain_db"].astype(float)
+
+    from vocoders.registry import CONTROL_CONDITIONS
+
+    rows = []
+    for cond, g in archive.groupby("condition"):
+        if cond == REAL_CONDITION:
+            continue
+        g = g.set_index("utt_id")
+        if set(g.index) != set(real.index):
+            raise InvariantViolation(
+                f"INV-06: '{cond}' does not hold exactly real's utterances; a gain "
+                "delta over different utterances is not a delta."
+            )
+        r = real.loc[g.index]
+        gain = g["loudness_gain_db"].astype(float) - r["loudness_gain_db"].astype(float)
+        band = in_band_level(g) - in_band_level(r)
+        hb = g["high_band_fraction"].astype(float) - r["high_band_fraction"].astype(float)
+        rows.append(
+            {
+                "condition": cond,
+                "n": len(g),
+                **_spread(gain, "gain_delta_db"),
+                **_spread(band, "band_offset_db"),
+                "band_offset_x_resolution": abs(band.mean()) / LOUDNESS_PROBE_RESOLUTION_DB,
+                "high_band_fraction_delta_mean": hb.mean(),
+                "in_primary_analysis": (
+                    not is_excluded(PRIMARY_ANALYSIS, str(cond))
+                    and cond not in CONTROL_CONDITIONS
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def mel_config_table(df: pd.DataFrame) -> pd.DataFrame:

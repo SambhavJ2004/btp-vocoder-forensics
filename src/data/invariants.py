@@ -83,6 +83,19 @@ LOUDNESS_TOLERANCE_LU: Final[float] = 0.5  # verification tolerance, not a knob
 # which is precisely the artifact under study. See CLAUDE.md INV-01.
 DERIVED_LOUDNESS_DRIFT_LIMIT_LU: Final[float] = 2.0
 
+# INV-04, made observable. Every archive manifest row records the loudness the
+# normaliser measured, the gain it applied and the target, so the gain each
+# condition received is a recorded fact rather than an estimate. The recorded
+# gain is measured from the arrays and must equal target - lufs_in to within
+# this; anything more means the normaliser did something other than one gain.
+LOUDNESS_GAIN_RECORD_TOLERANCE_DB: Final[float] = 1e-3
+
+# The smallest uniform level offset the committed linear probe resolves: lbfgs
+# stays at zero while 0.25 * shift < tol (1e-4), i.e. ~0.0035 dB for natural-log
+# magnitude features (~0.008 dB for log10). Context for reading the loudness
+# report, NOT a gate -- a stronger detector could resolve less. See INV-18.
+LOUDNESS_PROBE_RESOLUTION_DB: Final[float] = 0.0035
+
 # --- INV-17  Analysis band (NOT a generation-time filter) --------------------
 # The audited mel `fmax` of every condition, transcribed from the checkpoint's
 # OWN config. Source for each row: docs/mel_configs.md. This is the single
@@ -603,7 +616,8 @@ PIPELINE_ORDER: Final[tuple[str, ...]] = (
     "align_length",        # -> reference length            (INV-06)
     "apply_ref_trim",      # -> reference trim boundaries   (INV-03)
     "measure_high_band",   # -> recorded, NOT filtered      (INV-17)
-    "normalise_loudness",  # -> LOUDNESS_TARGET_LUFS        (INV-04)
+    "measure_band_loudness",  # -> recorded, NOT used for gain (INV-04)
+    "normalise_loudness",  # -> LOUDNESS_TARGET_LUFS, gain recorded (INV-04)
     "encode",              # -> WAV / PCM_16                (INV-05)
 )
 

@@ -294,6 +294,27 @@ and `_emit_pair` deliberately omits it for the derived tier, which is not
 re-normalised and legitimately drifts; that tier is bounded instead by
 `check_derived_loudness`), `experiments.sanity_checks.loudness_probe`.
 
+**The gain is recorded, not just its result.** Normalisation runs on the full
+band, so the gain a file receives depends on its high-band energy as well as its
+level (INV-18, and the open item on per-condition gain deltas). Every archive
+manifest row records four values:
+
+- `lufs_in`, what the normaliser measured;
+- `loudness_gain_db`, the gain the written file carries, measured from the arrays;
+- `loudness_target_lufs`;
+- `lufs_in_band`, the same pre-normalisation measurement on the analysis band.
+
+The last one is recorded and never used for the gain. Derived rows record none of
+them, because they are never normalised.
+`data.preprocess.normalise_loudness_recorded` is the single implementation, and
+`normalise_loudness` is it with the record dropped. Recording does not change the
+arrays: `TestINV04LoudnessRecord` checks the output byte for byte against the
+unrecorded logic. `data.manifest._validate_loudness_record` gates on the record
+being present on archive rows, equal to `target − lufs_in` within
+`LOUDNESS_GAIN_RECORD_TOLERANCE_DB`, and absent on derived rows. It never gates on
+the value. `data.manifest.loudness_gain_report` (`btpvf loudness`) turns the
+record into per-condition deltas against real.
+
 ---
 
 ### INV-05 — Encoding: one container, one bit depth, everywhere
@@ -355,7 +376,8 @@ generation, so the exception is gone and INV-07's original "no exceptions"
 wording is literally true again.
 
 **Enforced by.** `data.preprocess.finalise_trimmed` is the **single
-implementation** of the post-trim ordering (band-limit → loudness). It is
+implementation** of the post-trim ordering (measure high band → measure band
+loudness → normalise loudness; the two measurements are recorded, never applied). It is
 reached through two thin entry points that differ only in what they do *before*
 the trim, which is the only thing that genuinely differs between conditions:
 
@@ -1204,24 +1226,39 @@ nudge a pipeline toward a preferred answer.
   the two-edge design (INV-17): −1 dB at cutoff − 85 Hz, ≤ −200 dB at and above
   the cutoff, order 31–60. Analysis-time only; no regeneration.
 - **OPEN — the loudness coupling is not specific to resamplers (estimated, not
-  measured).** Loudness is normalised on the full band, so every condition with
-  less high-band energy than real gets a larger gain, and so a below-band level
-  offset in the band-limited primary analysis. Scaling from the committed
+  yet measured).** Loudness is normalised on the full band, so every condition
+  with less high-band energy than real gets a larger gain, and so a below-band
+  level offset in the band-limited primary analysis. Scaling from the committed
   `_norm` deltas (7.4–9.8 dB per unit of total energy removed above
-  `LADDER_FMAX`) gives about 0.03–0.04 dB for BigVGAN and Vocos (CSV high-band
-  ratios 0.8055 and 0.8040; the Vocos row predates the pin). That is the size
-  at which the default resampler's coupling *was* detected. It gives about
-  0.15–0.20 dB for Griffin-Lim, a trace of
-  the cliff INV-18 relies on the band limit to remove. The manifest records
-  `lufs_out` but not the gain applied, so none of this can be read back from
-  Phase A.
-  Needed, in order:
-  1. Record the pre-normalisation loudness per file.
-  2. Measure the per-condition gain delta against real.
-  3. Only then decide whether the primary analysis needs level matching on the
-     band-limited signal. That would be an analysis-time transform like the band
-     limit itself, and a change to INV-04 / INV-07 to be made deliberately, not
-     patched in. See [`docs/measurements.md`](docs/measurements.md).
+  `LADDER_FMAX`) gives these estimates:
+  - about 0.03–0.04 dB for BigVGAN and Vocos (CSV high-band ratios 0.8055 and
+    0.8040; the Vocos row predates the pin). That is the size at which the
+    default resampler's coupling *was* detected.
+  - about 0.15–0.20 dB for Griffin-Lim, a trace of the cliff INV-18 relies on the
+    band limit to remove.
+
+  The committed linear probe's resolution is about 0.0035 dB.
+
+  **Instrumented, not yet run.** Phase A now records the loudness gain on every
+  archive row (INV-04), and `btpvf loudness --manifest ...` reports, per
+  condition against real and per utterance, with n and spread:
+  - `gain_delta_db`, the gain difference;
+  - `band_offset_db`, the in-band level difference after normalisation, which is
+    what the primary analysis sees.
+
+  The second one decides this item. A gain delta also contains plain level
+  differences that full-band normalisation is *meant* to remove, and those never
+  reach the band. A condition that is only 1 dB quieter shows a 1 dB gain delta
+  and a zero band offset. On synthetic audio carrying real's 2% high band, a 20%
+  deficit gives a 0.044 dB band offset and a total loss gives 0.22 dB
+  (`TestINV04LoudnessRecord`).
+
+  **Closes when** a real Phase A run on LJSpeech reports measured gain deltas
+  per condition, with the in-band offset and its per-utterance spread. The
+  decision is then made on those numbers: leave loudness as it is, or level-match
+  the band-limited comparison set at analysis time. The second would be a
+  deliberate change to INV-04 / INV-07, not a patch. Until then, nothing about
+  the loudness logic changes. See [`docs/measurements.md`](docs/measurements.md).
 - **Regenerate every condition.** The archive changed meaning: files produced
   under the old INV-17 are band-limited at 8 kHz and cannot be reused. Nothing
   generated before this change is valid.

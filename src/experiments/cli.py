@@ -6,6 +6,7 @@ Usage:
     btpvf validate --manifest ...     # manifest-level invariant gate
     btpvf sanity   --manifest ...     # confound-leakage probes, both tiers
     btpvf provenance --manifest ...   # INV-01 derivation paths per tier
+    btpvf loudness --manifest ...     # INV-04 gain delta and in-band offset vs real
     btpvf quality  --manifest ...     # Phase B, X-axis
     btpvf plot     --quality ... --detection ...
 """
@@ -35,6 +36,10 @@ def main(argv: list[str] | None = None) -> int:
 
     pr = sub.add_parser("provenance", help="INV-01 derivation paths and mel configs")
     pr.add_argument("--manifest", required=True)
+
+    ld = sub.add_parser("loudness", help="INV-04: per-condition loudness gain vs real")
+    ld.add_argument("--manifest", required=True)
+    ld.add_argument("--out", default="results/loudness_gain.csv")
 
     s = sub.add_parser("sanity", help="confound-leakage probes")
     s.add_argument("--manifest", required=True)
@@ -92,6 +97,15 @@ def main(argv: list[str] | None = None) -> int:
         print(band_report(df).to_string(index=False))
         print()
         print(mel_config_table(df).to_string(index=False))
+        return 0
+
+    if args.cmd == "loudness":
+        from data.manifest import loudness_gain_report, read_manifest
+
+        report = loudness_gain_report(read_manifest(args.manifest))
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        report.to_csv(args.out, index=False)
+        print(report.to_string(index=False))
         return 0
 
     if args.cmd == "sanity":

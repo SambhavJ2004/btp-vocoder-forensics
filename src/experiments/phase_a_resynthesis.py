@@ -59,6 +59,7 @@ from data.invariants import (
 )
 from data.manifest import ManifestRow, dump_provenance, write_manifest
 from data.preprocess import (
+    LoudnessRecord,
     TrimSpan,
     archive_band_spec,
     derive_trim_span,
@@ -121,8 +122,24 @@ def _rows_for(
     commit: str | None = None,
     alignment_lag: int | None = None,
     high_band: float | None = None,
+    loudness: LoudnessRecord | None = None,
 ) -> list[ManifestRow]:
-    """One archive row plus its derived zero-shot row, both fully provenanced."""
+    """One archive row plus its derived zero-shot row, both fully provenanced.
+
+    The loudness record goes on the archive row only: the derived row was never
+    normalised, and recording a gain there would claim a gain stage that did not
+    happen.
+    """
+    gain_fields = (
+        dict(
+            lufs_in=loudness.lufs_in,
+            loudness_gain_db=loudness.gain_db,
+            loudness_target_lufs=loudness.target_lufs,
+            lufs_in_band=loudness.lufs_in_band,
+        )
+        if loudness is not None
+        else {}
+    )
     band_hz, band_name = archive_band_spec()
     common = dict(
         utt_id=utt_id,
@@ -153,6 +170,7 @@ def _rows_for(
             duration_s=n_archive / ARCHIVE_SR,
             lufs_out=lufs_archive,
             high_band_fraction=high_band,
+            **gain_fields,
             **common,
         ),
         ManifestRow(
@@ -196,7 +214,9 @@ def build_real_condition(
         # vocoder condition. Real is the reference every span and pairing
         # derives from, so a divergence here would move every condition against
         # real at once. The equivalence is asserted by test, not assumed.
-        norm, measured, high_band = finalise_reference(wav, span, meter=archive_meter)
+        norm, measured, high_band, loudness = finalise_reference(
+            wav, span, meter=archive_meter
+        )
 
         if would_clip(norm):
             dropped.add(utt.utt_id)
@@ -211,7 +231,7 @@ def build_real_condition(
             _rows_for(
                 utt.utt_id, REAL_CONDITION, utt.speaker, splits[utt.utt_id], span,
                 archive_path, zs_path, len(norm), n_zs, measured, lufs_zs, sr_native,
-                high_band=high_band,
+                high_band=high_band, loudness=loudness,
             )
         )
     return rows, spans, real_archive, dropped
@@ -243,7 +263,9 @@ def build_vocoder_condition(
         exc = exclusion_for(analysis, condition)
         if exc is not None:
             print(f"[INV-18] generated, but excluded from {exc.render()}")
-    staged: list[tuple[str, np.ndarray, float, int, str, float | None]] = []
+    staged: list[
+        tuple[str, np.ndarray, float, int, str, float | None, LoudnessRecord]
+    ] = []
     probe_pairs: list[tuple[np.ndarray, np.ndarray]] = []
 
     for utt in tqdm(corpus.utterances(), desc=condition):
@@ -266,7 +288,7 @@ def build_vocoder_condition(
                 src = librosa.resample(src, orig_sr=sr_src, target_sr=spec.mel.sample_rate)
 
         wav_native = voc.resynthesize(src, spec.mel.sample_rate)
-        wav, measured, high_band = process_condition_output(
+        wav, measured, high_band, loudness = process_condition_output(
             wav_native,
             spec.mel.sample_rate,
             spans[utt.utt_id],
@@ -280,7 +302,9 @@ def build_vocoder_condition(
                 "Add the utterance to the global drop list and regenerate every "
                 "condition without it -- do not attenuate this one file."
             )
-        staged.append((utt.utt_id, wav, measured, len(wav), utt.speaker, high_band))
+        staged.append(
+            (utt.utt_id, wav, measured, len(wav), utt.speaker, high_band, loudness)
+        )
         if len(probe_pairs) < ALIGNMENT_PROBE_FILES:
             probe_pairs.append((real_archive[utt.utt_id], wav))
 
@@ -291,7 +315,7 @@ def build_vocoder_condition(
     assert_aligned(report)
 
     rows: list[ManifestRow] = []
-    for utt_id, wav, measured, n_archive, speaker, high_band in staged:
+    for utt_id, wav, measured, n_archive, speaker, high_band, loudness in staged:
         archive_path, zs_path, lufs_zs, n_zs = _emit_pair(
             wav, measured, out_dir, condition, utt_id, zs_meter
         )
@@ -305,6 +329,7 @@ def build_vocoder_condition(
                 commit=spec.upstream_commit,
                 alignment_lag=report.peak_lag,
                 high_band=high_band,
+                loudness=loudness,
             )
         )
     return rows, report

@@ -281,9 +281,38 @@ above-band-driven part:
 
 If these hold, the band-limited primary analysis carries a projection of each
 condition's above-band deficit as a level offset. That is the mechanism INV-18
-relies on the band limit to remove, including a trace of Griffin-Lim's cliff. The
-manifest records `lufs_out` but not the gain applied, so the per-condition deltas
-cannot be read back from Phase A today. This is an open item in CLAUDE.md.
+relies on the band limit to remove, including a trace of Griffin-Lim's cliff.
+This is an open item in CLAUDE.md.
+
+**Instrumented for the next Phase A run.** Every archive manifest row now records
+the normaliser's input (`lufs_in`), the gain the file carries
+(`loudness_gain_db`), the target (`loudness_target_lufs`), and the
+pre-normalisation loudness on the analysis band (`lufs_in_band`), which is
+recorded and never used. `btpvf loudness --manifest ...`
+(`data.manifest.loudness_gain_report`) reports two paired deltas for each
+condition against real, each with n, mean, std, 5th/50th/95th percentiles:
+
+| column | what it is | reaches the primary analysis? |
+|---|---|---|
+| `gain_delta_db` | gain received minus real's | only partly — it includes plain level differences the normaliser is meant to remove |
+| `band_offset_db` | `(lufs_in_band + gain)` minus real's: the in-band level after normalisation | **yes** — this is the offset the band-limited analysis sees |
+
+The report also gives `band_offset_x_resolution`, the mean offset in units of the
+committed probe's ~0.0035 dB resolution, and the mean `high_band_fraction` delta
+alongside.
+
+The two deltas separate cleanly on controlled synthetic audio carrying real's
+2.02% high band (`TestINV04LoudnessRecord`, pipeline records):
+
+| difference from real | `gain_delta_db` | `band_offset_db` |
+|---|---|---|
+| 1 dB quieter, identical spectrum | 1.00000 | 0.00000 |
+| 20% less energy above `LADDER_FMAX` | 0.04375 | 0.04375 |
+| no energy above `LADDER_FMAX` | 0.22331 | 0.22331 |
+
+These synthetic magnitudes sit near the estimates above (0.03–0.04 and
+0.15–0.20 dB), slightly higher. They are not measurements of the ladder. The
+ladder's numbers come from the next real Phase A run.
 
 ### Normalisation and the high-band evidence
 
