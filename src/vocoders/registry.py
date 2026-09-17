@@ -71,9 +71,21 @@ UNAVAILABLE: tuple[str, ...] = tuple(sorted(UNAVAILABLE_CONDITIONS))
 # Everything Phase A generates.
 ALL_CONDITIONS: tuple[str, ...] = LADDER + CONTROL_CONDITIONS
 
-# Conditions shipped in the throwaway v0 dataset (week two) so that Persons B
-# and C can build their pipelines while the full set is still generating.
-V0_CONDITIONS: tuple[str, ...] = ("griffin_lim", "hifigan_v1")
+# Conditions shipped in the throwaway v0 dataset so that Persons B and C can
+# build their pipelines while the full set is still generating. Was
+# ("griffin_lim", "hifigan_v1"); hifigan_v1 is blocked on manual weight sourcing,
+# so v0 is the three conditions that are runnable today.
+V0_CONDITIONS: tuple[str, ...] = ("griffin_lim", "bigvgan_112m", "vocos")
+
+# INV-13 exception, stated rather than assumed. The invariant says one vocoder
+# per environment because dependency trees conflict. bigvgan_112m and vocos were
+# REPORTED by the team to coexist in one environment in testing; that is not a
+# measurement this repository made. Only this set may share a Phase A process
+# (experiments.phase_a_resynthesis.preflight refuses any other combination of
+# neural conditions), and every run records the package versions it actually
+# ran with, so the claim is checkable after the fact. griffin_lim has no
+# dependencies of its own and is always shareable.
+SHARED_ENV_REPORTED: frozenset[str] = frozenset({"griffin_lim", "bigvgan_112m", "vocos"})
 
 SPECS: dict[str, VocoderSpec] = {
     "griffin_lim": GRIFFIN_LIM_SPEC,

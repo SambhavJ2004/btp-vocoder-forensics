@@ -31,10 +31,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from data.invariants import MeasurementRef, ResamplerSpec
-from data.mel import VOCOS_MEL
+from data.invariants import InvariantViolation, MeasurementRef, ResamplerSpec
+from data.mel import VOCOS_MEL, MelConfig
 
-from .base import Vocoder, VocoderSpec
+from .base import Vocoder, VocoderSpec, resolve_torch_device
 
 _CSV = "band_measurements.csv"
 _PROBES = "probes.json"
@@ -109,31 +109,116 @@ SPEC = VocoderSpec(
 )
 
 
-class Vocos(Vocoder):
-    spec = SPEC
+def check_feature_extractor(feature_extractor, mel: MelConfig) -> None:
+    """INV-02. The loaded Vocos front-end must be the audited one, field by field.
 
-    def __init__(self, device: str = "cuda"):
+    Upstream's ``MelSpectrogramFeatures`` wraps a torchaudio ``MelSpectrogram``
+    and passes neither ``f_min`` nor ``f_max``, so torchaudio's defaults (0 and
+    sr/2) apply. The audit recorded those resolved values; this compares the
+    object actually loaded against them rather than trusting the config file
+    and the audit to agree.
+    """
+    spec = getattr(feature_extractor, "mel_spec", None)
+    if spec is None:
+        raise InvariantViolation(
+            f"INV-02: vocos loaded a {type(feature_extractor).__name__} front-end, not "
+            "MelSpectrogramFeatures. This is not the audited mel checkpoint."
+        )
+    sr = int(spec.sample_rate)
+    f_max = spec.f_max if spec.f_max is not None else sr / 2.0
+    loaded = {
+        "sample_rate": sr,
+        "n_fft": int(spec.n_fft),
+        "hop_length": int(spec.hop_length),
+        "win_length": int(spec.win_length),
+        "n_mels": int(spec.n_mels),
+        "fmin": float(spec.f_min),
+        "fmax": float(f_max),
+    }
+    for field, value in loaded.items():
+        expected = getattr(mel, field)
+        if expected is None or float(expected) != float(value):
+            raise InvariantViolation(
+                f"INV-02: vocos front-end {field} is {value}, audited {expected}. The "
+                "checkpoint behind the pinned revision is not the one docs/mel_configs.md "
+                "describes."
+            )
+    padding = getattr(feature_extractor, "padding", "center")
+    if (padding == "center") != mel.center:
+        raise InvariantViolation(
+            f"INV-02/INV-16: vocos front-end padding is {padding!r}, audited "
+            f"center={mel.center}. Padding decides frame alignment."
+        )
+
+
+class Vocos(Vocoder):
+    """Vocos, loaded from the pinned revision with its own mel front-end.
+
+    ``resynthesize`` runs upstream's copy-synthesis ``model(audio)``: its own
+    ``MelSpectrogramFeatures`` then backbone and ISTFT head. Input is 24 kHz
+    (the caller resamples the source with the pinned kaiser resampler, INV-18);
+    output is the model's native 24 kHz, float32 mono, untouched (INV-10).
+    """
+
+    spec = SPEC
+    runtime_modules = ("torch", "torchaudio", "vocos", "huggingface_hub")
+    required_pins = ("checkpoint_revision",)
+
+    def __init__(self, device: str | None = None):
         self.device = device
         self._model = None
 
     def load(self) -> None:
-        raise NotImplementedError(
-            "Load via vocos.Vocos.from_pretrained(spec.checkpoint) in its own "
-            "isolated session (INV-13). Pass the pinned revision -- the HF helper "
-            "tracks the branch head otherwise (INV-08). Note this pulls its own "
-            "torch/torchaudio pins, which is exactly why conditions do not share "
-            "an environment."
+        if not self.spec.checkpoint_revision:
+            raise InvariantViolation(
+                "INV-08: vocos has no checkpoint_revision; from_pretrained would track "
+                "the branch head."
+            )
+        from vocos import Vocos as UpstreamVocos
+
+        self.device = resolve_torch_device(self.device)
+        model = UpstreamVocos.from_pretrained(
+            self.spec.checkpoint, revision=self.spec.checkpoint_revision
         )
+        check_feature_extractor(model.feature_extractor, self.spec.mel)
+        self._model = model.eval().to(self.device)
+
+    def _require_loaded(self):
+        if self._model is None:
+            raise RuntimeError("vocos: call load() first.")
+        return self._model
 
     def synthesize(self, mel: np.ndarray) -> np.ndarray:
-        raise NotImplementedError(
-            "Use vocos.feature_extractor (MelSpectrogramFeatures) for analysis so "
-            "the front-end matches training -- it passes neither f_min nor f_max to "
-            "torchaudio, so the defaults 0 / sr/2 apply and must not be overridden. "
-            "Return the model's native 24 kHz, float32 mono, no post-processing "
-            "(INV-10). The single resample to the 22.05 kHz archive happens later, "
-            "in data.preprocess (INV-01)."
-        )
+        import torch
+
+        model = self._require_loaded()
+        features = torch.from_numpy(np.ascontiguousarray(mel, dtype=np.float32))
+        if features.ndim == 2:
+            features = features.unsqueeze(0)
+        with torch.inference_mode():
+            out = model.decode(features.to(self.device))
+        return out.squeeze(0).float().cpu().numpy().astype(np.float32)
+
+    def resynthesize(self, wav: np.ndarray, sr: int) -> np.ndarray:
+        import torch
+
+        if sr != self.spec.mel.sample_rate:
+            raise ValueError(
+                f"vocos: expected input at {self.spec.mel.sample_rate} Hz, got {sr}. "
+                "Resample the source with VOCOS_RESAMPLER first (INV-18)."
+            )
+        model = self._require_loaded()
+        audio = torch.from_numpy(np.ascontiguousarray(wav, dtype=np.float32)).unsqueeze(0)
+        with torch.inference_mode():
+            out = model(audio.to(self.device))
+        return out.squeeze(0).float().cpu().numpy().astype(np.float32)
 
     def unload(self) -> None:
         self._model = None
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:  # pragma: no cover
+            pass

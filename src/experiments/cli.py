@@ -2,7 +2,8 @@
 
 Usage:
     btpvf audit                       # which conditions are runnable yet
-    btpvf resynth --conditions ...    # Phase A, one isolated session per vocoder
+    btpvf resynth --corpus-root ... --conditions ... --out-dir ... --n-utterances N
+                                      # Phase A, every gate, output only if all pass
     btpvf validate --manifest ...     # manifest-level invariant gate
     btpvf sanity   --manifest ...     # confound-leakage probes, both tiers
     btpvf provenance --manifest ...   # INV-01 derivation paths per tier
@@ -24,12 +25,19 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("audit", help="checkpoint / mel-config readiness table")
 
-    a = sub.add_parser("resynth", help="Phase A: controlled resynthesis")
-    a.add_argument("--corpus-root", required=True)
+    a = sub.add_parser(
+        "resynth",
+        help="Phase A: gated resynthesis -> full-band archive, derived tier, manifest",
+    )
+    a.add_argument("--corpus-root", required=True, help="LJSpeech-1.1 directory")
     a.add_argument("--conditions", nargs="+", required=True)
-    a.add_argument("--out-dir", default="data/resynth")
-    a.add_argument("--manifest", default="manifests/dataset.csv")
-    a.add_argument("--n-utterances", type=int, default=3000)
+    a.add_argument("--out-dir", required=True, help="must not exist yet")
+    a.add_argument("--n-utterances", type=int, required=True)
+    a.add_argument("--device", default="auto", help="auto | cpu | cuda[:N]")
+    a.add_argument(
+        "--keep-failed", action="store_true",
+        help="on a failed gate, keep staging as <out-dir>.failed instead of deleting it",
+    )
 
     v = sub.add_parser("validate", help="manifest invariant gate")
     v.add_argument("--manifest", required=True)
@@ -68,12 +76,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "resynth":
-        from data.corpus import LJSpeech
-        from experiments.phase_a_resynthesis import run
+        from experiments.phase_a_resynthesis import run_gated
 
-        corpus = LJSpeech(args.corpus_root, subset_size=args.n_utterances)
-        path = run(corpus, args.conditions, args.out_dir, args.manifest)
-        print(f"manifest written: {path}")
+        result = run_gated(
+            args.corpus_root,
+            args.conditions,
+            args.out_dir,
+            args.n_utterances,
+            device=None if args.device == "auto" else args.device,
+            keep_failed=args.keep_failed,
+        )
+        print(result.sanity.to_string(index=False))
+        print()
+        print(result.loudness.to_string(index=False))
+        print(f"\nall gates passed; dataset at {result.out_dir}")
+        print(f"manifest: {result.manifest_path}")
         return 0
 
     if args.cmd == "validate":

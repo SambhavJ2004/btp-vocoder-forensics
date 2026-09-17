@@ -34,21 +34,26 @@ condition is accepted.
 
 from __future__ import annotations
 
+import json
+import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pyloudnorm as pyln
 from tqdm import tqdm
 
 from data.alignment import AlignmentReport, assert_aligned, check_vocoder_alignment
-from data.audio_io import read_native, write_audio
+from data.audio_io import read_native, read_processed, write_audio
 from data.corpus import Corpus, assign_splits
 from data.invariants import (
     ALIGNMENT_PROBE_FILES,
     ANALYSES,
     ARCHIVE_SR,
     ARCHIVE_TIER,
+    BAND_LIMIT_MAX_STOPBAND_ENERGY,
     GLOBAL_SEED,
     LADDER_FMAX,
     REAL_CONDITION,
@@ -56,12 +61,14 @@ from data.invariants import (
     ZEROSHOT_TIER,
     InvariantViolation,
     exclusion_for,
+    out_of_band_energy,
 )
-from data.manifest import ManifestRow, dump_provenance, write_manifest
+from data.manifest import ManifestRow, dump_provenance, select_tier, write_manifest
 from data.preprocess import (
     LoudnessRecord,
     TrimSpan,
     archive_band_spec,
+    band_limit_comparison_set,
     derive_trim_span,
     derive_zeroshot,
     finalise_reference,
@@ -245,6 +252,8 @@ def build_vocoder_condition(
     real_archive: dict[str, np.ndarray],
     splits: dict[str, str],
     dropped: set[str],
+    *,
+    device: str | None = None,
 ) -> tuple[list[ManifestRow], AlignmentReport]:
     """Resynthesize one condition at both tiers, reusing the reference trim spans.
 
@@ -255,6 +264,8 @@ def build_vocoder_condition(
     """
     spec = get_spec(condition)
     voc = get_vocoder(condition)
+    if device is not None:
+        voc.device = device
     voc.load()
     archive_meter = pyln.Meter(ARCHIVE_SR)
     zs_meter = pyln.Meter(ZEROSHOT_SR)
@@ -342,6 +353,7 @@ def run(
     manifest_path: str | Path,
     *,
     speaker_disjoint: bool | None = None,
+    device: str | None = None,
 ) -> Path:
     """Generate the real condition plus ``conditions``, both tiers, and the manifest.
 
@@ -374,7 +386,7 @@ def run(
     reports: list[AlignmentReport] = []
     for cond in conditions:
         cond_rows, report = build_vocoder_condition(
-            cond, corpus, out_dir, spans, real_archive, splits, dropped
+            cond, corpus, out_dir, spans, real_archive, splits, dropped, device=device
         )
         rows.extend(cond_rows)
         reports.append(report)
@@ -400,6 +412,10 @@ def run(
             "dropped_for_peak": sorted(dropped),
             "corpus": corpus.name,
             "alignment": {r.condition: r.peak_lag for r in reports},
+            # INV-13: one process, one environment, for every condition listed.
+            "environment_shared_by": [REAL_CONDITION, *conditions],
+            "environment": _environment(),
+            "device": device or "auto",
         },
     )
     return path
@@ -412,3 +428,275 @@ def _git_commit() -> str:
         ).strip()
     except Exception:
         return "unknown"
+
+
+# --- The gated run: every gate, then atomic output ----------------------------
+#
+# `run` writes as it goes. `run_gated` is what a real run uses: it generates into
+# a staging directory beside the output, runs every gate against what was
+# written, and only then renames staging into place. A failed gate leaves no
+# output directory at all -- not a half-written one that a consumer could mistake
+# for a dataset. A crash mid-run leaves `<out>.staging`, never `<out>`.
+
+MANIFEST_NAME = "manifest.csv"
+BAND_GATE_UTTERANCES = 5
+
+
+@dataclass
+class GatedRunResult:
+    out_dir: Path
+    manifest_path: Path
+    sanity: pd.DataFrame
+    loudness: pd.DataFrame
+    gates: dict
+
+
+def _sibling(out_dir: Path, suffix: str) -> Path:
+    return out_dir.with_name(out_dir.name + suffix)
+
+
+def preflight(
+    corpus_root: str | Path, conditions: list[str], out_dir: str | Path, n_utterances: int
+) -> None:
+    """Everything that can be checked before a single file is written. Fails fast."""
+    import importlib.util
+
+    from vocoders.registry import (
+        ALL_CONDITIONS,
+        SHARED_ENV_REPORTED,
+        checkpoint_audit,
+        get_spec,
+        get_vocoder,
+    )
+
+    conditions = list(conditions)
+    if not conditions:
+        raise InvariantViolation("Phase A: no conditions requested.")
+    if len(set(conditions)) != len(conditions):
+        raise InvariantViolation(f"Phase A: duplicate conditions in {conditions}.")
+    unknown = [c for c in conditions if c not in ALL_CONDITIONS]
+    if unknown:
+        raise InvariantViolation(
+            f"Phase A: {unknown} are not generable conditions ({sorted(ALL_CONDITIONS)}). "
+            f"'{REAL_CONDITION}' is always generated and is not requested."
+        )
+    if n_utterances < ALIGNMENT_PROBE_FILES:
+        raise InvariantViolation(
+            f"INV-16: {n_utterances} utterances cannot run the alignment gate, which "
+            f"needs {ALIGNMENT_PROBE_FILES}."
+        )
+
+    root = Path(corpus_root)
+    if not (root / "metadata.csv").is_file() or not (root / "wavs").is_dir():
+        raise InvariantViolation(
+            f"Phase A: {root} is not an LJSpeech root (metadata.csv and wavs/ expected)."
+        )
+
+    out_dir = Path(out_dir)
+    for path in (out_dir, _sibling(out_dir, ".staging"), _sibling(out_dir, ".failed")):
+        if path.exists():
+            raise InvariantViolation(
+                f"Phase A: {path} already exists. A dataset with two runs in it is not a "
+                "dataset; choose a new output directory or remove the old one "
+                "deliberately."
+            )
+
+    blocked = [
+        r["condition"] for r in checkpoint_audit() if r["condition"] in conditions and r["blocked"]
+    ]
+    if blocked:
+        raise InvariantViolation(
+            f"INV-08: {blocked} are blocked by the checkpoint audit (unpinned checkpoint "
+            "or unverified mel config). Run `btpvf audit`."
+        )
+
+    unpinned = {
+        c: [f for f in type(get_vocoder(c)).required_pins if not getattr(get_spec(c), f)]
+        for c in conditions
+    }
+    unpinned = {c: f for c, f in unpinned.items() if f}
+    if unpinned:
+        raise InvariantViolation(
+            f"INV-08: {unpinned} -- these adapters refuse to load without those pins. "
+            "The audit may still list them as runnable; loading is stricter."
+        )
+
+    # INV-13, stated rather than assumed. More than one condition with its own
+    # dependency tree may share a process only if every one of them is in the
+    # set reported to have coexisted in testing.
+    neural = [c for c in conditions if get_spec(c).family != "signal_processing"]
+    if len(neural) > 1 and not set(neural) <= SHARED_ENV_REPORTED:
+        raise InvariantViolation(
+            f"INV-13: {neural} would share one environment, and only "
+            f"{sorted(SHARED_ENV_REPORTED)} are reported to coexist. Run the others in "
+            "their own sessions and merge manifests afterwards."
+        )
+
+    missing = sorted({
+        m
+        for c in conditions
+        for m in type(get_vocoder(c)).runtime_modules
+        if importlib.util.find_spec(m) is None
+    })
+    if missing:
+        raise InvariantViolation(
+            f"INV-13: {conditions} need {missing}, which are not importable here. They "
+            "are deliberately not dependencies of this package; install them in the "
+            "condition's environment (pip install -e .[resynth])."
+        )
+
+
+def band_gate(manifest: pd.DataFrame, n_utterances: int = BAND_GATE_UTTERANCES) -> dict:
+    """INV-17 on real output: the analysis band limit must hold on what was written.
+
+    Applies the sanctioned comparison-set transform, real included, to the first
+    ``n_utterances`` archive utterances read back from their PCM_16 files. The
+    transform gates its own output (check_band_limit) and raises on a residual
+    above the allowance.
+    """
+    archive = select_tier(manifest, ARCHIVE_TIER)
+    utts = sorted(archive["utt_id"].unique())[:n_utterances]
+    worst = 0.0
+    for utt in utts:
+        rows = archive[archive["utt_id"] == utt]
+        wavs = {
+            str(c): read_processed(p, ARCHIVE_SR)
+            for c, p in zip(rows["condition"], rows["path"], strict=True)
+        }
+        limited = band_limit_comparison_set(wavs, sr=ARCHIVE_SR, verify=True)
+        worst = max(
+            worst, max(out_of_band_energy(w, ARCHIVE_SR, LADDER_FMAX) for w in limited.values())
+        )
+    return {
+        "utterances": len(utts),
+        "worst_residual_above_ladder_fmax": worst,
+        "allowance": BAND_LIMIT_MAX_STOPBAND_ENERGY,
+    }
+
+
+def run_gated(
+    corpus_root: str | Path,
+    conditions: list[str],
+    out_dir: str | Path,
+    n_utterances: int,
+    *,
+    device: str | None = None,
+    keep_failed: bool = False,
+) -> GatedRunResult:
+    """Phase A on a real corpus with every gate, and output only if all of them pass.
+
+    Gates, in order:
+
+      preflight     conditions generable and pinned (INV-08), shared-environment
+                    claim within what was reported (INV-13), runtime modules
+                    importable, output location unused.
+      alignment     INV-16, per condition, inside generation, before its files
+                    are accepted.
+      manifest      validate_manifest with the zero-shot tier required: rates,
+                    derivations, pairing, trim spans, splits, full-band archive,
+                    the loudness record, alignment records.
+      band          the analysis band limit holds on the written audio (INV-17).
+      sanity        every INV-12 probe on every condition and tier, over ALL
+                    utterances rather than the eval split: these probes train
+                    nothing, and at a few hundred utterances the eval split alone
+                    is small enough to trip the floor by chance.
+
+    Then the loudness report is written (a report, not a gate), the manifest's
+    paths are pointed at the final location, and staging is renamed into place.
+    On any failure staging is deleted -- or, with ``keep_failed``, renamed to
+    ``<out>.failed`` for inspection -- and the error propagates.
+    """
+    from data.alignment import read_alignment_report
+    from data.corpus import LJSpeech
+    from data.manifest import loudness_gain_report, read_manifest, validate_manifest
+    from experiments.sanity_checks import run_all
+
+    out_dir = Path(out_dir)
+    preflight(corpus_root, conditions, out_dir, n_utterances)
+    staging = _sibling(out_dir, ".staging")
+    staging.mkdir(parents=True)
+    gates: dict = {"preflight": "passed"}
+    try:
+        corpus = LJSpeech(corpus_root, subset_size=n_utterances)
+        staged_manifest = run(
+            corpus, list(conditions), staging, staging / MANIFEST_NAME, device=device
+        )
+        gates["alignment"] = read_alignment_report(staged_manifest.with_suffix(".alignment.json"))
+
+        df = read_manifest(staged_manifest)
+        validate_manifest(df, require_zeroshot=True)
+        gates["manifest"] = "passed"
+
+        gates["band"] = band_gate(df)
+
+        sanity = run_all(df, split=None)
+        sanity.to_csv(staging / "sanity.csv", index=False)
+        leaked = sanity[sanity["leaked"]]
+        gates["sanity"] = {
+            "split": "all",
+            "probes": len(sanity),
+            "leaked": len(leaked),
+            "expected_by_design": int(sanity["expected_by_design"].sum()),
+        }
+        if not leaked.empty:
+            raise InvariantViolation(
+                "INV-12: confound leak -- fix the pipeline and regenerate; never relax "
+                f"the floor.\n{leaked.to_string(index=False)}"
+            )
+
+        loudness = loudness_gain_report(df)
+        loudness.to_csv(staging / "loudness_gain.csv", index=False)
+        gates["loudness_report"] = "loudness_gain.csv"
+
+        # Point the manifest at where the files WILL be, then move them there.
+        df["path"] = [str(out_dir / Path(p).relative_to(staging)) for p in df["path"]]
+        df.to_csv(staged_manifest, index=False)
+        (staging / "gates.json").write_text(
+            json.dumps(gates, indent=2, sort_keys=True, default=str), encoding="utf-8"
+        )
+    except BaseException:
+        if keep_failed:
+            failed = _sibling(out_dir, ".failed")
+            staging.rename(failed)
+            print(f"[Phase A] FAILED -- partial output kept for inspection at {failed}")
+        else:
+            shutil.rmtree(staging, ignore_errors=True)
+            print("[Phase A] FAILED -- no output written")
+        raise
+
+    staging.rename(out_dir)
+    manifest_path = out_dir / MANIFEST_NAME
+    final = read_manifest(manifest_path)
+    absent = [p for p in final["path"] if not Path(p).is_file()]
+    if absent:
+        raise InvariantViolation(
+            f"Phase A: {len(absent)} manifest paths do not exist after the move "
+            f"(e.g. {absent[:3]}). The output directory is not a usable dataset."
+        )
+    return GatedRunResult(out_dir, manifest_path, sanity, loudness, gates)
+
+
+def _environment() -> dict:
+    """INV-13: the environment each condition ran in, as a recorded fact."""
+    import platform
+    import sys
+    from importlib import metadata
+
+    packages = {}
+    for name in ("numpy", "scipy", "librosa", "soundfile", "pyloudnorm", "pandas",
+                 "torch", "torchaudio", "vocos", "huggingface_hub"):
+        try:
+            packages[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            packages[name] = None
+    env: dict = {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "packages": packages,
+    }
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        env["cuda_available"] = bool(torch.cuda.is_available())
+        if env["cuda_available"]:
+            env["cuda_device"] = torch.cuda.get_device_name(0)
+    return env

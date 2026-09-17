@@ -27,9 +27,12 @@ high-band analysis, with the measurement cited in ANALYSIS_EXCLUSIONS.
 
 from __future__ import annotations
 
+import inspect
+
 import librosa
 import numpy as np
 
+from data.invariants import GLOBAL_SEED
 from data.mel import GRIFFIN_LIM_MEL, MelConfig
 
 from .base import Vocoder, VocoderSpec
@@ -47,8 +50,23 @@ SPEC = VocoderSpec(
 
 
 class GriffinLim(Vocoder):
-    def __init__(self, n_iter: int = 60, mel: MelConfig | None = None):
+    """Mel -> NNLS linear magnitude -> Griffin-Lim, fixed iterations, fixed seed.
+
+    INV-08 asks every stochastic condition to fix its sampler, and Griffin-Lim is
+    stochastic: its phase starts random. ``librosa.feature.inverse.mel_to_audio``
+    does not forward a ``random_state`` to ``griffinlim``, so it would draw from
+    numpy's global generator and the audio for one utterance would depend on how
+    many utterances came before it. The two steps are therefore called
+    separately, with the seed passed explicitly -- identical to ``mel_to_audio``
+    otherwise.
+    """
+
+    runtime_modules = ()
+
+    def __init__(self, n_iter: int = 60, mel: MelConfig | None = None,
+                 seed: int = GLOBAL_SEED):
         self.n_iter = n_iter
+        self.seed = seed
         self.spec = SPEC if mel is None else VocoderSpec(**{**SPEC.__dict__, "mel": mel})
 
     def load(self) -> None:  # nothing to load
@@ -57,16 +75,31 @@ class GriffinLim(Vocoder):
     def synthesize(self, mel: np.ndarray) -> np.ndarray:
         cfg = self.spec.mel
         linear = np.exp(mel) if cfg.log_base == "natural" else librosa.db_to_amplitude(mel)
-        wav = librosa.feature.inverse.mel_to_audio(
+        magnitude = librosa.feature.inverse.mel_to_stft(
             M=linear,
             sr=cfg.sample_rate,
             n_fft=cfg.n_fft,
-            hop_length=cfg.hop_length,
-            win_length=cfg.win_length,
+            power=1.0,
             fmin=cfg.fmin,
             fmax=cfg.fmax,
-            power=1.0,
+        )
+        wav = librosa.griffinlim(
+            magnitude,
             n_iter=self.n_iter,
+            hop_length=cfg.hop_length,
+            win_length=cfg.win_length,
             center=cfg.center,
+            **{_SEED_KWARG: self.seed},
         )
         return wav.astype(np.float32)
+
+
+# librosa 0.11 renamed griffinlim's `random_state` to `rng` (the old name is a
+# deprecated alias, removed in 1.2). Pass whichever the installed version takes.
+# The seed fixes the phase init within one librosa version; librosa's version is
+# recorded in the run provenance because the generator behind the seed may differ
+# between versions.
+_SEED_KWARG = (
+    "rng" if "rng" in inspect.signature(librosa.griffinlim).parameters
+    else "random_state"
+)

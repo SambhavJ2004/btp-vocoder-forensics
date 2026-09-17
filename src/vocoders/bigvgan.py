@@ -28,7 +28,12 @@ the way to the archive (INV-01).
 
 from __future__ import annotations
 
+import importlib
+import json
 import re
+import sys
+from collections.abc import Callable
+from pathlib import Path
 
 import numpy as np
 
@@ -41,7 +46,7 @@ from data.mel import (
     MelConfig,
 )
 
-from .base import Vocoder, VocoderSpec
+from .base import Vocoder, VocoderSpec, resolve_torch_device
 
 # --- bigvgan_112m: pin and mel config sourced from the measurement run --------
 # data/measurements/meta.json was written by the Kaggle run that produced the
@@ -157,29 +162,227 @@ FULLBAND_SPEC = VocoderSpec(
 )
 
 
-class BigVGAN(Vocoder):
-    """Wraps all three; pass the spec you want."""
+# --- Loading, without the HF mixin -------------------------------------------
+# Upstream's `BigVGAN.from_pretrained` goes through huggingface_hub's
+# PyTorchModelHubMixin, whose `_from_pretrained` signature changed under it and
+# no longer works against current huggingface_hub. The mixin only ever did three
+# things -- fetch config.json, build the model from it, load the generator
+# weights -- so those are done here directly.
+#
+# The model CODE comes from the same pinned revision as the weights: the HF repo
+# ships bigvgan.py, meldataset.py and alias_free_activation/ alongside them. So
+# one content-addressed revision pins code, config and weights together, and the
+# mel front-end is upstream's own get_mel_spectrogram (INV-02), not a copy.
 
-    def __init__(self, spec: VocoderSpec = LARGE_SPEC):
+UPSTREAM_CODE_FILES: tuple[str, ...] = (
+    "bigvgan.py",
+    "activations.py",
+    "env.py",
+    "meldataset.py",
+    "utils.py",
+    "alias_free_activation/torch/__init__.py",
+    "alias_free_activation/torch/act.py",
+    "alias_free_activation/torch/filter.py",
+    "alias_free_activation/torch/resample.py",
+)
+UPSTREAM_CONFIG = "config.json"
+UPSTREAM_WEIGHTS = "bigvgan_generator.pt"
+# Top-level module names upstream's code imports itself by. They are generic
+# ("utils", "env"), so a same-named module imported earlier from anywhere else
+# would be picked up silently instead of upstream's.
+UPSTREAM_MODULES: tuple[str, ...] = (
+    "bigvgan", "activations", "env", "meldataset", "utils", "alias_free_activation",
+)
+
+# config.json key -> MelConfig field
+_HPARAM_FIELDS: tuple[tuple[str, str], ...] = (
+    ("sampling_rate", "sample_rate"),
+    ("n_fft", "n_fft"),
+    ("hop_size", "hop_length"),
+    ("win_size", "win_length"),
+    ("num_mels", "n_mels"),
+    ("fmin", "fmin"),
+    ("fmax", "fmax"),
+)
+
+
+def check_hparams(h: dict, mel: MelConfig, *, condition: str) -> None:
+    """INV-02. The config.json at the pinned revision must match the audit."""
+    for key, field in _HPARAM_FIELDS:
+        if key not in h:
+            raise InvariantViolation(f"INV-02: {condition} config.json has no {key!r}.")
+        value = h[key]
+        if key == "fmax" and value is None:
+            value = h["sampling_rate"] / 2.0  # librosa resolves None to sr/2
+        expected = getattr(mel, field)
+        if expected is None or float(value) != float(expected):
+            raise InvariantViolation(
+                f"INV-02: {condition} config.json {key}={h[key]!r}, audited {field}="
+                f"{expected!r}. The pinned revision is not the checkpoint the audit and "
+                "the committed measurements describe."
+            )
+
+
+def fetch_pinned_snapshot(
+    spec: VocoderSpec, download: Callable[..., str] | None = None
+) -> Path:
+    """Download code, config and weights from the pinned revision. Verify first.
+
+    Returns the snapshot directory. The weight digest is checked against
+    ``spec.checkpoint_sha256`` before anything from the snapshot is imported or
+    loaded (INV-08): a swapped checkpoint must fail here, not after audio exists.
+    """
+    from .checkpoints import verify_checkpoint
+
+    if not spec.checkpoint_revision:
+        raise InvariantViolation(
+            f"INV-08: {spec.key} has no checkpoint_revision; downloading would track "
+            "the branch head."
+        )
+    if not spec.checkpoint_sha256:
+        raise InvariantViolation(
+            f"INV-08: {spec.key} has no checkpoint_sha256 to verify the weights against."
+        )
+    if download is None:
+        from huggingface_hub import hf_hub_download
+
+        download = hf_hub_download
+
+    files = (*UPSTREAM_CODE_FILES, UPSTREAM_CONFIG, UPSTREAM_WEIGHTS)
+    paths = {
+        f: Path(download(repo_id=spec.checkpoint, filename=f, revision=spec.checkpoint_revision))
+        for f in files
+    }
+    root = paths["bigvgan.py"].parent
+    strays = [f for f, p in paths.items() if p != root / f]
+    if strays:
+        raise InvariantViolation(
+            f"INV-08: {spec.key} files {strays} did not land in one snapshot directory; "
+            "code, config and weights must come from the same revision."
+        )
+    verify_checkpoint(paths[UPSTREAM_WEIGHTS], spec.checkpoint_sha256, condition=spec.key)
+    return root
+
+
+def _module_origin(module) -> list[str]:
+    file = getattr(module, "__file__", None)
+    if file:
+        return [str(Path(file).resolve())]
+    return [str(Path(p).resolve()) for p in getattr(module, "__path__", [])]
+
+
+def import_upstream(root: Path) -> dict:
+    """Import upstream's modules from ``root`` and prove they came from there."""
+    root = Path(root).resolve()
+
+    def inside(module) -> bool:
+        origins = _module_origin(module)
+        return bool(origins) and all(Path(o).is_relative_to(root) for o in origins)
+
+    for name in UPSTREAM_MODULES:
+        existing = sys.modules.get(name)
+        if existing is not None and not inside(existing):
+            raise InvariantViolation(
+                f"INV-13: a module named {name!r} is already imported from "
+                f"{_module_origin(existing)}. BigVGAN's code imports itself by that "
+                "top-level name and would silently get the wrong module. Run the "
+                "condition in a fresh process."
+            )
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    modules = {n: importlib.import_module(n) for n in ("bigvgan", "meldataset", "env")}
+    for name, module in modules.items():
+        if not inside(module):
+            raise InvariantViolation(
+                f"INV-13: imported {name!r} from {_module_origin(module)}, not from the "
+                f"pinned snapshot {root}."
+            )
+    return modules
+
+
+class BigVGAN(Vocoder):
+    """Wraps all three; pass the spec you want.
+
+    Only ``bigvgan_112m`` carries a weight digest today, so it is the only one
+    ``load()`` will accept -- the other two fail closed at the digest check.
+    """
+
+    runtime_modules = ("torch", "huggingface_hub", "librosa", "scipy", "matplotlib")
+    required_pins = ("checkpoint_revision", "checkpoint_sha256")
+
+    def __init__(self, spec: VocoderSpec = LARGE_SPEC, device: str | None = None):
         self.spec = spec
+        self.device = device
         self._model = None
+        self._h = None
+        self._mel_fn = None
 
     def load(self) -> None:
-        raise NotImplementedError(
-            "Load via bigvgan.BigVGAN.from_pretrained(spec.checkpoint, "
-            "revision=spec.checkpoint_revision, use_cuda_kernel=False) -- the custom "
-            "CUDA kernel is a compile risk on Kaggle and is not needed for "
-            "inference-only work. Pass the pinned revision explicitly; omitting it "
-            "silently tracks the branch head (INV-08). Then remove_weight_norm() "
-            "and eval()."
+        import torch
+
+        root = fetch_pinned_snapshot(self.spec)
+        upstream = import_upstream(root)
+        h = upstream["env"].AttrDict(
+            json.loads((root / UPSTREAM_CONFIG).read_text(encoding="utf-8"))
         )
+        check_hparams(h, self.spec.mel, condition=self.spec.key)
+
+        self.device = resolve_torch_device(self.device)
+        # use_cuda_kernel=False: the custom CUDA kernel is a compile risk on Kaggle
+        # and inference does not need it.
+        model = upstream["bigvgan"].BigVGAN(h, use_cuda_kernel=False)
+        state = torch.load(root / UPSTREAM_WEIGHTS, map_location="cpu", weights_only=True)
+        # Mirrors upstream's own loader: a checkpoint saved without weight norm
+        # only loads after removing it; one saved with it loads first and then
+        # has it removed for inference.
+        try:
+            model.load_state_dict(state["generator"])
+        except RuntimeError:
+            model.remove_weight_norm()
+            model.load_state_dict(state["generator"])
+        else:
+            model.remove_weight_norm()
+        self._model = model.eval().to(self.device)
+        self._h = h
+        self._mel_fn = upstream["meldataset"].get_mel_spectrogram
+
+    def _require_loaded(self):
+        if self._model is None:
+            raise RuntimeError(f"{self.spec.key}: call load() first.")
+        return self._model
 
     def synthesize(self, mel: np.ndarray) -> np.ndarray:
-        raise NotImplementedError(
-            "Use upstream's meldataset.get_mel_spectrogram() for analysis so the "
-            "front-end matches training exactly, then generator forward. Return the "
-            "model's native 22.05 kHz, float32 mono, no post-processing (INV-10)."
-        )
+        import torch
+
+        model = self._require_loaded()
+        x = torch.from_numpy(np.ascontiguousarray(mel, dtype=np.float32))
+        if x.ndim == 2:
+            x = x.unsqueeze(0)
+        with torch.inference_mode():
+            out = model(x.to(self.device))
+        return out.squeeze().float().cpu().numpy().astype(np.float32)
+
+    def resynthesize(self, wav: np.ndarray, sr: int) -> np.ndarray:
+        """Upstream's own front-end (``meldataset.get_mel_spectrogram``), then forward."""
+        import torch
+
+        if sr != self.spec.mel.sample_rate:
+            raise ValueError(
+                f"{self.spec.key}: expected input at {self.spec.mel.sample_rate} Hz, got {sr}."
+            )
+        model = self._require_loaded()
+        x = torch.from_numpy(np.ascontiguousarray(wav, dtype=np.float32)).unsqueeze(0)
+        with torch.inference_mode():
+            mel = self._mel_fn(x.to(self.device), self._h)
+            out = model(mel)
+        return out.squeeze().float().cpu().numpy().astype(np.float32)
 
     def unload(self) -> None:
         self._model = None
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:  # pragma: no cover
+            pass

@@ -108,6 +108,12 @@ active guard.
 Also unenforced in the same invariant: *"Fix sampler step counts and seeds for
 any stochastic vocoder"* has no mechanism at all.
 
+> **Update (first real Phase A run).** Partly closed. `bigvgan_112m`'s `load()`
+> calls `verify_checkpoint` on the downloaded weights before importing any
+> upstream code, and `griffin_lim` seeds its phase init per utterance. Still open:
+> `hifigan_v1`, `melgan`, `bigvgan_base` and the full-band control have no working
+> `load()`, and no adapter has yet run against real weights.
+
 ### D-6 — INV-09: speaker-disjointness is opt-in, not conditional · moderate
 
 > **Claim (Rule).** "Speaker-disjoint as well **when the corpus is

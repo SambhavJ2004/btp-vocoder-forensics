@@ -46,13 +46,20 @@ def _leading_trailing_silence(
     return voiced[0] / sr, (len(wav) - voiced[-1]) / sr
 
 
-def _tier_rows(manifest: pd.DataFrame, tier: str, split: str) -> tuple[pd.DataFrame, int]:
+def _tier_rows(
+    manifest: pd.DataFrame, tier: str, split: str | None
+) -> tuple[pd.DataFrame, int]:
+    """``split=None`` means every split. The probes train nothing -- each is a
+    scalar feature scored directly -- so there is no held-out set to protect,
+    and using every utterance is what keeps the EER's sampling noise below the
+    floor at small dataset sizes."""
     sub = select_tier(manifest, tier)
-    return sub[sub["split"] == split], TIER_RATES[tier]
+    return (sub if split is None else sub[sub["split"] == split]), TIER_RATES[tier]
 
 
 def silence_probe(
-    manifest: pd.DataFrame, condition: str, split: str = "eval", tier: str = ARCHIVE_TIER
+    manifest: pd.DataFrame, condition: str, split: str | None = "eval",
+    tier: str = ARCHIVE_TIER,
 ) -> dict[str, object]:
     """INV-03 check. Can leading/trailing silence duration alone separate the
     condition from real? It must not: identical trim spans are applied to both.
@@ -69,7 +76,8 @@ def silence_probe(
 
 
 def loudness_probe(
-    manifest: pd.DataFrame, condition: str, split: str = "eval", tier: str = ARCHIVE_TIER
+    manifest: pd.DataFrame, condition: str, split: str | None = "eval",
+    tier: str = ARCHIVE_TIER,
 ) -> dict[str, object]:
     """INV-04 check. Can broadband RMS alone separate the condition from real?
 
@@ -91,7 +99,8 @@ def loudness_probe(
 
 
 def duration_probe(
-    manifest: pd.DataFrame, condition: str, split: str = "eval", tier: str = ARCHIVE_TIER
+    manifest: pd.DataFrame, condition: str, split: str | None = "eval",
+    tier: str = ARCHIVE_TIER,
 ) -> dict[str, object]:
     """INV-06 check. Can total duration alone separate the condition from real?
     Should be exactly at chance -- paired conditions have identical lengths.
@@ -104,7 +113,8 @@ def duration_probe(
 
 
 def bandwidth_probe(
-    manifest: pd.DataFrame, condition: str, split: str = "eval", tier: str = ARCHIVE_TIER
+    manifest: pd.DataFrame, condition: str, split: str | None = "eval",
+    tier: str = ARCHIVE_TIER,
 ) -> dict[str, object]:
     """INV-01 check. Can the highest frequency with meaningful energy separate
     the condition from real? A hit here usually means a resampling difference
@@ -170,7 +180,7 @@ def _verdict(probe: str, condition: str, eer: float, tier: str) -> dict[str, obj
     }
 
 
-def run_all(manifest: pd.DataFrame, split: str = "eval") -> pd.DataFrame:
+def run_all(manifest: pd.DataFrame, split: str | None = "eval") -> pd.DataFrame:
     """Every probe against every non-real condition, on every tier present.
 
     A row with ``leaked == True`` blocks publication of that condition. The fix

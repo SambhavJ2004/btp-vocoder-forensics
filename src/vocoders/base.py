@@ -56,6 +56,17 @@ class Vocoder(ABC):
     """Adapter around one upstream vocoder implementation."""
 
     spec: VocoderSpec
+    # Importable modules this adapter needs at load() time. Checked BEFORE a run
+    # starts generating anything, so a missing dependency fails in seconds rather
+    # than after the real condition has been written (INV-13: none of these are
+    # dependencies of the package itself).
+    runtime_modules: tuple[str, ...] = ()
+    # VocoderSpec pin fields this adapter's load() refuses to run without. Checked
+    # in preflight too, so an unpinned condition fails before generation starts
+    # rather than after the real condition is written (INV-08).
+    required_pins: tuple[str, ...] = ()
+    # Device for neural adapters; None resolves at load() to cuda if available.
+    device: str | None = None
 
     @abstractmethod
     def load(self) -> None:
@@ -85,6 +96,28 @@ class Vocoder(ABC):
 
     def unload(self) -> None:  # noqa: B027 -- optional hook, not every adapter holds GPU state
         """Free GPU memory between conditions in a shared session."""
+
+
+def resolve_torch_device(device: str | None) -> str:
+    """Resolve ``None``/``"auto"`` to ``cuda`` when available, else ``cpu``.
+
+    An explicit ``cuda`` request without a GPU raises rather than silently
+    falling back: a condition generated on CPU instead of GPU is the same model,
+    but the run should say which it was, not discover it later.
+
+    Also pins the cuDNN choices that make GAN inference repeatable (INV-08):
+    benchmark mode picks algorithms by timing, which can differ run to run.
+    """
+    import torch
+
+    if device in (None, "auto"):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    elif str(device).startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(f"device {device!r} requested but torch sees no CUDA device.")
+    if hasattr(torch, "backends") and hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    return str(device)
 
 
 @dataclass
