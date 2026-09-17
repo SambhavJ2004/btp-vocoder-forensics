@@ -501,13 +501,15 @@ def preflight(
                 "deliberately."
             )
 
-    blocked = [
-        r["condition"] for r in checkpoint_audit() if r["condition"] in conditions and r["blocked"]
-    ]
+    blocked = {
+        r["condition"]: r["missing_pins"] or r["pin"]
+        for r in checkpoint_audit()
+        if r["condition"] in conditions and r["blocked"]
+    }
     if blocked:
         raise InvariantViolation(
-            f"INV-08: {blocked} are blocked by the checkpoint audit (unpinned checkpoint "
-            "or unverified mel config). Run `btpvf audit`."
+            f"INV-08: {blocked} are blocked by the checkpoint audit (missing pins, an "
+            "unpinned checkpoint, or an unverified mel config). Run `btpvf audit`."
         )
 
     unpinned = {

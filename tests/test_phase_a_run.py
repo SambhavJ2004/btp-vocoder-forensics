@@ -12,6 +12,7 @@ move of output into place.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -281,7 +282,7 @@ class TestBigVGANAdapter:
             check_hparams({**self.CONFIG, key: value}, LARGE_SPEC.mel, condition="bigvgan_112m")
 
     def _downloader(self, root, calls, weights=b"not really weights"):
-        def download(*, repo_id, filename, revision):
+        def download(*, repo_id, filename, revision, token=None):
             calls.append((repo_id, filename, revision))
             path = root / filename
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -479,6 +480,287 @@ class TestKaggleNotebook:
         assert "hifigan_v1" in md and "melgan" in md
 
     def test_carries_no_credentials(self):
-        text = self.PATH.read_text(encoding="utf-8").lower()
-        for needle in ("kaggle.json", "hf_token", "api_key", "password", "ghp_"):
-            assert needle not in text
+        """INV-15. The HF_TOKEN variable name may appear; a token value may not."""
+        import re
+
+        raw = self.PATH.read_text(encoding="utf-8")
+        for needle in ("kaggle.json", "api_key", "password"):
+            assert needle not in raw.lower()
+        assert not re.search(r"\b(hf|ghp|gho|github_pat)_[A-Za-z0-9_]{20,}", raw)
+
+    def test_hf_token_is_optional_and_never_printed(self):
+        """Rate-limit relief is opt-in: the secret lines ship commented out, and no
+        line that touches the token prints anything."""
+        lines = [ln for src in self._code() for ln in src.splitlines() if "HF_TOKEN" in ln]
+        assert lines, "the notebook should show how to supply HF_TOKEN"
+        for ln in lines:
+            assert "print" not in ln and "display" not in ln, ln
+            if "get_secret" in ln or "os.environ[" in ln:
+                assert ln.lstrip().startswith("#"), f"must ship commented out: {ln}"
+
+
+# ============================================================ the HF cache layout
+
+
+def _file_symlink(target: Path, link: Path) -> None:
+    """A real relative file symlink, as huggingface_hub makes them. Skips where the OS
+    refuses (Windows without Developer Mode or elevation); never mocked."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(os.path.relpath(target, link.parent), link)
+    except (OSError, NotImplementedError) as err:
+        pytest.skip(f"this OS will not create file symlinks here: {err}")
+
+
+def _dir_link(target: Path, link: Path) -> None:
+    """A real directory link: a symlink, or on Windows a junction (needs no privilege)."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return
+    except (OSError, NotImplementedError):
+        pass
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+        return
+    pytest.skip("this OS will create neither a directory symlink nor a junction")
+
+
+_UPSTREAM_STUBS = {
+    "bigvgan.py": (
+        "WHO = 'bigvgan'\nimport utils, activations\nimport alias_free_activation.torch.act\n"
+    ),
+    "meldataset.py": "WHO = 'meldataset'\n",
+    "env.py": "WHO = 'env'\n",
+    "utils.py": "WHO = 'utils'\n",
+    "activations.py": "WHO = 'activations'\n",
+    "alias_free_activation/torch/__init__.py": "",
+    "alias_free_activation/torch/act.py": "WHO = 'act'\n",
+}
+_IMPORTED = ("bigvgan", "meldataset", "env", "utils", "activations", "alias_free_activation",
+             "alias_free_activation.torch", "alias_free_activation.torch.act")
+
+
+@pytest.fixture
+def isolated_imports(monkeypatch):
+    """Upstream's generic module names must not leak between tests."""
+    import importlib
+
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    for name in _IMPORTED:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    yield
+    for name in _IMPORTED:
+        sys.modules.pop(name, None)
+    importlib.invalidate_caches()
+
+
+@pytest.fixture
+def hf_snapshot(tmp_path):
+    """models--x/blobs/<sha256> real files; snapshots/<rev>/ a tree of relative symlinks
+    into them -- the layout huggingface_hub builds, and the thing that broke on Kaggle."""
+    import hashlib
+
+    repo = tmp_path / "hub" / "models--nvidia--bigvgan_v2_22khz_80band_fmax8k_256x"
+    blobs = repo / "blobs"
+    snap = repo / "snapshots" / "a9d8b711c344f3c49cc1a05d0c8b6741cf733aa8"
+    blobs.mkdir(parents=True)
+    for rel, text in _UPSTREAM_STUBS.items():
+        blob = blobs / hashlib.sha256((rel + text).encode()).hexdigest()
+        blob.write_text(text)
+        _file_symlink(blob, snap / rel)
+    return snap
+
+
+class TestUpstreamImportGuardOnTheHFCache:
+    """INV-13's import guard against the real HuggingFace cache layout.
+
+    The first Kaggle run failed here: Python loads through snapshots/<rev>/, whose
+    files are symlinks into blobs/, and the guard compared the resolved module file
+    against the snapshot DIRECTORY. It now compares resolved file with resolved
+    snapshot entry. These tests build the symlinks; they do not mock them.
+    """
+
+    def test_symlinked_snapshot_passes(self, hf_snapshot, isolated_imports):
+        from vocoders.bigvgan import import_upstream
+
+        modules = import_upstream(hf_snapshot)
+        loaded = Path(modules["bigvgan"].__file__).resolve()
+        # The layout really reproduces the failure: what Python loaded resolves into
+        # blobs/, outside the snapshot directory the old guard compared against.
+        assert "blobs" in loaded.parts
+        assert not loaded.is_relative_to(hf_snapshot.resolve())
+        assert {n: m.WHO for n, m in modules.items()} == {
+            "bigvgan": "bigvgan", "meldataset": "meldataset", "env": "env"
+        }
+
+    def test_a_second_load_in_the_same_process_passes(self, hf_snapshot, isolated_imports):
+        """The pre-import check sees upstream's own modules, symlinked, from the first load."""
+        from vocoders.bigvgan import import_upstream
+
+        import_upstream(hf_snapshot)
+        assert "utils" in sys.modules and "alias_free_activation" in sys.modules
+        import_upstream(hf_snapshot)
+
+    def test_module_resolving_outside_the_snapshot_fails(
+        self, hf_snapshot, isolated_imports, tmp_path
+    ):
+        """A same-named file earlier on sys.path wins the import; the guard must catch it."""
+        from vocoders.bigvgan import import_upstream
+
+        impostor = tmp_path / "site-packages"
+        impostor.mkdir()
+        (impostor / "bigvgan.py").write_text("WHO = 'impostor'\n")
+        sys.path[:0] = [str(impostor), str(hf_snapshot)]  # snapshot present, but behind it
+        with pytest.raises(InvariantViolation, match="INV-13: imported 'bigvgan'"):
+            import_upstream(hf_snapshot)
+
+    def test_same_named_module_already_imported_from_elsewhere_fails(
+        self, hf_snapshot, isolated_imports, tmp_path
+    ):
+        from vocoders.bigvgan import import_upstream
+
+        stray = type(sys)("utils")
+        stray.__file__ = str(tmp_path / "site-packages" / "utils.py")
+        sys.modules["utils"] = stray
+        with pytest.raises(InvariantViolation, match="INV-13: a module named 'utils'"):
+            import_upstream(hf_snapshot)
+
+
+class TestUpstreamImportGuardThroughADirectoryLink:
+    """The namespace-package branch (alias_free_activation has no __init__) through a
+    real directory link. Junctions need no privilege on Windows, so unlike the file
+    symlinks above this runs everywhere."""
+
+    def _snapshot(self, tmp_path) -> Path:
+        store = tmp_path / "store" / "alias_free_activation"
+        (store / "torch").mkdir(parents=True)
+        (store / "torch" / "__init__.py").write_text("")
+        snap = tmp_path / "snapshot"
+        snap.mkdir()
+        for name in ("bigvgan", "meldataset", "env"):
+            (snap / f"{name}.py").write_text(f"WHO = {name!r}\n")
+        _dir_link(store, snap / "alias_free_activation")
+        return snap
+
+    def test_namespace_package_through_the_link_passes(self, tmp_path, isolated_imports):
+        import importlib
+
+        from vocoders.bigvgan import import_upstream
+
+        snap = self._snapshot(tmp_path)
+        sys.path.insert(0, str(snap))
+        namespace = importlib.import_module("alias_free_activation")
+        (entry,) = list(namespace.__path__)
+        assert Path(entry).resolve() != Path(entry).absolute(), "the link was not followed"
+        import_upstream(snap)
+
+    def test_namespace_package_from_elsewhere_fails(self, tmp_path, isolated_imports):
+        from vocoders.bigvgan import import_upstream
+
+        snap = self._snapshot(tmp_path)
+        other = tmp_path / "elsewhere" / "alias_free_activation"
+        other.mkdir(parents=True)
+        stray = type(sys)("alias_free_activation")
+        stray.__path__ = [str(other)]
+        sys.modules["alias_free_activation"] = stray
+        with pytest.raises(InvariantViolation, match="INV-13: a module named 'alias_free"):
+            import_upstream(snap)
+
+
+# ============================================================ audit agrees with the CLI
+
+
+class TestAuditAgreesWithTheCLI:
+    def test_blocked_column_is_exactly_what_preflight_refuses_for_pins(self, corpus, tmp_path):
+        """For every generable condition: the audit says blocked if and only if
+        preflight refuses it on INV-08 grounds. Other refusals (missing torch here)
+        are environmental, not properties of the condition."""
+        from experiments.phase_a_resynthesis import preflight
+        from vocoders.registry import ALL_CONDITIONS, checkpoint_audit
+
+        rows = {r["condition"]: r for r in checkpoint_audit(include_unavailable=False)}
+        for cond in ALL_CONDITIONS:
+            try:
+                preflight(corpus, [cond], tmp_path / f"out-{cond}", N_UTTS)
+                refused_on_pins = False
+            except InvariantViolation as err:
+                refused_on_pins = str(err).startswith("INV-08")
+            assert refused_on_pins == rows[cond]["blocked"], cond
+
+    def test_missing_pins_are_named(self):
+        from vocoders.registry import checkpoint_audit
+
+        rows = {r["condition"]: r for r in checkpoint_audit()}
+        for cond in ("bigvgan_base", "bigvgan_v2_22khz_fullband"):
+            assert rows[cond]["missing_pins"] == "checkpoint_sha256", cond
+            assert rows[cond]["blocked"] is True, cond
+        for cond in ("bigvgan_112m", "vocos", "griffin_lim"):
+            assert rows[cond]["missing_pins"] == "" and rows[cond]["blocked"] is False, cond
+
+
+# ============================================================ HF_TOKEN
+
+_SENTINEL = "hf_SENTINELtokenVALUEthatMUSTneverAPPEAR0123"
+
+
+class TestHFToken:
+    def test_optional_and_read_from_the_environment(self, monkeypatch):
+        from vocoders.checkpoints import hf_token
+
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+        assert hf_token() is None
+        monkeypatch.setenv("HF_TOKEN", "   ")
+        assert hf_token() is None
+        monkeypatch.setenv("HF_TOKEN", _SENTINEL)
+        assert hf_token() == _SENTINEL
+
+    def _recording_downloader(self, root, calls):
+        def download(*, repo_id, filename, revision, token):
+            calls.append(token)
+            path = root / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"w")
+            return str(path)
+        return download
+
+    def test_bigvgan_downloads_carry_the_token_when_set(self, tmp_path, monkeypatch):
+        import hashlib
+
+        from vocoders.bigvgan import LARGE_SPEC, fetch_pinned_snapshot
+
+        spec = replace(LARGE_SPEC, checkpoint_sha256=hashlib.sha256(b"w").hexdigest())
+        for value, expected in ((_SENTINEL, _SENTINEL), (None, None)):
+            if value is None:
+                monkeypatch.delenv("HF_TOKEN", raising=False)
+            else:
+                monkeypatch.setenv("HF_TOKEN", value)
+            calls = []
+            fetch_pinned_snapshot(spec, self._recording_downloader(tmp_path / "s", calls))
+            assert calls and set(calls) == {expected}
+
+    def test_token_never_appears_in_a_failure(self, tmp_path, monkeypatch):
+        from vocoders.bigvgan import LARGE_SPEC, fetch_pinned_snapshot
+
+        monkeypatch.setenv("HF_TOKEN", _SENTINEL)
+        with pytest.raises(InvariantViolation) as err:  # digest mismatch
+            fetch_pinned_snapshot(LARGE_SPEC, self._recording_downloader(tmp_path / "s", []))
+        assert _SENTINEL not in str(err.value)
+
+    def test_token_never_appears_in_run_output(self, corpus, tmp_path, monkeypatch, capsys):
+        from experiments.cli import main
+
+        monkeypatch.setenv("HF_TOKEN", _SENTINEL)
+        _register(monkeypatch, lambda w: w)
+        out = tmp_path / "run"
+        assert main(["resynth", "--corpus-root", str(corpus), "--conditions", "hifigan_v1",
+                     "--out-dir", str(out), "--n-utterances", str(N_UTTS),
+                     "--device", "cpu"]) == 0
+        captured = capsys.readouterr()
+        assert _SENTINEL not in captured.out + captured.err
+        texts = [p for p in out.rglob("*") if p.suffix in (".json", ".csv")]
+        assert texts
+        for p in texts:
+            assert _SENTINEL not in p.read_text(encoding="utf-8"), p.name

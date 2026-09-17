@@ -177,6 +177,13 @@ def checkpoint_audit(include_unavailable: bool = True) -> list[dict[str, object]
         else:
             pin = "UNPINNED"
 
+        # What the adapter's load() refuses to run without. Phase A's preflight
+        # enforces the same list, so `blocked` here agrees with what the CLI will
+        # actually accept (bigvgan_base and the full-band control carry a revision
+        # but no weight digest, which their adapter requires).
+        missing_pins = [
+            f for f in type(get_vocoder(key)).required_pins if not getattr(spec, f)
+        ]
         mel_verified = not spec.mel.source.startswith("TODO")
         ckpt_known = bool(spec.checkpoint) and not spec.checkpoint.startswith(
             ("TODO", "BLOCKED")
@@ -191,8 +198,10 @@ def checkpoint_audit(include_unavailable: bool = True) -> list[dict[str, object]
                 **{f"in_{a}": not is_excluded(a, key) for a in ANALYSES},
                 "checkpoint": spec.checkpoint or "(none required)",
                 "pin": pin,
+                "missing_pins": ",".join(missing_pins),
                 "mel_verified": mel_verified,
                 "blocked": unavailable
+                or bool(missing_pins)
                 or (needs_ckpt and not (ckpt_known and pin != "UNPINNED" and mel_verified)),
             }
         )

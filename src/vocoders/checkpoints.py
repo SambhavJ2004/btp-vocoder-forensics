@@ -23,11 +23,28 @@ unlogged change to a condition, and it looks exactly like a result (INV-08).
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 from data.invariants import InvariantViolation
 
 _CHUNK = 1 << 20  # 1 MiB
+
+# Optional Hugging Face token, read from the environment only (INV-15: never a
+# file in the repo, never a notebook literal). Authenticated downloads avoid the
+# anonymous rate limit; they do not change what is downloaded, because every
+# download is pinned by revision and, for BigVGAN, verified by digest.
+HF_TOKEN_ENV = "HF_TOKEN"
+
+
+def hf_token() -> str | None:
+    """The token from ``HF_TOKEN``, or None when unset or blank.
+
+    Never print, log or record the return value -- not in errors, provenance,
+    gates.json or the manifest. Callers pass it straight to huggingface_hub.
+    """
+    value = os.environ.get(HF_TOKEN_ENV, "").strip()
+    return value or None
 
 
 def sha256_file(path: str | Path) -> str:

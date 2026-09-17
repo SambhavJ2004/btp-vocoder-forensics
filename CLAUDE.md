@@ -450,7 +450,10 @@ one of them:
 working `load()`. Each adapter declares `required_pins`, which Phase A's preflight
 checks before generating anything. So `bigvgan_base` and the full-band control,
 pinned by revision only, are refused before generation rather than failing after
-the real condition has been written.
+the real condition has been written. `checkpoint_audit` reports the same thing:
+its `missing_pins` column names the absent pin and `blocked` is true, so
+`btpvf audit` never lists a condition as runnable that the CLI would refuse
+(`TestAuditAgreesWithTheCLI`).
 
 The rule's *"fix sampler step counts"* is still aspirational for any future
 diffusion-style adapter.
@@ -601,6 +604,28 @@ repository did not measure that, and it is recorded as reported, not as a findin
 Adapters also declare the `runtime_modules` they need, and preflight checks those
 are importable before any audio is generated.
 
+**Upstream code runs only if it provably came from the pinned snapshot.**
+BigVGAN's own code imports itself by generic top-level names (`utils`, `env`), so
+`vocoders.bigvgan.import_upstream` refuses a same-named module already imported
+from elsewhere, and refuses an import that resolved anywhere but the snapshot.
+Both sides of that comparison are **resolved paths**: the module's file, and the
+snapshot's own entry for that name. The HuggingFace cache keeps content in
+`blobs/` and makes `snapshots/<revision>/` a tree of symlinks into it.
+
+The first version resolved the module's file but compared it against the snapshot
+*directory*, so every correctly loaded module failed. That is what stopped the
+first Kaggle run at BigVGAN. The fixed comparison is an equality on what Python
+actually loaded, which is at least as strict as the old prefix test.
+
+- **On Linux (WSL)**, a stdlib-only script runs the old and fixed guards against a
+  real symlinked cache. It reproduces the Kaggle failure with the old one; with the
+  fixed one, both legitimate loads pass and the impostor and same-named cases
+  still raise.
+- **In the suite**, `TestUpstreamImportGuardOnTheHFCache` builds real file
+  symlinks and skips where the OS refuses them (Windows without Developer Mode).
+  `TestUpstreamImportGuardThroughADirectoryLink` uses a junction and runs
+  everywhere; the old guard fails it.
+
 ---
 
 ### INV-14 — Matched and mismatched are never conflated
@@ -639,6 +664,17 @@ file is deleted, and it is not the team's data alone that is at risk.
 
 **Enforced by.** [`.gitignore`](.gitignore). If a credential is ever committed,
 rotate the key first, then clean the history — in that order.
+
+**The one credential the pipeline reads: `HF_TOKEN`, optional.**
+`vocoders.checkpoints.hf_token()` reads it from the environment. BigVGAN passes it
+explicitly to every `hf_hub_download`. Vocos's `from_pretrained` has no token
+parameter, and gets it through huggingface_hub's own reading of `HF_TOKEN`.
+Unset, downloads are anonymous and may be rate limited; set, nothing about *what*
+is downloaded changes, because every download is pinned by revision.
+
+It is never printed, logged or recorded: `TestHFToken` runs a whole gated run with
+a sentinel token and asserts it appears in no output, sidecar or error. The
+notebook ships the Kaggle Secrets lines commented out.
 
 ---
 
@@ -1352,25 +1388,24 @@ nudge a pipeline toward a preferred answer.
   (`melgan_fullband` was removed, so the two-digests-must-match note no longer
   applies.)
 
-- **OPEN — first real Phase A run: built, not yet executed.** The
-  `griffin_lim`, `bigvgan_112m` and `vocos` adapters are implemented, and
-  `btpvf resynth` runs every gate and writes output only if all of them pass.
-  `notebooks/kaggle_v0.ipynb` drives it for 200 utterances. What is **not**
-  established:
-  - **Real weights.** The neural adapters have never run against real weights.
-    torch is deliberately absent from the development environment (INV-13), so
-    their tests cover the gates around loading (pins, digest, config, module
-    provenance, device), not the forward pass.
-  - **Alignment.** No condition has an INV-16 record yet. The probe runs on the
-    Kaggle run, and a non-zero lag blocks the condition; it is not a tolerance to
-    widen.
-  - **The weight digest.** Whether `meta.json`'s digest is of
-    `bigvgan_generator.pt` is assumed; the file hashed was never recorded. A
-    mismatch fails at `load()`, before any BigVGAN audio.
-  - **Sanity probes.** Whether they pass on real vocoder output is unknown.
-    `bigvgan_112m` in particular is a full-band vocoder with about 80% of real's
-    high-band energy, and is not exempt from the bandwidth probe.
+- **OPEN — first real Phase A run: partly executed.** The first Kaggle run of
+  `notebooks/kaggle_v0.ipynb` established:
+  - **Real condition.** 200/200 utterances through every gate, in 36 s.
+  - **The weight digest.** `bigvgan_generator.pt` at the pinned revision matches
+    `meta.json`'s sha256, which settles which file that digest was of.
+  - **`--keep-failed`.** It left staging aside as `resynth_v0.failed`.
 
+  It then stopped at BigVGAN on a **false positive in the INV-13 import guard**:
+  resolved module path against an unresolved snapshot directory, on the
+  HuggingFace symlink cache. That is fixed (INV-13), but not yet re-run on Kaggle.
+  Still **not** established:
+  - **Forward pass.** No neural adapter has produced audio from real weights.
+  - **Alignment.** No condition has an INV-16 record yet.
+  - **Sanity probes.** Whether they pass on real vocoder output is unknown.
+    `bigvgan_112m` is a full-band vocoder with about 80% of real's high-band
+    energy, and is not exempt from the bandwidth probe.
+
+  Remove `resynth_v0.failed` before re-running; preflight refuses while it exists.
   Closes when the notebook completes on Kaggle with every gate passed.
 - **Two-tier storage cost.** Every utterance now exists twice. At ~3000
   utterances x 6 conditions x 2 tiers the archive is roughly 2.4x the previous

@@ -788,7 +788,12 @@ class TestLadder:
         # HuggingFace-hosted: pinned by revision SHA.
         for key in ("vocos", "bigvgan_base", "bigvgan_v2_22khz_fullband"):
             assert rows[key]["pin"] == "hf-revision", key
-            assert rows[key]["blocked"] is False, key
+        assert rows["vocos"]["blocked"] is False
+        # ...but the BigVGAN adapter also requires a weight digest, which these two
+        # lack. The audit reports that, so it agrees with what Phase A accepts.
+        for key in ("bigvgan_base", "bigvgan_v2_22khz_fullband"):
+            assert rows[key]["missing_pins"] == "checkpoint_sha256", key
+            assert rows[key]["blocked"] is True, key
         # bigvgan_112m additionally carries the weight-file digest from meta.json.
         assert rows["bigvgan_112m"]["pin"] == "hf-revision+sha256"
         assert rows["bigvgan_112m"]["blocked"] is False

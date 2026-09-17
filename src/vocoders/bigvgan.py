@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import re
 import sys
 from collections.abc import Callable
@@ -232,7 +233,7 @@ def fetch_pinned_snapshot(
     ``spec.checkpoint_sha256`` before anything from the snapshot is imported or
     loaded (INV-08): a swapped checkpoint must fail here, not after audio exists.
     """
-    from .checkpoints import verify_checkpoint
+    from .checkpoints import hf_token, verify_checkpoint
 
     if not spec.checkpoint_revision:
         raise InvariantViolation(
@@ -248,9 +249,12 @@ def fetch_pinned_snapshot(
 
         download = hf_hub_download
 
+    token = hf_token()  # optional; None means huggingface_hub's own default
     files = (*UPSTREAM_CODE_FILES, UPSTREAM_CONFIG, UPSTREAM_WEIGHTS)
     paths = {
-        f: Path(download(repo_id=spec.checkpoint, filename=f, revision=spec.checkpoint_revision))
+        f: Path(download(
+            repo_id=spec.checkpoint, filename=f, revision=spec.checkpoint_revision, token=token
+        ))
         for f in files
     }
     root = paths["bigvgan.py"].parent
@@ -264,38 +268,68 @@ def fetch_pinned_snapshot(
     return root
 
 
-def _module_origin(module) -> list[str]:
+def _module_origin(module) -> list[Path]:
+    """Where Python actually loaded ``module`` from, with every symlink followed."""
     file = getattr(module, "__file__", None)
     if file:
-        return [str(Path(file).resolve())]
-    return [str(Path(p).resolve()) for p in getattr(module, "__path__", [])]
+        return [Path(file).resolve()]
+    return [Path(p).resolve() for p in getattr(module, "__path__", [])]
+
+
+def _expected_origin(root: Path, name: str, module) -> Path:
+    """Where ``name`` lives in the snapshot, with every symlink followed.
+
+    A module with a file is ``<name>.py`` or ``<name>/__init__.py``; a namespace
+    package (``alias_free_activation`` has no ``__init__``) is its directory.
+    """
+    if getattr(module, "__file__", None):
+        for entry in (root / f"{name}.py", root / name / "__init__.py"):
+            if os.path.lexists(entry):
+                return entry.resolve()
+        return (root / f"{name}.py").resolve()  # absent: matches no real file
+    return (root / name).resolve()
+
+
+def _from_snapshot(module, root: Path, name: str) -> bool:
+    """True only if every origin of ``module`` IS the snapshot's own entry.
+
+    Both sides are resolved. The HuggingFace cache stores content in ``blobs/``
+    and makes ``snapshots/<revision>/`` a tree of symlinks into it, so Python
+    legitimately reports a loaded module's file under ``blobs/``. The first
+    version of this check resolved the module's path but compared it against the
+    snapshot DIRECTORY, whose files are symlinks -- so every correctly loaded
+    module failed it (the first real Kaggle run). Comparing the resolved module
+    file with the resolved snapshot ENTRY for that name is at least as strict:
+    it is an equality on what Python loaded, not a prefix test on a directory.
+    """
+    expected = _expected_origin(root, name, module)
+    origins = _module_origin(module)
+    return bool(origins) and all(origin == expected for origin in origins)
 
 
 def import_upstream(root: Path) -> dict:
     """Import upstream's modules from ``root`` and prove they came from there."""
-    root = Path(root).resolve()
-
-    def inside(module) -> bool:
-        origins = _module_origin(module)
-        return bool(origins) and all(Path(o).is_relative_to(root) for o in origins)
+    root = Path(root)
 
     for name in UPSTREAM_MODULES:
         existing = sys.modules.get(name)
-        if existing is not None and not inside(existing):
+        if existing is not None and not _from_snapshot(existing, root, name):
             raise InvariantViolation(
                 f"INV-13: a module named {name!r} is already imported from "
-                f"{_module_origin(existing)}. BigVGAN's code imports itself by that "
-                "top-level name and would silently get the wrong module. Run the "
-                "condition in a fresh process."
+                f"{[str(o) for o in _module_origin(existing)]}, which is not the pinned "
+                f"snapshot's {name!r} ({_expected_origin(root, name, existing)}). "
+                "BigVGAN's code imports itself by that top-level name and would silently "
+                "get the wrong module. Run the condition in a fresh process."
             )
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
     modules = {n: importlib.import_module(n) for n in ("bigvgan", "meldataset", "env")}
     for name, module in modules.items():
-        if not inside(module):
+        if not _from_snapshot(module, root, name):
             raise InvariantViolation(
-                f"INV-13: imported {name!r} from {_module_origin(module)}, not from the "
-                f"pinned snapshot {root}."
+                f"INV-13: imported {name!r} from "
+                f"{[str(o) for o in _module_origin(module)]}, not from the pinned "
+                f"snapshot's {name!r} ({_expected_origin(root, name, module)})."
             )
     return modules
 
