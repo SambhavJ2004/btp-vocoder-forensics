@@ -82,18 +82,25 @@ from vocoders.registry import get_spec, get_vocoder
 
 def _emit_pair(
     wav_archive: np.ndarray,
-    measured_archive: float,
+    loudness: LoudnessRecord,
     out_dir: Path,
     condition: str,
     utt_id: str,
     zeroshot_meter: pyln.Meter,
 ) -> tuple[Path, Path, float, int]:
-    """Write the archive artifact, then derive and write the zero-shot artifact."""
+    """Write the archive artifact, then derive and write the zero-shot artifact.
+
+    The write is verified against the ANALYSIS-BAND loudness, because that is
+    where the target is defined (INV-04). The full-band value is what the derived
+    tier's drift is measured against, since that tier is a full-band downsample.
+    """
     archive_path = out_dir / ARCHIVE_TIER / condition / f"{utt_id}.wav"
-    write_audio(archive_path, wav_archive, ARCHIVE_SR, measured_lufs=measured_archive)
+    write_audio(
+        archive_path, wav_archive, ARCHIVE_SR, measured_lufs=loudness.lufs_out_band
+    )
 
     wav_zs, measured_zs = derive_zeroshot(
-        wav_archive, archive_lufs=measured_archive, meter=zeroshot_meter
+        wav_archive, archive_lufs=loudness.lufs_out, meter=zeroshot_meter
     )
     if would_clip(wav_zs):
         raise InvariantViolation(
@@ -143,6 +150,7 @@ def _rows_for(
             loudness_gain_db=loudness.gain_db,
             loudness_target_lufs=loudness.target_lufs,
             lufs_in_band=loudness.lufs_in_band,
+            lufs_out_band=loudness.lufs_out_band,
         )
         if loudness is not None
         else {}
@@ -230,7 +238,7 @@ def build_real_condition(
             continue
 
         archive_path, zs_path, lufs_zs, n_zs = _emit_pair(
-            norm, measured, out_dir, REAL_CONDITION, utt.utt_id, zs_meter
+            norm, loudness, out_dir, REAL_CONDITION, utt.utt_id, zs_meter
         )
         spans[utt.utt_id] = span
         real_archive[utt.utt_id] = norm
@@ -328,7 +336,7 @@ def build_vocoder_condition(
     rows: list[ManifestRow] = []
     for utt_id, wav, measured, n_archive, speaker, high_band, loudness in staged:
         archive_path, zs_path, lufs_zs, n_zs = _emit_pair(
-            wav, measured, out_dir, condition, utt_id, zs_meter
+            wav, loudness, out_dir, condition, utt_id, zs_meter
         )
         rows.extend(
             _rows_for(

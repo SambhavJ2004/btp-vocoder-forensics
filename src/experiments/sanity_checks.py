@@ -22,12 +22,17 @@ import pandas as pd
 
 from data.audio_io import read_processed
 from data.invariants import (
+    ARCHIVE_SR,
     ARCHIVE_TIER,
     HIGH_BAND_ANALYSIS,
     REAL_CONDITION,
     SANITY_EER_FLOOR,
     TIER_RATES,
     TIERS,
+    TRIM_FRAME_LENGTH,
+    TRIM_HOP_LENGTH,
+    TRIM_PAD_MS,
+    TRIM_TOP_DB,
     InvariantViolation,
     is_excluded,
 )
@@ -197,3 +202,132 @@ def run_all(manifest: pd.DataFrame, split: str | None = "eval") -> pd.DataFrame:
             if tier == ARCHIVE_TIER:
                 out.append(bandwidth_probe(manifest, cond, split, tier))
     return pd.DataFrame(out)
+
+
+# --- Diagnosing a silence-probe hit ------------------------------------------
+
+
+SILENCE_DIAGNOSTIC_THRESHOLDS: tuple[float, ...] = (-60.0, -50.0, -40.0, -30.0, -20.0)
+
+
+def reference_silent_mask(real: np.ndarray, sr: int = ARCHIVE_SR) -> np.ndarray:
+    """Samples the REAL reference considers silent, by INV-03's own criterion.
+
+    Frames more than ``TRIM_TOP_DB`` below the file's loudest frame -- the rule
+    ``librosa.effects.trim`` applies, evaluated over the whole file instead of
+    only its ends. Derived from real and applied by index to every condition, so
+    every condition is measured over exactly the same samples (INV-03).
+    """
+    import librosa
+
+    rms = librosa.feature.rms(
+        y=real, frame_length=TRIM_FRAME_LENGTH, hop_length=TRIM_HOP_LENGTH, center=True
+    )[0]
+    db = librosa.amplitude_to_db(rms, ref=np.max)
+    silent_frames = db < -TRIM_TOP_DB
+    mask = np.repeat(silent_frames, TRIM_HOP_LENGTH)[: len(real)]
+    if len(mask) < len(real):
+        mask = np.pad(mask, (0, len(real) - len(mask)), constant_values=False)
+    return mask
+
+
+def _dbfs(x: np.ndarray) -> float:
+    if x.size == 0:
+        return float("nan")
+    return float(20.0 * np.log10(max(float(np.sqrt(np.mean(x.astype(np.float64) ** 2))), 1e-12)))
+
+
+def silence_diagnostic(
+    manifest: pd.DataFrame,
+    *,
+    tier: str = ARCHIVE_TIER,
+    split: str | None = None,
+    thresholds: tuple[float, ...] = SILENCE_DIAGNOSTIC_THRESHOLDS,
+    limit: int | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Why a condition separates on silence duration. Diagnosis, not a gate.
+
+    Returns two frames:
+
+      floors   per condition: the level inside the REAL reference's silent
+               regions, and how much of the file those regions are. A vocoder
+               that reconstructs noise where the reference has near-silence
+               reads higher here than real does.
+      sweep    per condition and threshold: the silence probe's own feature
+               (leading + trailing silence duration) recomputed at that
+               threshold, and its EER against real. If the separation is
+               reconstruction noise sitting at some level, it collapses once the
+               threshold is well above that level; if it survives every
+               threshold, the cause is not the noise floor.
+
+    Neither frame decides anything. INV-12 says a leak blocks the condition, and
+    whether this one is reconstruction noise (a vocoder artifact) or a pipeline
+    fault is a judgement for a human to make on these numbers.
+    """
+    sub, sr = _tier_rows(manifest, tier, split)
+    utts = sorted(sub[sub["condition"] == REAL_CONDITION]["utt_id"].unique())
+    if limit is not None:
+        utts = utts[:limit]
+    conditions = [c for c in sorted(sub["condition"].unique()) if c != REAL_CONDITION]
+    paths = {
+        (str(r.condition), str(r.utt_id)): r.path
+        for r in sub.itertuples()
+        if str(r.utt_id) in set(utts)
+    }
+
+    floors: dict[str, list[float]] = {c: [] for c in (REAL_CONDITION, *conditions)}
+    pads: dict[str, list[float]] = {c: [] for c in (REAL_CONDITION, *conditions)}
+    silent_fraction: list[float] = []
+    features: dict[float, dict[str, list[float]]] = {
+        t: {c: [] for c in (REAL_CONDITION, *conditions)} for t in thresholds
+    }
+
+    for utt in utts:
+        real = read_processed(paths[(REAL_CONDITION, utt)], sr)
+        mask = reference_silent_mask(real, sr)
+        silent_fraction.append(float(mask.mean()))
+        for cond in (REAL_CONDITION, *conditions):
+            wav = real if cond == REAL_CONDITION else read_processed(paths[(cond, utt)], sr)
+            n = min(len(wav), len(mask))
+            floors[cond].append(_dbfs(wav[:n][mask[:n]]))
+            # The probe reads inward from both ends, so the trim pad is the
+            # region it actually sees (INV-03 keeps TRIM_PAD_MS of context).
+            pad = int(round(TRIM_PAD_MS * 1e-3 * sr))
+            pads[cond].append(_dbfs(np.concatenate([wav[:pad], wav[-pad:]])))
+            for t in thresholds:
+                lead, trail = _leading_trailing_silence(wav, sr, threshold_db=t)
+                features[t][cond].append(lead + trail)
+
+    floor_rows = [
+        {
+            "condition": cond,
+            "n": len(values),
+            "silent_region_dbfs_median": float(np.nanmedian(values)),
+            "silent_region_dbfs_p90": float(np.nanpercentile(values, 90)),
+            "above_real_db": float(np.nanmedian(values) - np.nanmedian(floors[REAL_CONDITION])),
+            "trim_pad_dbfs_median": float(np.nanmedian(pads[cond])),
+            "trim_pad_above_real_db": float(
+                np.nanmedian(pads[cond]) - np.nanmedian(pads[REAL_CONDITION])
+            ),
+            "reference_silent_fraction": float(np.mean(silent_fraction)),
+        }
+        for cond, values in floors.items()
+    ]
+
+    sweep_rows = []
+    for t in thresholds:
+        for cond in conditions:
+            real_feature = np.asarray(features[t][REAL_CONDITION])
+            cond_feature = np.asarray(features[t][cond])
+            eer, _ = compute_eer(real_feature, cond_feature)
+            sweep_rows.append(
+                {
+                    "threshold_dbfs": t,
+                    "condition": cond,
+                    "eer": eer,
+                    "leaked_at_floor": bool(eer < SANITY_EER_FLOOR),
+                    "real_silence_s_mean": float(real_feature.mean()),
+                    "condition_silence_s_mean": float(cond_feature.mean()),
+                }
+            )
+    return pd.DataFrame(floor_rows), pd.DataFrame(sweep_rows)

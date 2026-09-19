@@ -19,9 +19,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 
-from data.invariants import ARCHIVE_SR, LADDER_FMAX, InvariantViolation
+from data.invariants import (
+    ARCHIVE_SR,
+    ARCHIVE_TIER,
+    LADDER_FMAX,
+    SANITY_EER_FLOOR,
+    InvariantViolation,
+)
+from experiments.sanity_checks import SILENCE_DIAGNOSTIC_THRESHOLDS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 N_UTTS = 22  # >= ALIGNMENT_PROBE_FILES
@@ -764,3 +772,118 @@ class TestHFToken:
         assert texts
         for p in texts:
             assert _SENTINEL not in p.read_text(encoding="utf-8"), p.name
+
+
+class TestSilenceDiagnostic:
+    """INV-12 diagnosis: WHY a condition separates on silence duration.
+
+    The first full v0 run tripped the probe on griffin_lim (EER 0.350 archive,
+    0.355 zeroshot). Trim spans are reference-derived, so the difference cannot
+    be leading/trailing silence LENGTH; it has to be what sits inside those
+    regions. This reports the level there, per condition, and sweeps the probe's
+    own threshold. It decides nothing: the floor and the verdicts are untouched.
+    """
+
+    FLOOR_DBFS = -70.0
+    NOISE_DBFS = -45.0
+
+    def _corpus(self, tmp_path, noise_dbfs=NOISE_DBFS):
+        """real: speech between quiet pads. 'griffin_lim': the same, with low-level
+        noise added everywhere -- the shape of a phase-reconstruction floor."""
+        from data.audio_io import write_audio
+
+        rows = []
+        for i in range(12):
+            rng = np.random.default_rng(i)
+            n = int(1.0 * ARCHIVE_SR)
+            t = np.arange(n) / ARCHIVE_SR
+            speech = 0.3 * np.sin(2 * np.pi * (120 + i) * t)
+            edge = int(0.005 * ARCHIVE_SR)  # abrupt edges: a taper would swamp the floor
+            speech[:edge] *= np.linspace(0, 1, edge)
+            speech[-edge:] *= np.linspace(1, 0, edge)
+            pad = np.zeros(int(0.2 * ARCHIVE_SR))
+            real = np.concatenate([pad, speech, pad]).astype(np.float32)
+            real = (real + rng.normal(0, 10 ** (self.FLOOR_DBFS / 20), len(real))).astype(
+                np.float32
+            )
+            noisy = (real + rng.normal(0, 10 ** (noise_dbfs / 20), len(real))).astype(np.float32)
+            for cond, wav in (("real", real), ("griffin_lim", noisy)):
+                path = tmp_path / cond / f"u{i:02d}.wav"
+                write_audio(path, wav, ARCHIVE_SR)
+                rows.append({"utt_id": f"u{i:02d}", "condition": cond, "tier": ARCHIVE_TIER,
+                             "path": str(path), "split": "eval",
+                             "duration_s": len(wav) / ARCHIVE_SR})
+        return pd.DataFrame(rows)
+
+    def test_reference_silent_mask_is_derived_from_real_alone(self):
+        from experiments.sanity_checks import reference_silent_mask
+
+        n = int(0.5 * ARCHIVE_SR)
+        loud = 0.3 * np.sin(2 * np.pi * 200 * np.arange(n) / ARCHIVE_SR)
+        wav = np.concatenate([np.zeros(n), loud, np.zeros(n)]).astype(np.float32)
+        mask = reference_silent_mask(wav, ARCHIVE_SR)
+        assert len(mask) == len(wav)
+        assert mask[: n // 2].all() and mask[-n // 2:].all()
+        assert not mask[n + n // 4: n + n // 2].any()
+
+    def test_it_finds_the_elevated_floor_and_where_the_separation_dies(self, tmp_path):
+        from experiments.sanity_checks import silence_diagnostic, silence_probe
+
+        df = self._corpus(tmp_path)
+        # The probe fires, exactly as it did on the real run.
+        assert silence_probe(df, "griffin_lim", split=None)["leaked"]
+
+        floors, sweep = silence_diagnostic(df, split=None)
+        gl = floors.set_index("condition").loc["griffin_lim"]
+        # The injected floor is well above real's, in the regions real calls silent
+        # and in the trim pad the probe actually reads.
+        assert gl["above_real_db"] > 6.0
+        assert gl["trim_pad_above_real_db"] > 6.0
+        assert floors.set_index("condition").loc["real", "above_real_db"] == 0.0
+
+        at = sweep.set_index("threshold_dbfs")
+        assert at.loc[-60.0, "eer"] < SANITY_EER_FLOOR, "separable at a floor-level threshold"
+        # What distinguishes a noise floor from a duration difference: once the
+        # threshold is well above the added noise, the two conditions measure the
+        # SAME silence. The EER is read on the feature, not the other way round --
+        # with the durations agreeing to microseconds it is unstable on near-ties.
+        assert at.loc[-60.0, "condition_silence_s_mean"] < (
+            0.5 * at.loc[-60.0, "real_silence_s_mean"]
+        )
+        assert abs(
+            at.loc[-30.0, "condition_silence_s_mean"] - at.loc[-30.0, "real_silence_s_mean"]
+        ) < 0.005
+
+    def test_a_condition_with_no_added_noise_separates_nowhere(self, tmp_path):
+        from experiments.sanity_checks import silence_diagnostic
+
+        df = self._corpus(tmp_path, noise_dbfs=-200.0)
+        floors, sweep = silence_diagnostic(df, split=None)
+        assert abs(floors.set_index("condition").loc["griffin_lim", "above_real_db"]) < 1.0
+        assert (
+            (sweep["condition_silence_s_mean"] - sweep["real_silence_s_mean"]).abs() < 0.005
+        ).all()
+
+    def test_it_is_diagnosis_and_changes_no_verdict(self, tmp_path):
+        """The gate keeps its floor, and silence is never expected_by_design."""
+        from experiments.sanity_checks import run_all, silence_diagnostic
+
+        df = self._corpus(tmp_path)
+        before = run_all(df, split=None)
+        silence_diagnostic(df, split=None)
+        after = run_all(df, split=None)
+        pd.testing.assert_frame_equal(before, after)
+        silence = before[before["probe"] == "silence_duration"]
+        assert silence["leaked"].all()
+        assert not silence["expected_by_design"].any()
+
+    def test_cli_writes_both_tables(self, tmp_path):
+        from experiments.cli import main
+
+        manifest = tmp_path / "m.csv"
+        self._corpus(tmp_path).to_csv(manifest, index=False)
+        out = tmp_path / "diag"
+        assert main(["silence-diag", "--manifest", str(manifest), "--out-dir", str(out)]) == 0
+        assert (out / "silence_floors.csv").is_file()
+        sweep = pd.read_csv(out / "silence_threshold_sweep.csv")
+        assert set(sweep["threshold_dbfs"]) == set(SILENCE_DIAGNOSTIC_THRESHOLDS)

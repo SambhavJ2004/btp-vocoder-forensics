@@ -83,11 +83,12 @@ LOUDNESS_TOLERANCE_LU: Final[float] = 0.5  # verification tolerance, not a knob
 # which is precisely the artifact under study. See CLAUDE.md INV-01.
 DERIVED_LOUDNESS_DRIFT_LIMIT_LU: Final[float] = 2.0
 
-# INV-04, made observable. Every archive manifest row records the loudness the
-# normaliser measured, the gain it applied and the target, so the gain each
-# condition received is a recorded fact rather than an estimate. The recorded
-# gain is measured from the arrays and must equal target - lufs_in to within
-# this; anything more means the normaliser did something other than one gain.
+# INV-04, made observable. Every archive manifest row records both loudness
+# measurements, the gain applied and the target, so the gain each condition
+# received is a recorded fact rather than an estimate. The recorded gain is
+# measured from the arrays and must equal target - lufs_in_BAND to within this;
+# anything more means the normaliser did something other than one gain, or
+# referenced something other than the analysis band.
 LOUDNESS_GAIN_RECORD_TOLERANCE_DB: Final[float] = 1e-3
 
 # The smallest uniform level offset the committed linear probe resolves: lbfgs
@@ -616,8 +617,8 @@ PIPELINE_ORDER: Final[tuple[str, ...]] = (
     "align_length",        # -> reference length            (INV-06)
     "apply_ref_trim",      # -> reference trim boundaries   (INV-03)
     "measure_high_band",   # -> recorded, NOT filtered      (INV-17)
-    "measure_band_loudness",  # -> recorded, NOT used for gain (INV-04)
-    "normalise_loudness",  # -> LOUDNESS_TARGET_LUFS, gain recorded (INV-04)
+    "measure_band_loudness",  # -> the gain's reference           (INV-04)
+    "normalise_loudness",  # -> band hits LOUDNESS_TARGET_LUFS  (INV-04)
     "encode",              # -> WAV / PCM_16                (INV-05)
 )
 

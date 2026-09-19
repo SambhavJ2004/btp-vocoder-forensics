@@ -16,15 +16,17 @@ Manifest columns exist to answer specific questions:
   - ``lufs_out``     : INV-04. Proves loudness landed on target (archive), and
                        records the band-limiting drift (derived).
   - ``lufs_in`` / ``loudness_gain_db`` / ``loudness_target_lufs``
-                     : INV-04, archive rows. What the normaliser measured, the
-                       gain it applied, and the target. Normalisation is
-                       full-band, so a condition with less high-band energy is
-                       given a larger gain; recording it makes that measurable.
+                     : INV-04, archive rows. The full-band loudness before the
+                       gain (evidence), the gain applied, and the target.
                        NaN on derived rows, which are never re-normalised.
-  - ``lufs_in_band`` : INV-04, archive rows. Pre-normalisation loudness on the
-                       analysis band. Recorded, never used for the gain. With
-                       the gain it gives the in-band level the primary analysis
-                       sees, which is what loudness_gain_report compares.
+  - ``lufs_in_band`` / ``lufs_out_band``
+                     : INV-04, archive rows. The analysis-band loudness before
+                       and after the gain. The gain is REFERENCED to
+                       ``lufs_in_band``, so ``lufs_out_band`` lands on the
+                       target and the in-band level is matched across
+                       conditions; ``lufs_out`` then differs by each file's
+                       high-band share. loudness_gain_report compares the
+                       measured ``lufs_out_band``.
   - ``split``        : INV-09. Frozen once, shared across conditions and tiers.
   - ``alignment_*``  : INV-16. Proves the vocoder is sample-aligned.
   - ``archive_band_hz`` / ``archive_band``
@@ -55,6 +57,7 @@ from .invariants import (
     LOUDNESS_GAIN_RECORD_TOLERANCE_DB,
     LOUDNESS_PROBE_RESOLUTION_DB,
     LOUDNESS_TARGET_LUFS,
+    LOUDNESS_TOLERANCE_LU,
     MAX_RESAMPLE_STEPS,
     PRIMARY_ANALYSIS,
     REAL_CONDITION,
@@ -88,6 +91,7 @@ MANIFEST_COLUMNS: tuple[str, ...] = (
     "loudness_gain_db",
     "loudness_target_lufs",
     "lufs_in_band",
+    "lufs_out_band",
     "trim_start",
     "trim_end",
     "trim_ref_length",
@@ -148,6 +152,7 @@ class ManifestRow:
     loudness_gain_db: float | None = None
     loudness_target_lufs: float | None = None
     lufs_in_band: float | None = None
+    lufs_out_band: float | None = None
     vocoder_checkpoint: str | None = None
     vocoder_commit: str | None = None
     seed: int | None = None
@@ -378,7 +383,9 @@ def _validate_band(df: pd.DataFrame) -> None:
         )
 
 
-_LOUDNESS_RECORD = ("lufs_in", "loudness_gain_db", "loudness_target_lufs", "lufs_in_band")
+_LOUDNESS_RECORD = (
+    "lufs_in", "loudness_gain_db", "loudness_target_lufs", "lufs_in_band", "lufs_out_band",
+)
 
 
 def _validate_loudness_record(df: pd.DataFrame) -> None:
@@ -413,13 +420,21 @@ def _validate_loudness_record(df: pd.DataFrame) -> None:
                 f"{sorted(set(rec['loudness_target_lufs']))}, expected "
                 f"{LOUDNESS_TARGET_LUFS} LUFS for every condition."
             )
-        implied = rec["loudness_target_lufs"] - rec["lufs_in"]
+        implied = rec["loudness_target_lufs"] - rec["lufs_in_band"]
         off = (rec["loudness_gain_db"] - implied).abs() > LOUDNESS_GAIN_RECORD_TOLERANCE_DB
         if off.any():
             raise InvariantViolation(
                 f"INV-04: {int(off.sum())} archive rows record a gain that is not "
-                "target - lufs_in. Normalisation is one gain to one target; anything "
-                "else means a second gain stage or a mis-recorded row."
+                "target - lufs_in_band. The target is defined on the analysis band; a "
+                "gain referenced to the full band puts each condition's high-band "
+                "deficit inside the primary analysis as a level offset."
+            )
+        landed = (rec["lufs_out_band"] - rec["loudness_target_lufs"]).abs()
+        if (landed > LOUDNESS_TOLERANCE_LU).any():
+            raise InvariantViolation(
+                f"INV-04: {int((landed > LOUDNESS_TOLERANCE_LU).sum())} archive rows "
+                f"miss the target in the analysis band by more than "
+                f"{LOUDNESS_TOLERANCE_LU} LU."
             )
     derived = df[df["tier"] != ARCHIVE_TIER]
     gain_cols = ["lufs_in", "loudness_gain_db", "loudness_target_lufs"]
@@ -466,7 +481,8 @@ def loudness_gain_report(df: pd.DataFrame) -> pd.DataFrame:
     resolve less.
     """
     archive = select_tier(df, ARCHIVE_TIER)
-    need = ["utt_id", "condition", "high_band_fraction", *_LOUDNESS_RECORD]
+    need = [c for c in ("utt_id", "condition", "high_band_fraction", *_LOUDNESS_RECORD)
+            if c != "lufs_out_band"]
     missing = [c for c in need if c not in archive.columns]
     if missing:
         raise InvariantViolation(
@@ -477,7 +493,17 @@ def loudness_gain_report(df: pd.DataFrame) -> pd.DataFrame:
     if real.empty:
         raise InvariantViolation("INV-06: no real rows to measure gain deltas against.")
 
+    measured_band = "lufs_out_band" in archive.columns and archive["lufs_out_band"].notna().all()
+
     def in_band_level(frame: pd.DataFrame) -> pd.Series:
+        """The in-band level after the gain: measured where the manifest records it.
+
+        Manifests written before the target moved to the analysis band have no
+        ``lufs_out_band``; for those it is derived, which is what makes the old
+        run's numbers still reproducible.
+        """
+        if measured_band:
+            return frame["lufs_out_band"].astype(float)
         return frame["lufs_in_band"].astype(float) + frame["loudness_gain_db"].astype(float)
 
     from vocoders.registry import CONTROL_CONDITIONS
@@ -503,6 +529,7 @@ def loudness_gain_report(df: pd.DataFrame) -> pd.DataFrame:
                 **_spread(gain, "gain_delta_db"),
                 **_spread(band, "band_offset_db"),
                 "band_offset_x_resolution": abs(band.mean()) / LOUDNESS_PROBE_RESOLUTION_DB,
+                "band_level_source": "measured" if measured_band else "derived",
                 "high_band_fraction_delta_mean": hb.mean(),
                 "in_primary_analysis": (
                     not is_excluded(PRIMARY_ANALYSIS, str(cond))

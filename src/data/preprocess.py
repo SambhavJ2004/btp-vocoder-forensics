@@ -36,7 +36,7 @@ Two design points that are easy to get wrong:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import NamedTuple
 
@@ -366,26 +366,26 @@ def apply_trim_span(wav: np.ndarray, span: TrimSpan) -> np.ndarray:
 
 @dataclass(frozen=True)
 class LoudnessRecord:
-    """INV-04, made observable: what the normaliser saw and what it did, per file.
+    """INV-04: what the normaliser measured, what it applied, and what came out.
 
-    Normalisation runs on the FULL band, so a condition with less high-band
-    energy than real is given a slightly larger gain, and that gain also moves
-    everything below LADDER_FMAX. Recording the gain is what lets a real run
-    measure that instead of estimating it (CLAUDE.md, open item on per-condition
-    gain deltas). Nothing here feeds back into the gain.
+    The gain is referenced to ``lufs_in_band`` -- the loudness of the signal
+    band-limited to LADDER_FMAX -- and applied to the full-band audio. So
+    ``lufs_out_band`` lands on the target and ``lufs_out`` sits above it by
+    whatever that file's high band contributes, which is a per-condition
+    quantity and is therefore recorded rather than equalised.
 
-    ``lufs_in_band`` is the same pre-normalisation measurement on the analysis
-    band. It is what separates the two things a gain delta mixes: level
-    differences the full-band normaliser is SUPPOSED to equalise, and the part
-    driven by above-band content, which lands inside the band-limited primary
-    analysis as ``(lufs_in_band + gain_db)`` differing from real's.
+    Both measurements are kept on every row so the change of reference is
+    auditable after the fact: ``target - lufs_in`` is the gain the old full-band
+    rule would have applied, and the difference between the two is exactly the
+    level offset that used to land inside the primary analysis.
     """
 
-    lufs_in: float                 # integrated loudness before normalisation, full band
+    lufs_in: float                 # before, full band -- evidence, not the reference
+    lufs_in_band: float            # before, analysis band -- the gain's reference
     gain_db: float                 # gain applied, measured from the arrays
     target_lufs: float
-    lufs_out: float                # after normalisation (the manifest's lufs_out)
-    lufs_in_band: float | None = None   # before normalisation, band-limited to LADDER_FMAX
+    lufs_out: float                # after, full band (drifts up by the high-band share)
+    lufs_out_band: float           # after, analysis band -- lands on target
 
 
 class Finalised(NamedTuple):
@@ -400,33 +400,47 @@ class Finalised(NamedTuple):
 def normalise_loudness_recorded(
     wav: np.ndarray, meter: pyln.Meter | None = None, *, sr: int = ARCHIVE_SR
 ) -> tuple[np.ndarray, LoudnessRecord]:
-    """INV-04. Bring the waveform to the fixed LUFS target, and record the gain.
+    """INV-04. Gain the waveform so its ANALYSIS BAND hits the LUFS target.
 
-    The single implementation of loudness normalisation; :func:`normalise_loudness`
-    is this with the record reduced to ``lufs_out``. The normalisation itself is
-    unchanged by the recording: one integrated-loudness measurement, one gain to
-    the target, the same arrays out.
+    The single implementation of loudness normalisation. The reference is the
+    band-limited signal; the gain is applied to the full-band audio, which is
+    what gets written. Measured on the first real run, full-band referencing put
+    a level offset inside the band-limited primary analysis that tracked each
+    condition's high-band deficit exactly -- 0.05 dB for BigVGAN and 0.30 dB for
+    Griffin-Lim, against a probe resolution of 0.0035 dB. See CLAUDE.md INV-04.
 
     Peak protection is deliberately NOT applied here: silently attenuating one
     file would break the "identical target across conditions" guarantee. The
     caller drops the utterance from every condition instead.
     """
+    if sr != ARCHIVE_SR:
+        raise InvariantViolation(
+            f"INV-04: the target is defined on the analysis band at {ARCHIVE_SR} Hz, so "
+            f"normalisation at {sr} Hz is not meaningful. The derived tier is never "
+            "re-normalised (INV-01)."
+        )
     meter = meter or pyln.Meter(sr)
-    loudness_in = meter.integrated_loudness(wav)
-    if not np.isfinite(loudness_in):
+    loudness_in = float(meter.integrated_loudness(wav))          # evidence only
+    loudness_in_band = float(meter.integrated_loudness(band_limit_to_ladder(wav, sr=sr)))
+    if not np.isfinite(loudness_in_band) or not np.isfinite(loudness_in):
         raise InvariantViolation("INV-04: loudness undefined (silent or too short).")
-    out = pyln.normalize.loudness(wav, loudness_in, LOUDNESS_TARGET_LUFS)
+    out = pyln.normalize.loudness(wav, loudness_in_band, LOUDNESS_TARGET_LUFS)
     lufs_out = float(meter.integrated_loudness(out))
     out = out.astype(np.float32)
+    # Measured, not derived from the gain: metering gates on absolute level, so a
+    # gained signal is re-measured rather than assumed to shift exactly.
+    lufs_out_band = float(meter.integrated_loudness(band_limit_to_ladder(out, sr=sr)))
     # The gain the written file actually carries, not the one that was intended.
     gain_db = 20.0 * np.log10(
         np.linalg.norm(out.astype(np.float64)) / np.linalg.norm(np.asarray(wav, np.float64))
     )
     return out, LoudnessRecord(
-        lufs_in=float(loudness_in),
+        lufs_in=loudness_in,
+        lufs_in_band=loudness_in_band,
         gain_db=float(gain_db),
         target_lufs=float(LOUDNESS_TARGET_LUFS),
         lufs_out=lufs_out,
+        lufs_out_band=lufs_out_band,
     )
 
 
@@ -471,7 +485,7 @@ def finalise_trimmed(
 
     Steps, in this order and no other:
       measure_high_band (INV-17, descriptive) -> measure_band_loudness (INV-04,
-      descriptive) -> normalise_loudness (INV-04, gain recorded)
+      the gain's reference) -> normalise_loudness (INV-04, gain recorded)
 
     Every condition reaches this function, and reaches it by the same route.
     That is the whole point: the real reference and the vocoder conditions have
@@ -492,18 +506,17 @@ def finalise_trimmed(
     normalisation keeps the number comparable across conditions, since gain
     would otherwise scale it.
 
-    Returns a :class:`Finalised`: the normalised waveform, its measured
+    Returns a :class:`Finalised`: the normalised waveform, its measured full-band
     loudness, the fraction of energy above LADDER_FMAX (evidence, not a gate --
     Griffin-Lim reads ~0 here and real ~0.018), and the :class:`LoudnessRecord`.
-    The two measurements before normalisation are recorded and never used: the
-    gain is computed exactly as it was before they existed.
+    The high-band fraction is measured before the gain so it stays comparable
+    across conditions; the gain itself is referenced to the analysis band inside
+    :func:`normalise_loudness_recorded`.
     """
     meter = meter or pyln.Meter(ARCHIVE_SR)
     wav = wav_trimmed
     high_band = out_of_band_energy(wav, ARCHIVE_SR, LADDER_FMAX)
-    lufs_in_band = measure_band_loudness(wav, meter)
     wav, record = normalise_loudness_recorded(wav, meter=meter, sr=ARCHIVE_SR)
-    record = replace(record, lufs_in_band=lufs_in_band)
     return Finalised(wav, record.lufs_out, high_band, record)
 
 

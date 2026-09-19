@@ -181,9 +181,12 @@ bandwidth — and cannot be attributed wholly to generalisation failure. Likewis
 UTMOS and PESQ are blind above 8 kHz, so the headline correlation relates a
 band-limited quality estimate to a full-band detectability estimate.
 
-**Loudness interaction.** The derived tier is **not re-normalised**.
-Downsampling discards energy above 8 kHz, which lowers measured loudness
-slightly. Re-normalising would apply a gain *proportional to each file's
+**Loudness interaction.** The derived tier is **not re-normalised**. Since the
+archive gain is referenced to the analysis band (INV-04), the derived tier is
+already band-matched across conditions: it inherits a gain computed on the band
+it is about to keep. Downsampling discards energy above 8 kHz, which lowers
+measured loudness slightly — by each file's high-band share, which is the same
+quantity `lufs_out` now records. Re-normalising would apply a gain *proportional to each file's
 high-band energy* — encoding the artifact under study directly into the gain,
 which is the worst available outcome. The drift is recorded in the manifest and
 bounded by `DERIVED_LOUDNESS_DRIFT_LIMIT_LU = 2.0`; a larger drift means an
@@ -270,15 +273,48 @@ trimming" literally true rather than approximately true.
 
 ### INV-04 — Loudness: one normalisation target, no per-file exceptions
 
-**Rule.** Every condition is normalised to `-27.0 LUFS` (ITU-R BS.1770).
-When a file would exceed the `-1.0 dBFS` peak ceiling, **drop that utterance
-from every condition** — never attenuate it in one.
+**Rule.** Every condition is normalised to `-27.0 LUFS` (ITU-R BS.1770),
+**measured on the signal band-limited to `LADDER_FMAX`** and applied to the
+full-band audio. When a file would exceed the `-1.0 dBFS` peak ceiling, **drop
+that utterance from every condition** — never attenuate it in one.
 
 **Why.** Level differences between conditions are trivially learnable; a
 detector can reach a low EER on RMS alone, having learned nothing forensic. The
 X-axis needs it too: UTMOS and PESQ are both level-sensitive, so an
 un-normalised set would confound *both* axes at once and the correlation between
 them would be partly an artifact of gain.
+
+**The target is defined on the analysis band, and that is a change in what the
+number means.** It used to be the loudness of the whole signal. It is now the
+loudness of the band the primary analysis actually sees. A file's full-band
+level is therefore no longer `-27.0 LUFS`: it sits above it by however much that
+file's high band contributes, which differs per condition and is recorded rather
+than equalised.
+
+The reason is measured, not theoretical. Full-band normalisation makes the gain
+depend on high-band energy, so a condition with less of it is gained more, and
+that extra gain lands on **every** bin — including the ones below `LADDER_FMAX`
+that the primary analysis compares. The first full v0 run measured exactly that,
+on 200 LJSpeech utterances:
+
+| condition | gain delta vs real | in-band offset | × probe resolution | high-band fraction delta |
+|---|---|---|---|---|
+| `vocos` | 0.184 dB | −0.0022 dB | 0.6 | +0.0010 |
+| `bigvgan_112m` | 0.231 dB | **0.0506 dB** | 14.4 | −0.0064 |
+| `griffin_lim` | 0.763 dB | **0.3018 dB** | 86.2 | −0.0324 |
+
+The in-band offset tracked the high-band deficit across all three: Vocos has
+none and reads clean, Griffin-Lim has the largest and reads worst. A level offset
+that large is trivially learnable, and it points the same way as the hypothesis —
+the lowest-quality condition gets the biggest offset — so it would have
+manufactured part of the headline correlation.
+
+Referencing the gain to the band removes it at the source: every condition's
+in-band loudness is now the same number by construction, so the primary analysis
+compares like with like. The high-band analysis gains something too: it now
+measures high-band energy against a low-band-matched level, which is the more
+meaningful reference. What used to be a level offset is now visible where it
+belongs, in `lufs_out` and in `high_band_fraction`.
 
 The no-exceptions clause is the part that gets rationalised away under time
 pressure. Quietly attenuating one clipping file makes that file's loudness
@@ -294,26 +330,29 @@ and `_emit_pair` deliberately omits it for the derived tier, which is not
 re-normalised and legitimately drifts; that tier is bounded instead by
 `check_derived_loudness`), `experiments.sanity_checks.loudness_probe`.
 
-**The gain is recorded, not just its result.** Normalisation runs on the full
-band, so the gain a file receives depends on its high-band energy as well as its
-level (INV-18, and the open item on per-condition gain deltas). Every archive
-manifest row records four values:
+**The gain is recorded, not just its result.** Every archive manifest row
+records five values, so the change of reference is auditable per file:
 
-- `lufs_in`, what the normaliser measured;
+- `lufs_in`, the full-band loudness before the gain — evidence, not the reference;
+- `lufs_in_band`, the analysis-band loudness before the gain — **what the gain is
+  referenced to**;
 - `loudness_gain_db`, the gain the written file carries, measured from the arrays;
 - `loudness_target_lufs`;
-- `lufs_in_band`, the same pre-normalisation measurement on the analysis band.
+- `lufs_out_band`, the analysis-band loudness after the gain — it lands on target.
 
-The last one is recorded and never used for the gain. Derived rows record none of
-them, because they are never normalised.
+`target − lufs_in` is the gain the old full-band rule would have applied, so the
+difference between the two rules stays computable from any manifest. Derived rows
+record none of them, because they are never normalised.
 `data.preprocess.normalise_loudness_recorded` is the single implementation, and
-`normalise_loudness` is it with the record dropped. Recording does not change the
-arrays: `TestINV04LoudnessRecord` checks the output byte for byte against the
-unrecorded logic. `data.manifest._validate_loudness_record` gates on the record
-being present on archive rows, equal to `target − lufs_in` within
-`LOUDNESS_GAIN_RECORD_TOLERANCE_DB`, and absent on derived rows. It never gates on
-the value. `data.manifest.loudness_gain_report` (`btpvf loudness`) turns the
-record into per-condition deltas against real.
+`normalise_loudness` is it with the record dropped.
+`data.manifest._validate_loudness_record` gates on the record being present on
+archive rows, on the gain equalling `target − lufs_in_band` within
+`LOUDNESS_GAIN_RECORD_TOLERANCE_DB`, on `lufs_out_band` landing on target within
+`LOUDNESS_TOLERANCE_LU`, and on derived rows carrying none of it. A manifest whose
+gain is referenced to the full band is refused. `data.manifest.loudness_gain_report`
+(`btpvf loudness`) compares the **measured** `lufs_out_band` across conditions, and
+`TestINV04LoudnessRecord` pins the Griffin-Lim-shaped case — no high band at all,
+which read 86× the probe resolution — at or below that resolution.
 
 ---
 
@@ -564,6 +603,14 @@ a retracted one.
 The bandwidth probe is the one legitimate grey area — a genuine high-band
 vocoder artifact also moves effective bandwidth — so read a hit there as
 "inspect the spectra", not automatically as "confound".
+
+**Diagnosing a hit is separate from deciding about it.**
+`experiments.sanity_checks.silence_diagnostic` (`btpvf silence-diag`) reports, per
+condition, the level inside the regions the REAL reference calls silent, the level
+in the trim pad the probe actually reads, and the probe's own feature swept across
+thresholds. `real` is a row in that table, so the pipeline's own floor is visible
+next to each condition's. It changes no verdict and no floor — see the open item
+on griffin_lim's silence probe.
 
 **Enforced by.** `experiments.sanity_checks.run_all`; the CLI exits non-zero on
 a leak.
@@ -1056,11 +1103,17 @@ and in the **same** band it reads a non-degenerate 0.5291 for the lossier defaul
 above-band control is under `PROBE_CONTROL_MIN_AUROC`. Full reasoning, with the
 mechanism reproduced: [`docs/measurements.md`](docs/measurements.md).
 
-**The loudness step — a threshold with a margin, not a gate.** The pipeline
-normalises on the full band, so a round trip that removes high-band energy gets a
-slightly larger gain, which shifts every below-band bin. Measured on real audio
-(the `_norm` probes above), the coupling shows at a 0.02986 dB gain delta
-(0.5291 → 0.5348) and not at 0.001534 dB or 4.62e-05 dB.
+**The loudness step — measured, then removed at the source.** The `_norm` probes
+measured the **old** rule, where the gain was referenced to the full band: a round
+trip that removes high-band energy was gained more, and that shifted every
+below-band bin. INV-04 now references the gain to the analysis band, so a pair
+differing only above `LADDER_FMAX` receives the *same* gain and there is no shift
+to detect. For such a pair the **raw** probes are now the pipeline-matching ones,
+and they read 0.5000 below the band for the pin.
+
+The bracket below is kept because it is what justified the change, and because it
+still bounds any residual coupling. Measured on real audio, the coupling showed at
+a 0.02986 dB gain delta (0.5291 → 0.5348) and not at 0.001534 dB or 4.62e-05 dB.
 
 - **It is a bracket.** Onset lies in (0.001534, 0.02986] dB. "~0.0015 dB" is the
   highest measured null, not a located threshold.
@@ -1307,43 +1360,41 @@ nudge a pipeline toward a preferred answer.
   −6 dB at the cutoff and 7e-06 to 3e-04 of energy surviving above it. Ported to
   the two-edge design (INV-17): −1 dB at cutoff − 85 Hz, ≤ −200 dB at and above
   the cutoff, order 31–60. Analysis-time only; no regeneration.
-- **OPEN — the loudness coupling is not specific to resamplers (estimated, not
-  yet measured).** Loudness is normalised on the full band, so every condition
-  with less high-band energy than real gets a larger gain, and so a below-band
-  level offset in the band-limited primary analysis. Scaling from the committed
-  `_norm` deltas (7.4–9.8 dB per unit of total energy removed above
-  `LADDER_FMAX`) gives these estimates:
-  - about 0.03–0.04 dB for BigVGAN and Vocos (CSV high-band ratios 0.8055 and
-    0.8040; the Vocos row predates the pin). That is the size at which the
-    default resampler's coupling *was* detected.
-  - about 0.15–0.20 dB for Griffin-Lim, a trace of the cliff INV-18 relies on the
-    band limit to remove.
+- **RESOLVED — the loudness coupling was real, and the target moved to the
+  analysis band.** The first full v0 run measured it on 200 LJSpeech utterances:
+  in-band offsets of −0.0022 dB (vocos), 0.0506 dB (bigvgan_112m) and 0.3018 dB
+  (griffin_lim), tracking each condition's high-band deficit, against a probe
+  resolution of 0.0035 dB. The estimates that opened this item (0.03–0.04 and
+  0.15–0.20 dB) were the right size. INV-04 now references the gain to the
+  band-limited signal, which removes the offset by construction; both loudness
+  measurements stay on every row so the old rule remains computable. The archive
+  must be regenerated — every file's gain changes.
+- **OPEN, YOUR DECISION — griffin_lim trips the silence probe.** The first full
+  v0 run: EER **0.350** archive, **0.355** zeroshot, against a 0.40 floor. Trim
+  spans are reference-derived, so this cannot be a difference in silence LENGTH;
+  it is what sits inside those regions.
 
-  The committed linear probe's resolution is about 0.0035 dB.
+  Diagnosed locally, on synthetic audio through the real Griffin-Lim adapter and
+  the real pipeline (the Kaggle audio is not in this repository):
+  - Griffin-Lim's level inside the regions real calls silent is **13.2 dB above
+    real's** (−57.7 vs −71.0 dBFS with a −65 dBFS room tone), and **10.0 dB above**
+    in the trim pad the probe actually reads.
+  - The separation **collapses to chance at a −30 dBFS threshold** (EER 0.50),
+    well above that reconstruction noise, and is total below it.
+  - `real` goes through the identical trim, loudness and PCM_16 path and shows no
+    elevated floor, so the common pipeline steps are not the cause.
 
-  **Instrumented, not yet run.** Phase A now records the loudness gain on every
-  archive row (INV-04), and `btpvf loudness --manifest ...` reports, per
-  condition against real and per utterance, with n and spread:
-  - `gain_delta_db`, the gain difference;
-  - `band_offset_db`, the in-band level difference after normalisation, which is
-    what the primary analysis sees.
-
-  The second one decides this item. A gain delta also contains plain level
-  differences that full-band normalisation is *meant* to remove, and those never
-  reach the band. A condition that is only 1 dB quieter shows a 1 dB gain delta
-  and a zero band offset. On synthetic audio carrying real's 2% high band, a 20%
-  deficit gives a 0.044 dB band offset and a total loss gives 0.22 dB
-  (`TestINV04LoudnessRecord`).
-
-  **Closes when** a real Phase A run on LJSpeech reports measured gain deltas
-  per condition, with the in-band offset and its per-utterance spread. The
-  decision is then made on those numbers: leave loudness as it is, or level-match
-  the band-limited comparison set at analysis time. The second would be a
-  deliberate change to INV-04 / INV-07, not a patch. Until then, nothing about
-  the loudness logic changes. See [`docs/measurements.md`](docs/measurements.md).
-- **Regenerate every condition.** The archive changed meaning: files produced
-  under the old INV-17 are band-limited at 8 kHz and cannot be reused. Nothing
-  generated before this change is valid.
+  That is consistent with phase reconstruction smearing energy into near-silent
+  regions — a vocoder artifact — but it is **synthetic audio, not the run's**. It
+  is not marked `expected_by_design` and the floor is unchanged. Run
+  `btpvf silence-diag --manifest .../resynth_v0.failed/manifest.csv` on the real
+  files before deciding. At a −20 dBFS threshold the separation returns (EER 0.18
+  locally), because there the probe is reading speech onsets rather than silence,
+  which is a different effect and a real one.
+- **Regenerate every condition.** The archive changed meaning twice: files
+  produced under the old INV-17 are band-limited at 8 kHz, and files produced
+  before INV-04's move to the analysis band carry a full-band-referenced gain.
+  Nothing generated before these changes is valid, including the first v0 run.
 
 - **MelGAN is the band outlier, not the laggard.** The audit found
   `descriptinc/melgan-neurips` uses `mel_fmax=None` → 11025 Hz, so MelGAN is the
@@ -1395,18 +1446,23 @@ nudge a pipeline toward a preferred answer.
     `meta.json`'s sha256, which settles which file that digest was of.
   - **`--keep-failed`.** It left staging aside as `resynth_v0.failed`.
 
-  It then stopped at BigVGAN on a **false positive in the INV-13 import guard**:
-  resolved module path against an unresolved snapshot directory, on the
-  HuggingFace symlink cache. That is fixed (INV-13), but not yet re-run on Kaggle.
-  Still **not** established:
-  - **Forward pass.** No neural adapter has produced audio from real weights.
-  - **Alignment.** No condition has an INV-16 record yet.
-  - **Sanity probes.** Whether they pass on real vocoder output is unknown.
-    `bigvgan_112m` is a full-band vocoder with about 80% of real's high-band
-    energy, and is not exempt from the bandwidth probe.
+  The second run generated **all four conditions at 200 utterances**, so the
+  INV-13 import-guard fix holds on the real cache and both neural adapters produce
+  audio from real weights. It then failed the INV-12 gate on griffin_lim's silence
+  probe (its own open item above), which is the gate working rather than a defect
+  in it.
 
-  Remove `resynth_v0.failed` before re-running; preflight refuses while it exists.
-  Closes when the notebook completes on Kaggle with every gate passed.
+  Still **not** established:
+  - **A complete pass.** No run has yet cleared every gate.
+  - **Alignment.** The INV-16 records from that run are in
+    `resynth_v0.failed/manifest.alignment.json`; they are not in this repository.
+  - **The bandwidth probe on bigvgan_112m.** It did not fire in that run; whether
+    it holds at 3000 utterances is untested.
+
+  The next run also regenerates under band-referenced loudness (INV-04), so its
+  audio differs from the v0 run's by each file's gain. Remove `resynth_v0.failed`
+  before re-running; preflight refuses while it exists. Closes when the notebook
+  completes on Kaggle with every gate passed.
 - **Two-tier storage cost.** Every utterance now exists twice. At ~3000
   utterances x 6 conditions x 2 tiers the archive is roughly 2.4x the previous
   footprint, against a 20 GB per-account Kaggle limit. Publish the tiers as

@@ -6,6 +6,7 @@ Usage:
                                       # Phase A, every gate, output only if all pass
     btpvf validate --manifest ...     # manifest-level invariant gate
     btpvf sanity   --manifest ...     # confound-leakage probes, both tiers
+    btpvf silence-diag --manifest ... # diagnose a silence-probe hit (not a gate)
     btpvf provenance --manifest ...   # INV-01 derivation paths per tier
     btpvf loudness --manifest ...     # INV-04 gain delta and in-band offset vs real
     btpvf quality  --manifest ...     # Phase B, X-axis
@@ -53,6 +54,14 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--manifest", required=True)
     s.add_argument("--split", default="eval")
     s.add_argument("--out", default="results/sanity.csv")
+
+    sd = sub.add_parser(
+        "silence-diag",
+        help="diagnose a silence-probe hit: noise floor in silent regions, threshold sweep",
+    )
+    sd.add_argument("--manifest", required=True)
+    sd.add_argument("--out-dir", default="results")
+    sd.add_argument("--limit", type=int, default=None, help="utterances to read (default all)")
 
     q = sub.add_parser("quality", help="Phase B: quality metrics")
     q.add_argument("--manifest", required=True)
@@ -136,6 +145,30 @@ def main(argv: list[str] | None = None) -> int:
         if df["leaked"].any():
             print("\nCONFOUND LEAK: fix the pipeline and regenerate. Do not relax the floor.")
             return 1
+        return 0
+
+    if args.cmd == "silence-diag":
+        import pandas as pd
+
+        from experiments.sanity_checks import silence_diagnostic
+
+        # Read tolerantly: this runs on manifests written by earlier versions,
+        # including the failed run being diagnosed.
+        df = pd.read_csv(args.manifest)
+        missing = {"utt_id", "condition", "tier", "path", "split"} - set(df.columns)
+        if missing:
+            raise SystemExit(f"manifest lacks {sorted(missing)}")
+        floors, sweep = silence_diagnostic(df, limit=args.limit)
+        out_dir = Path(args.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        floors.to_csv(out_dir / "silence_floors.csv", index=False)
+        sweep.to_csv(out_dir / "silence_threshold_sweep.csv", index=False)
+        print("level inside the reference's silent regions:")
+        print(floors.to_string(index=False))
+        print("\nthe probe's own feature, swept over thresholds:")
+        print(sweep.to_string(index=False))
+        print(f"\nwritten to {out_dir}/silence_floors.csv and silence_threshold_sweep.csv")
+        print("Diagnosis only: INV-12's floor and verdicts are unchanged.")
         return 0
 
     if args.cmd == "quality":

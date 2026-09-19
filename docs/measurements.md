@@ -470,6 +470,84 @@ the leak assertion at every cutoff.
 
 ---
 
+## The first v0 run, 200 LJSpeech utterances
+
+Not committed here: the audio and its manifest live in the Kaggle working
+directory (`resynth_v0.failed`). These are the numbers it produced, recorded
+because two invariants moved because of them.
+
+### Loudness: the coupling, measured on real audio
+
+`btpvf loudness` on that run, per condition against real, paired by utterance:
+
+| condition | gain delta | in-band offset | × probe resolution | high-band fraction delta |
+|---|---|---|---|---|
+| `vocos` | 0.184 dB | −0.0022 dB | 0.6 | +0.0010 |
+| `bigvgan_112m` | 0.231 dB | **0.0506 dB** | 14.4 | −0.0064 |
+| `griffin_lim` | 0.763 dB | **0.3018 dB** | 86.2 | −0.0324 |
+
+The in-band offset tracks the high-band fraction delta across all three, which is
+the coupling's signature: full-band normalisation turns a high-band energy
+difference into a level offset inside the band-limited primary analysis. Vocos has
+no high-band deficit and reads clean; Griffin-Lim has the largest and reads worst.
+
+The gain delta and the in-band offset are different quantities, which is why the
+report carries both: `vocos` received 0.184 dB more gain than real and still
+landed level with it inside the band, because that gain was equalising an ordinary
+level difference, not a bandwidth one.
+
+**What changed.** INV-04's target is now defined on the band-limited signal. The
+offset is zero by construction, the high-band analysis measures against a
+low-band-matched level, and both loudness measurements stay on every manifest row
+so `target − lufs_in` (the old rule's gain) remains computable. The archive must
+be regenerated.
+
+### Silence: griffin_lim trips the INV-12 probe
+
+| probe | condition | tier | EER | floor |
+|---|---|---|---|---|
+| silence_duration | griffin_lim | archive | **0.350** | 0.40 |
+| silence_duration | griffin_lim | zeroshot | **0.355** | 0.40 |
+
+Trim spans are reference-derived (INV-03), so leading and trailing silence are
+identical in LENGTH by construction. What differs is the level inside those
+regions.
+
+**Diagnosed locally**, on synthetic audio through the real Griffin-Lim adapter and
+the real pipeline — the run's audio is not in this repository, so these are not
+its numbers. Source: speech between silent pads with a −65 dBFS room tone, abrupt
+5 ms speech edges, 22 utterances:
+
+| measurement | real | griffin_lim |
+|---|---|---|
+| level inside the reference's silent regions | −71.0 dBFS | **−57.7 dBFS** (+13.2 dB) |
+| level in the trim pad the probe reads | −70.9 dBFS | **−60.9 dBFS** (+10.0 dB) |
+
+The probe's own feature, swept across thresholds:
+
+| threshold | EER | real silence | griffin_lim silence |
+|---|---|---|---|
+| −60 dBFS | 0.136 | 0.048 s | 0.022 s |
+| −50 dBFS | 0.000 | 0.061 s | 0.036 s |
+| −40 dBFS | 0.091 | 0.063 s | 0.055 s |
+| **−30 dBFS** | **0.500** | 0.066 s | 0.066 s |
+| −20 dBFS | 0.182 | 0.189 s | 0.126 s |
+
+Three things follow. The separation is total at thresholds near the noise and
+**gone at −30 dBFS**, which is what distinguishes a noise floor from a duration
+difference. `real` passes through the identical trim, loudness and PCM_16 path
+and shows no elevated floor, so the shared pipeline steps are not the cause. And
+at −20 dBFS the separation returns, because there the probe is reading speech
+onsets rather than silence — a different effect, and a real one.
+
+Consistent with phase reconstruction smearing energy into near-silent regions,
+i.e. a vocoder artifact. **Not decided**: `griffin_lim` is not marked
+`expected_by_design`, the floor is unchanged, and the run's own audio has not been
+measured. `btpvf silence-diag --manifest <run>/manifest.csv` produces both tables
+above from a completed run.
+
+---
+
 ## Claims that rest on these files
 
 | claim | where | evidence |

@@ -193,11 +193,13 @@ class TestINV04Loudness:
 
 
 class TestINV04LoudnessRecord:
-    """The loudness gain is recorded per file, so a real run can MEASURE the
-    full-band normaliser's effect on the band-limited primary analysis instead of
-    estimating it (CLAUDE.md, open item on per-condition gain deltas).
+    """The gain is referenced to the ANALYSIS BAND, and both measurements are recorded.
 
-    The loudness logic itself must not move: recording is observation only.
+    The first real run measured what full-band referencing did: it put each
+    condition's high-band deficit inside the band-limited primary analysis as a
+    level offset -- 0.05 dB for BigVGAN, 0.30 dB for Griffin-Lim, against a probe
+    resolution of 0.0035 dB. Referencing the gain to the band removes that by
+    construction, and these tests check it is actually gone.
     """
 
     @staticmethod
@@ -219,22 +221,40 @@ class TestINV04LoudnessRecord:
         x = np.fft.irfft(spec, n) * 10 ** (level_db / 20)
         return (0.2 * x / 3.0).astype(np.float32)
 
-    # --- the logic did not change -----------------------------------------
-    def test_normalisation_is_byte_identical_to_the_unrecorded_logic(self):
-        """The pre-change implementation, inlined: one meter reading, one gain."""
+    # --- the gain's reference ---------------------------------------------
+    def test_the_gain_is_referenced_to_the_band_not_the_full_signal(self):
+        """The rule, inlined: measure the band-limited signal, gain the full one."""
         import pyloudnorm as pyln
 
-        from data.preprocess import normalise_loudness, normalise_loudness_recorded
+        from data.preprocess import (
+            band_limit_to_ladder,
+            normalise_loudness,
+            normalise_loudness_recorded,
+        )
 
         x = self._wideband()
         meter = pyln.Meter(ARCHIVE_SR)
-        before = pyln.normalize.loudness(x, meter.integrated_loudness(x), LOUDNESS_TARGET_LUFS)
-        ref_wav, ref_lufs = before.astype(np.float32), float(meter.integrated_loudness(before))
+        band_lufs = meter.integrated_loudness(band_limit_to_ladder(x, sr=ARCHIVE_SR))
+        expected = pyln.normalize.loudness(x, band_lufs, LOUDNESS_TARGET_LUFS)
+        ref_wav = expected.astype(np.float32)
 
         wav, lufs = normalise_loudness(x)
         rec_wav, rec = normalise_loudness_recorded(x)
-        assert np.array_equal(wav, ref_wav) and lufs == ref_lufs
-        assert np.array_equal(rec_wav, ref_wav) and rec.lufs_out == ref_lufs
+        assert np.array_equal(wav, ref_wav)
+        assert np.array_equal(rec_wav, ref_wav)
+        assert rec.lufs_in_band == pytest.approx(band_lufs, abs=1e-9)
+        # ...and NOT the full-band rule. The band holds less energy than the whole
+        # signal, so referencing it gives a slightly LARGER gain.
+        assert rec.gain_db > LOUDNESS_TARGET_LUFS - rec.lufs_in
+        assert lufs == rec.lufs_out
+
+    def test_normalisation_at_another_rate_is_refused(self):
+        """The band is defined at the archive rate; the derived tier is never
+        re-normalised (INV-01), so there is no meaningful second case."""
+        from data.preprocess import normalise_loudness
+
+        with pytest.raises(InvariantViolation, match="INV-04.*analysis band"):
+            normalise_loudness(_quiet_tone(1.0, sr=ZEROSHOT_SR), sr=ZEROSHOT_SR)
 
     def test_band_measurement_does_not_touch_the_output(self):
         from data.preprocess import finalise_trimmed, normalise_loudness
@@ -252,11 +272,14 @@ class TestINV04LoudnessRecord:
         x = self._wideband()
         rec = finalise_trimmed(x, condition="real").loudness
         assert rec.target_lufs == LOUDNESS_TARGET_LUFS
-        assert rec.gain_db == pytest.approx(rec.target_lufs - rec.lufs_in, abs=1e-6)
-        assert abs(rec.gain_db - (rec.target_lufs - rec.lufs_in)) < (
+        assert rec.gain_db == pytest.approx(rec.target_lufs - rec.lufs_in_band, abs=1e-6)
+        assert abs(rec.gain_db - (rec.target_lufs - rec.lufs_in_band)) < (
             LOUDNESS_GAIN_RECORD_TOLERANCE_DB
         )
-        assert rec.lufs_out == pytest.approx(LOUDNESS_TARGET_LUFS, abs=1e-3)
+        # The BAND lands on target; the full-band level then sits above it by
+        # whatever this file's high band contributes, which is recorded, not equalised.
+        assert rec.lufs_out_band == pytest.approx(LOUDNESS_TARGET_LUFS, abs=1e-3)
+        assert rec.lufs_out > rec.lufs_out_band
         assert np.isfinite(rec.lufs_in_band) and rec.lufs_in_band < rec.lufs_in
 
     def test_pipeline_order_records_both_measurements_before_the_gain(self):
@@ -280,6 +303,7 @@ class TestINV04LoudnessRecord:
                     "high_band_fraction": fin.high_band_fraction,
                     "lufs_in": rec.lufs_in, "loudness_gain_db": rec.gain_db,
                     "loudness_target_lufs": rec.target_lufs, "lufs_in_band": rec.lufs_in_band,
+                    "lufs_out_band": rec.lufs_out_band,
                 })
         return pd.DataFrame(rows)
 
@@ -294,18 +318,43 @@ class TestINV04LoudnessRecord:
         assert r["gain_delta_db_mean"] == pytest.approx(1.0, abs=1e-3)
         assert abs(r["band_offset_db_mean"]) < 1e-3
 
-    def test_a_high_band_deficit_lands_inside_the_band(self):
-        """The coupling itself: less energy above LADDER_FMAX -> larger gain -> the
-        whole band-limited signal sits higher than real's, by the same amount."""
+    def _old_rule_band_offset(self, df) -> float:
+        """What the in-band offset WOULD be under full-band referencing, from the
+        same recorded measurements: gain = target - lufs_in, band level follows."""
+        rows = df.set_index(["condition", "utt_id"])
+        old_gain = rows["loudness_target_lufs"] - rows["lufs_in"]
+        level = (rows["lufs_in_band"] + old_gain).unstack(0)
+        return float((level["hifigan_v1"] - level["real"]).mean())
+
+    def test_a_high_band_deficit_no_longer_lands_inside_the_band(self):
+        """BigVGAN-shaped: 20% less energy above LADDER_FMAX. Under full-band
+        referencing this read ~0.04 dB inside the band (12x the probe resolution);
+        referenced to the band it is gone, and the deficit shows up where it
+        belongs -- in the full-band level, and in high_band_fraction."""
+        from data.invariants import LOUDNESS_PROBE_RESOLUTION_DB
         from data.manifest import loudness_gain_report
 
         df = self._frame({"real": {}, "hifigan_v1": {"hb_scale": np.sqrt(0.8)}})
         r = loudness_gain_report(df).set_index("condition").loc["hifigan_v1"]
-        # ~0.04 dB: the size estimated for BigVGAN, whose ratio to real is 0.8055.
-        assert 0.02 < r["gain_delta_db_mean"] < 0.06
-        assert r["band_offset_db_mean"] == pytest.approx(r["gain_delta_db_mean"], rel=0.01)
+        assert abs(r["band_offset_db_mean"]) <= LOUDNESS_PROBE_RESOLUTION_DB
+        assert abs(r["gain_delta_db_mean"]) <= LOUDNESS_PROBE_RESOLUTION_DB
         assert r["high_band_fraction_delta_mean"] < 0
-        assert r["n"] == 4 and r["gain_delta_db_std"] >= 0
+        assert r["n"] == 4 and r["band_level_source"] == "measured"
+        assert self._old_rule_band_offset(df) > 10 * LOUDNESS_PROBE_RESOLUTION_DB
+
+    def test_a_griffin_lim_shaped_deficit_is_within_the_probe_resolution(self):
+        """The case the first real run failed on: NO energy above LADDER_FMAX, which
+        read 0.3018 dB in band -- 86x the probe resolution. Referenced to the band
+        it is at or below that resolution."""
+        from data.invariants import LOUDNESS_PROBE_RESOLUTION_DB
+        from data.manifest import loudness_gain_report
+
+        df = self._frame({"real": {}, "hifigan_v1": {"hb_scale": 0.0}})
+        r = loudness_gain_report(df).set_index("condition").loc["hifigan_v1"]
+        assert abs(r["band_offset_db_mean"]) <= LOUDNESS_PROBE_RESOLUTION_DB
+        assert r["band_offset_x_resolution"] <= 1.0
+        # The same recorded measurements under the old rule, for comparison.
+        assert self._old_rule_band_offset(df) > 50 * LOUDNESS_PROBE_RESOLUTION_DB
 
     def test_report_refuses_unpaired_conditions(self):
         from data.manifest import loudness_gain_report
@@ -342,7 +391,27 @@ class TestINV04LoudnessRecord:
 
         df = _manifest_frame()
         df.loc[df["tier"] == ARCHIVE_TIER, "loudness_gain_db"] += 0.5
-        with pytest.raises(InvariantViolation, match="INV-04.*target - lufs_in"):
+        with pytest.raises(InvariantViolation, match="INV-04.*target - lufs_in_band"):
+            validate_manifest(df)
+
+    def test_a_gain_referenced_to_the_full_band_is_rejected(self):
+        """The old rule, in a manifest: gain = target - lufs_in. It must not pass."""
+        from data.manifest import validate_manifest
+
+        df = _manifest_frame()
+        archive = df["tier"] == ARCHIVE_TIER
+        df.loc[archive, "loudness_gain_db"] = (
+            df.loc[archive, "loudness_target_lufs"] - df.loc[archive, "lufs_in"]
+        )
+        with pytest.raises(InvariantViolation, match="INV-04.*lufs_in_band"):
+            validate_manifest(df)
+
+    def test_the_band_must_land_on_target(self):
+        from data.manifest import validate_manifest
+
+        df = _manifest_frame()
+        df.loc[df["tier"] == ARCHIVE_TIER, "lufs_out_band"] = LOUDNESS_TARGET_LUFS - 2.0
+        with pytest.raises(InvariantViolation, match="INV-04.*analysis band"):
             validate_manifest(df)
 
     def test_wrong_target_is_rejected(self):
@@ -688,10 +757,12 @@ def _manifest_frame(**overrides) -> pd.DataFrame:
                         "archive_band": "full_band",
                         "high_band_fraction": 0.015,
                         # INV-04: the normaliser's record, archive rows only.
+                        # INV-04: the gain is target - lufs_in_band, not - lufs_in.
                         "lufs_in": -30.0 if not derived else np.nan,
-                        "loudness_gain_db": 3.0 if not derived else np.nan,
+                        "loudness_gain_db": 3.2 if not derived else np.nan,
                         "loudness_target_lufs": LOUDNESS_TARGET_LUFS if not derived else np.nan,
                         "lufs_in_band": -30.2 if not derived else np.nan,
+                        "lufs_out_band": LOUDNESS_TARGET_LUFS if not derived else np.nan,
                         "vocoder_checkpoint": "", "vocoder_commit": "", "seed": 1,
                     }
                 )
@@ -2636,16 +2707,18 @@ class TestINV18ProbeControls:
 
 
 class TestINV18LoudnessCoupling:
-    """Does the below-band result survive the pipeline's loudness step? Committed.
+    """What the committed ``_norm`` probes measured: the OLD full-band rule.
 
-    Loudness is normalised on the FULL band (INV-04), so a round trip that removes
-    above-band energy gets a slightly larger gain, and that gain shifts every bin
-    below LADDER_FMAX. probes.json measures it on 200 LJSpeech files in the
-    pipeline order resample -> normalise -> quantise: keys ending ``_norm``, each
-    with the mean gain delta it induced.
+    They were taken when the gain was referenced to the whole signal, so a round
+    trip that removed above-band energy was gained more and every bin below
+    LADDER_FMAX moved with it. These numbers are why INV-04's target moved to the
+    analysis band; they are kept because they bound the coupling and because the
+    bracket they establish is still the probe's resolution.
 
-    This used to rest on a local synthetic dose-response. The committed file
-    replaces it (kaiser: 4.62e-05 dB measured against 6.4e-05 dB estimated).
+    Under the current rule a pair differing only above the band gets the same gain
+    on both sides, so there is nothing to shift and the RAW probes are the
+    pipeline-matching ones. That the offset is gone is pinned by
+    TestINV04LoudnessRecord, not here.
     """
 
     def test_file_records_both_loudness_variants_in_pipeline_order(self):
