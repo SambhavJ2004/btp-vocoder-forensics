@@ -657,6 +657,11 @@ def run_gated(
             "leaked": len(leaked),
             "expected_by_design": int(sanity["expected_by_design"].sum()),
         }
+        # INV-03/INV-12: the silence threshold is derived from this dataset's own
+        # floor, so it is a property OF the dataset and belongs in its provenance.
+        # Every sanity row carries it too; the sidecar is what survives when the
+        # CSV is read apart from the run.
+        _record_silence_calibration(staged_manifest.with_suffix(".provenance.json"), df)
         if not leaked.empty:
             raise InvariantViolation(
                 "INV-12: confound leak -- fix the pipeline and regenerate; never relax "
@@ -696,6 +701,24 @@ def run_gated(
             f"(e.g. {absent[:3]}). The output directory is not a usable dataset."
         )
     return GatedRunResult(out_dir, manifest_path, sanity, loudness, gates)
+
+
+def _record_silence_calibration(sidecar: Path, manifest: pd.DataFrame) -> None:
+    """Add the derived silence threshold, per tier, to the provenance sidecar.
+
+    Derived from real's own noise floor (INV-03/INV-12), so it differs per corpus
+    by design and cannot be reconstructed later from a constant. Recorded
+    non-strictly: the gate has already raised if the threshold does not read the
+    trim pad, and on a ``--keep-failed`` run the record is what says why.
+    """
+    from experiments.sanity_checks import silence_reference
+
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    payload["silence_threshold"] = {
+        tier: silence_reference(manifest, tier, None, strict=False).as_record()
+        for tier in sorted(set(manifest["tier"]))
+    }
+    sidecar.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _environment() -> dict:

@@ -13,9 +13,16 @@ Probes run per tier (INV-01) and the tier is reported with every row. The
 bandwidth probe is ARCHIVE-only: on the derived 16 kHz set every condition has
 passed through the same downsampler, so the probe would report a reassuring 0.5
 while saying nothing about the archive the study actually measures.
+
+The silence probe's threshold is DERIVED from the corpus, per tier, and no
+caller may supply a constant: see :func:`silence_reference`. INV-03 defines
+silence relatively and this probe compares |sample| to an absolute level, so the
+two agree only if the level is placed against the corpus's measured floor.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -27,6 +34,10 @@ from data.invariants import (
     HIGH_BAND_ANALYSIS,
     REAL_CONDITION,
     SANITY_EER_FLOOR,
+    SILENCE_FLOOR_FRAME_PERCENTILE,
+    SILENCE_FLOOR_MARGIN_DB,
+    SILENCE_FLOOR_PEAK_PERCENTILE,
+    SILENCE_PAD_AGREEMENT,
     TIER_RATES,
     TIERS,
     TRIM_FRAME_LENGTH,
@@ -39,16 +50,99 @@ from data.invariants import (
 from data.manifest import select_tier
 from detectors.eer import compute_eer
 
+# Below one least-significant bit of PCM_16 nothing is recorded, so such frames
+# carry no information about the corpus's noise floor. Excluding them stops a
+# run of digital zeros -- which is not a noise floor, it is the absence of one --
+# from dragging the floor estimate to the quantiser and the threshold with it.
+_PCM16_LSB = 1.0 / 32768.0
+
 
 def _leading_trailing_silence(
-    wav: np.ndarray, sr: int, threshold_db: float = -50.0
+    wav: np.ndarray, sr: int, *, threshold_db: float
 ) -> tuple[float, float]:
+    """Seconds of silence at each end, at an EXPLICIT threshold.
+
+    ``threshold_db`` has no default on purpose. It used to default to -50.0 dBFS,
+    a value that appeared in no constants block and had no recorded derivation,
+    and that on LJSpeech sat ~3 dB inside the corpus's own noise floor. A default
+    here is how that went unexamined: every caller got a number without ever
+    choosing one. Callers now take it from :func:`silence_reference`.
+    """
     amp = np.abs(wav)
     thr = 10 ** (threshold_db / 20.0)
     voiced = np.where(amp > thr)[0]
     if voiced.size == 0:
         return len(wav) / sr, 0.0
     return voiced[0] / sr, (len(wav) - voiced[-1]) / sr
+
+
+def _frame_rms(wav: np.ndarray, sr: int = ARCHIVE_SR) -> np.ndarray:
+    """Frame RMS on INV-03's own frame/hop, so the floor and the trimmer agree."""
+    import librosa
+
+    return librosa.feature.rms(
+        y=wav, frame_length=TRIM_FRAME_LENGTH, hop_length=TRIM_HOP_LENGTH, center=True
+    )[0]
+
+
+def _quiet_mask(wav: np.ndarray, sr: int = ARCHIVE_SR) -> np.ndarray:
+    """Samples in the quietest ``SILENCE_FLOOR_FRAME_PERCENTILE`` of the file's frames.
+
+    The quiet END of the level distribution, which is where a noise floor lives.
+    Deliberately NOT :func:`reference_silent_mask`: that uses INV-03's relative
+    criterion, ``TRIM_TOP_DB`` below the loudest frame, which on LJSpeech admits
+    frames at -53.5 dBFS -- quiet speech, not floor. Calibrating on the loudest
+    samples of a "quiet" band puts the threshold near the top of it.
+    """
+    rms = _frame_rms(wav, sr)
+    recorded = rms > _PCM16_LSB
+    if not recorded.any():
+        return np.zeros(len(wav), dtype=bool)
+    cut = float(np.percentile(rms[recorded], SILENCE_FLOOR_FRAME_PERCENTILE))
+    quiet = recorded & (rms <= cut)
+    mask = np.repeat(quiet, TRIM_HOP_LENGTH)[: len(wav)]
+    if len(mask) < len(wav):
+        mask = np.pad(mask, (0, len(wav) - len(mask)), constant_values=False)
+    return mask
+
+
+def silence_floor_dbfs(wavs: list[np.ndarray], sr: int = ARCHIVE_SR) -> tuple[float, float]:
+    """The corpus's noise floor, as the probe measures levels: a SAMPLE PEAK.
+
+    Returns ``(floor_peak_dbfs, frame_rms_percentile_dbfs)`` -- the pooled
+    ``SILENCE_FLOOR_PEAK_PERCENTILE`` of |sample| inside every file's quietest
+    frames, and the median across files of those frames' RMS cut. The second is
+    reported, not used: it is what makes the first reproducible from
+    ``btpvf silence-diag`` output rather than from a separate calculation.
+
+    Peak against peak is the point. The probe thresholds |sample|; a floor given
+    as an RMS would leave the margin absorbing a crest factor of sqrt(2 ln N),
+    which scales with the region length and the sample rate, so the same constant
+    would silently mean something else on another corpus or tier.
+    """
+    peaks: list[np.ndarray] = []
+    cuts: list[float] = []
+    for wav in wavs:
+        mask = _quiet_mask(wav, sr)
+        if not mask.any():
+            continue
+        peaks.append(np.abs(wav[mask].astype(np.float64)))
+        rms = _frame_rms(wav, sr)
+        recorded = rms > _PCM16_LSB
+        cuts.append(float(np.percentile(rms[recorded], SILENCE_FLOOR_FRAME_PERCENTILE)))
+    if not peaks:
+        raise InvariantViolation(
+            "INV-12: no frame of the real reference carries signal above the PCM_16 "
+            "quantisation floor, so the corpus has no measurable noise floor and the "
+            "silence threshold cannot be derived. Check the audio before the probe."
+        )
+    pooled = np.concatenate(peaks)
+    floor = float(np.percentile(pooled, SILENCE_FLOOR_PEAK_PERCENTILE))
+    return _dbfs_amp(floor), _dbfs_amp(float(np.median(cuts)))
+
+
+def _dbfs_amp(amplitude: float) -> float:
+    return float(20.0 * np.log10(max(amplitude, 1e-12)))
 
 
 def _tier_rows(
@@ -62,22 +156,162 @@ def _tier_rows(
     return (sub if split is None else sub[sub["split"] == split]), TIER_RATES[tier]
 
 
+def _pad_level_dbfs(wav: np.ndarray, sr: int) -> float:
+    """Level of the trim pad -- the TRIM_PAD_MS of context INV-03 keeps at each end.
+
+    Not a noise floor: the pad holds the onset ramp, which is why it sits above
+    the file's silent regions (LJSpeech: -47.3 dBFS against -53.5).
+    """
+    pad = int(round(TRIM_PAD_MS * 1e-3 * sr))
+    return _dbfs(np.concatenate([wav[:pad], wav[-pad:]]))
+
+
+@dataclass(frozen=True)
+class SilenceReference:
+    """The silence probe's threshold for one (dataset, tier), derived from real.
+
+    Every field is reported with the EER so that a silence result can never be
+    read without the threshold it was measured at.
+    """
+
+    tier: str
+    n_files: int
+    frame_rms_percentile_dbfs: float  # the quiet-frame cut, for reproducing the floor
+    floor_dbfs: float                 # sample-peak floor of real's quietest frames
+    threshold_dbfs: float             # floor + SILENCE_FLOOR_MARGIN_DB
+    pad_expected_s: float             # 2 * TRIM_PAD_MS, fixed by INV-03
+    pad_measured_s: float             # what real actually reads at the threshold
+    pad_level_dbfs: float             # real's trim-pad level, for the ungated diagnostic
+    real_feature: dict[str, float] = field(repr=False, default_factory=dict)
+
+    @property
+    def pad_error(self) -> float:
+        return abs(self.pad_measured_s - self.pad_expected_s) / self.pad_expected_s
+
+    @property
+    def ok(self) -> bool:
+        return self.pad_error <= SILENCE_PAD_AGREEMENT
+
+    def as_record(self) -> dict[str, object]:
+        """Everything needed to reproduce the threshold, for the sidecar and the CSV."""
+        return {
+            "tier": self.tier,
+            "n_real_files": self.n_files,
+            "frame_percentile": SILENCE_FLOOR_FRAME_PERCENTILE,
+            "peak_percentile": SILENCE_FLOOR_PEAK_PERCENTILE,
+            "quiet_frame_rms_cut_dbfs": round(self.frame_rms_percentile_dbfs, 3),
+            "floor_dbfs": round(self.floor_dbfs, 3),
+            "margin_db": SILENCE_FLOOR_MARGIN_DB,
+            "threshold_dbfs": round(self.threshold_dbfs, 3),
+            "pad_expected_s": round(self.pad_expected_s, 6),
+            "pad_measured_s": round(self.pad_measured_s, 6),
+            "pad_error": round(self.pad_error, 4),
+            "pad_tolerance": SILENCE_PAD_AGREEMENT,
+            "pad_agreement_ok": self.ok,
+            "real_trim_pad_dbfs": round(self.pad_level_dbfs, 3),
+        }
+
+
+def silence_reference(
+    manifest: pd.DataFrame,
+    tier: str = ARCHIVE_TIER,
+    split: str | None = "eval",
+    *,
+    strict: bool = True,
+) -> SilenceReference:
+    """Derive the silence threshold from the REAL reference of this dataset.
+
+    ``threshold = floor + SILENCE_FLOOR_MARGIN_DB``, with the floor measured by
+    :func:`silence_floor_dbfs`. Real alone, never the conditions: a threshold
+    that saw the conditions would be fitted to the answer.
+
+    **The pad-agreement check raises.** INV-03 writes exactly ``TRIM_PAD_MS`` of
+    context at each end, so at a threshold that is reading silence the real
+    reference must read ``2 * TRIM_PAD_MS``. Outside ``SILENCE_PAD_AGREEMENT``
+    the threshold is not reading silence -- too low and it is counting the
+    corpus's own noise as signal, too high and it is eating speech onsets -- and
+    the EER it would produce is a number nobody can interpret. That is worse than
+    no number, so the probe stops instead of reporting it.
+
+    ``strict=False`` returns the same record unraised, for
+    :func:`silence_diagnostic`: diagnosing a dataset whose threshold does not
+    agree with its pad is exactly what the diagnostic is for.
+    """
+    sub, sr = _tier_rows(manifest, tier, split)
+    rows = sub[sub["condition"] == REAL_CONDITION]
+    if rows.empty:
+        raise InvariantViolation(
+            f"INV-12: tier '{tier}' has no real rows, so the silence threshold cannot "
+            "be derived. It is defined against the real reference's own noise floor."
+        )
+    wavs = {str(u): read_processed(p, sr) for u, p in zip(rows["utt_id"], rows["path"],
+                                                         strict=True)}
+    floor_dbfs, frame_cut_dbfs = silence_floor_dbfs(list(wavs.values()), sr)
+    threshold = floor_dbfs + SILENCE_FLOOR_MARGIN_DB
+
+    feature = {
+        utt: sum(_leading_trailing_silence(wav, sr, threshold_db=threshold))
+        for utt, wav in wavs.items()
+    }
+    pad_expected = 2.0 * TRIM_PAD_MS * 1e-3
+    ref = SilenceReference(
+        tier=tier,
+        n_files=len(wavs),
+        frame_rms_percentile_dbfs=frame_cut_dbfs,
+        floor_dbfs=floor_dbfs,
+        threshold_dbfs=threshold,
+        pad_expected_s=pad_expected,
+        pad_measured_s=float(np.mean(list(feature.values()))),
+        pad_level_dbfs=float(np.median([_pad_level_dbfs(w, sr) for w in wavs.values()])),
+        real_feature=feature,
+    )
+    if strict and not ref.ok:
+        raise InvariantViolation(
+            f"INV-03/INV-12: the derived silence threshold does not read silence on "
+            f"tier '{tier}'. Real reads {ref.pad_measured_s * 1e3:.1f} ms of leading + "
+            f"trailing silence at {threshold:.1f} dBFS, against the "
+            f"{pad_expected * 1e3:.1f} ms that INV-03's TRIM_PAD_MS fixes "
+            f"({ref.pad_error:.0%} off, tolerance {SILENCE_PAD_AGREEMENT:.0%}). "
+            f"Measured floor {floor_dbfs:.1f} dBFS (quiet-frame RMS cut "
+            f"{frame_cut_dbfs:.1f} dBFS), margin {SILENCE_FLOOR_MARGIN_DB} dB. "
+            "Below the pad means the threshold is counting the corpus's own noise as "
+            "signal; above it means it is eating speech onsets. Either way the silence "
+            "EER would not be a silence measurement. Diagnose with `btpvf silence-diag` "
+            "-- do not widen the tolerance to get a number."
+        )
+    return ref
+
+
 def silence_probe(
     manifest: pd.DataFrame, condition: str, split: str | None = "eval",
-    tier: str = ARCHIVE_TIER,
+    tier: str = ARCHIVE_TIER, reference: SilenceReference | None = None,
 ) -> dict[str, object]:
     """INV-03 check. Can leading/trailing silence duration alone separate the
     condition from real? It must not: identical trim spans are applied to both.
+
+    The threshold comes from :func:`silence_reference`, derived from real's own
+    noise floor, and is reported on the row. Also reported, and NOT gated:
+    ``trim_pad_above_real_db``, this condition's trim-pad level against real's.
     """
     sub, sr = _tier_rows(manifest, tier, split)
-    feats: dict[str, np.ndarray] = {}
-    for name in (REAL_CONDITION, condition):
-        rows = sub[sub["condition"] == name]
-        vals = [sum(_leading_trailing_silence(read_processed(p, sr), sr)) for p in rows["path"]]
-        feats[name] = np.asarray(vals)
+    ref = reference or silence_reference(manifest, tier, split)
 
-    eer, _ = compute_eer(feats[REAL_CONDITION], feats[condition])
-    return _verdict("silence_duration", condition, eer, tier)
+    real_rows = sub[sub["condition"] == REAL_CONDITION]
+    real_feature = np.asarray([ref.real_feature[str(u)] for u in real_rows["utt_id"]])
+
+    rows = sub[sub["condition"] == condition]
+    values, pads = [], []
+    for p in rows["path"]:
+        wav = read_processed(p, sr)
+        values.append(sum(_leading_trailing_silence(wav, sr, threshold_db=ref.threshold_dbfs)))
+        pads.append(_pad_level_dbfs(wav, sr))
+
+    eer, _ = compute_eer(real_feature, np.asarray(values))
+    verdict = _verdict("silence_duration", condition, eer, tier)
+    verdict["silence_s_mean"] = float(np.mean(values))
+    # INV-12 records this; nothing gates it. See `run_all` and docs/measurements.md.
+    verdict["trim_pad_above_real_db"] = float(np.median(pads)) - ref.pad_level_dbfs
+    return verdict
 
 
 def loudness_probe(
@@ -190,17 +424,42 @@ def run_all(manifest: pd.DataFrame, split: str | None = "eval") -> pd.DataFrame:
 
     A row with ``leaked == True`` blocks publication of that condition. The fix
     is to correct the pipeline and regenerate, never to relax SANITY_EER_FLOOR.
+
+    Every row carries the silence threshold and the floor it was derived from,
+    for its tier, so no EER in this table can be read without the calibration
+    behind it. The threshold is derived ONCE per tier and shared by every
+    condition -- deriving it per condition would give each a different ruler.
+
+    ``trim_pad_above_real_db`` is **recorded and ungated**: it is a level
+    difference in the 40 ms trim pad, which the derived threshold deliberately
+    sits above, and which ``rms_level`` cannot see because whole-file RMS is
+    dominated by speech. There is no basis in this repository for choosing a
+    floor for it, and a gate without a justified floor is the failure this whole
+    change is about. See docs/measurements.md for what gating it would need.
     """
     conditions = [c for c in manifest["condition"].unique() if c != REAL_CONDITION]
     tiers = [t for t in TIERS if t in set(manifest["tier"])]
     out: list[dict[str, object]] = []
     for tier in tiers:
+        ref = silence_reference(manifest, tier, split)
+        calibration = {
+            "silence_threshold_dbfs": ref.threshold_dbfs,
+            "silence_floor_dbfs": ref.floor_dbfs,
+            "silence_frame_rms_cut_dbfs": ref.frame_rms_percentile_dbfs,
+            "real_pad_s": ref.pad_measured_s,
+            "real_trim_pad_dbfs": ref.pad_level_dbfs,
+        }
         for cond in conditions:
-            out.append(duration_probe(manifest, cond, split, tier))
-            out.append(silence_probe(manifest, cond, split, tier))
-            out.append(loudness_probe(manifest, cond, split, tier))
+            rows = [
+                duration_probe(manifest, cond, split, tier),
+                silence_probe(manifest, cond, split, tier, reference=ref),
+                loudness_probe(manifest, cond, split, tier),
+            ]
             if tier == ARCHIVE_TIER:
-                out.append(bandwidth_probe(manifest, cond, split, tier))
+                rows.append(bandwidth_probe(manifest, cond, split, tier))
+            for row in rows:
+                row.update(calibration)
+            out.extend(rows)
     return pd.DataFrame(out)
 
 
@@ -237,6 +496,27 @@ def _dbfs(x: np.ndarray) -> float:
     return float(20.0 * np.log10(max(float(np.sqrt(np.mean(x.astype(np.float64) ** 2))), 1e-12)))
 
 
+def _quiet_stats(wav: np.ndarray, sr: int) -> tuple[float, float]:
+    """One file's quiet-frame RMS cut and the peak level inside those frames.
+
+    The two numbers the derived threshold is built from, per file. Reported by
+    the diagnostic for every condition so the gate's calibration is reproducible
+    from its output rather than from a separate calculation; the gate itself
+    pools across real's files instead of taking a median of per-file values.
+    """
+    rms = _frame_rms(wav, sr)
+    recorded = rms > _PCM16_LSB
+    if not recorded.any():
+        return float("nan"), float("nan")
+    cut = float(np.percentile(rms[recorded], SILENCE_FLOOR_FRAME_PERCENTILE))
+    mask = _quiet_mask(wav, sr)
+    if not mask.any():
+        return _dbfs_amp(cut), float("nan")
+    peak = float(np.percentile(np.abs(wav[mask].astype(np.float64)),
+                               SILENCE_FLOOR_PEAK_PERCENTILE))
+    return _dbfs_amp(cut), _dbfs_amp(peak)
+
+
 def silence_diagnostic(
     manifest: pd.DataFrame,
     *,
@@ -244,27 +524,40 @@ def silence_diagnostic(
     split: str | None = None,
     thresholds: tuple[float, ...] = SILENCE_DIAGNOSTIC_THRESHOLDS,
     limit: int | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, SilenceReference]:
     """Why a condition separates on silence duration. Diagnosis, not a gate.
 
-    Returns two frames:
+    Returns three things:
 
-      floors   per condition: the level inside the REAL reference's silent
-               regions, and how much of the file those regions are. A vocoder
-               that reconstructs noise where the reference has near-silence
-               reads higher here than real does.
-      sweep    per condition and threshold: the silence probe's own feature
-               (leading + trailing silence duration) recomputed at that
-               threshold, and its EER against real. If the separation is
-               reconstruction noise sitting at some level, it collapses once the
-               threshold is well above that level; if it survives every
-               threshold, the cause is not the noise floor.
+      floors    per condition: the level inside the REAL reference's silent
+                regions, the level in the trim pad, and the two quiet-frame
+                statistics the threshold is derived from
+                (``quiet_frame_rms_dbfs``, ``quiet_peak_dbfs``). A vocoder that
+                reconstructs noise where the reference has near-silence reads
+                higher here than real does.
+      sweep     per condition and threshold: the silence probe's own feature
+                (leading + trailing silence duration) recomputed at that
+                threshold, and its EER against real. The derived threshold is
+                swept alongside the fixed points and flagged ``gate_threshold``,
+                so what the gate will read is visible next to what it would read
+                elsewhere.
+      reference the gate's own calibration for this dataset, derived NON-STRICTLY
+                -- a dataset whose threshold disagrees with its pad is exactly
+                what this function is for, so it reports the disagreement where
+                :func:`silence_probe` raises on it.
 
-    Neither frame decides anything. INV-12 says a leak blocks the condition, and
-    whether this one is reconstruction noise (a vocoder artifact) or a pipeline
-    fault is a judgement for a human to make on these numbers.
+    Nothing here decides anything. INV-12 says a leak blocks the condition, and
+    whether a hit is a vocoder artifact or a pipeline fault is a judgement for a
+    human to make on these numbers.
+
+    ``limit`` caps the per-utterance tables only. The reference is always derived
+    from every real file of the tier, because the threshold is a property of the
+    dataset and a diagnostic that reported a different one would be describing a
+    gate that does not exist.
     """
     sub, sr = _tier_rows(manifest, tier, split)
+    reference = silence_reference(manifest, tier, split, strict=False)
+
     utts = sorted(sub[sub["condition"] == REAL_CONDITION]["utt_id"].unique())
     if limit is not None:
         utts = utts[:limit]
@@ -274,12 +567,15 @@ def silence_diagnostic(
         for r in sub.itertuples()
         if str(r.utt_id) in set(utts)
     }
+    swept = (*thresholds, reference.threshold_dbfs)
 
     floors: dict[str, list[float]] = {c: [] for c in (REAL_CONDITION, *conditions)}
     pads: dict[str, list[float]] = {c: [] for c in (REAL_CONDITION, *conditions)}
+    cuts: dict[str, list[float]] = {c: [] for c in (REAL_CONDITION, *conditions)}
+    peaks: dict[str, list[float]] = {c: [] for c in (REAL_CONDITION, *conditions)}
     silent_fraction: list[float] = []
     features: dict[float, dict[str, list[float]]] = {
-        t: {c: [] for c in (REAL_CONDITION, *conditions)} for t in thresholds
+        t: {c: [] for c in (REAL_CONDITION, *conditions)} for t in swept
     }
 
     for utt in utts:
@@ -290,11 +586,11 @@ def silence_diagnostic(
             wav = real if cond == REAL_CONDITION else read_processed(paths[(cond, utt)], sr)
             n = min(len(wav), len(mask))
             floors[cond].append(_dbfs(wav[:n][mask[:n]]))
-            # The probe reads inward from both ends, so the trim pad is the
-            # region it actually sees (INV-03 keeps TRIM_PAD_MS of context).
-            pad = int(round(TRIM_PAD_MS * 1e-3 * sr))
-            pads[cond].append(_dbfs(np.concatenate([wav[:pad], wav[-pad:]])))
-            for t in thresholds:
+            pads[cond].append(_pad_level_dbfs(wav, sr))
+            cut, peak = _quiet_stats(wav, sr)
+            cuts[cond].append(cut)
+            peaks[cond].append(peak)
+            for t in swept:
                 lead, trail = _leading_trailing_silence(wav, sr, threshold_db=t)
                 features[t][cond].append(lead + trail)
 
@@ -309,13 +605,18 @@ def silence_diagnostic(
             "trim_pad_above_real_db": float(
                 np.nanmedian(pads[cond]) - np.nanmedian(pads[REAL_CONDITION])
             ),
+            # The estimator's own inputs, per condition. On `real` these are the
+            # per-file medians of what the gate pools; the gate's exact pooled
+            # values are in `reference`.
+            "quiet_frame_rms_dbfs": float(np.nanmedian(cuts[cond])),
+            "quiet_peak_dbfs": float(np.nanmedian(peaks[cond])),
             "reference_silent_fraction": float(np.mean(silent_fraction)),
         }
         for cond, values in floors.items()
     ]
 
     sweep_rows = []
-    for t in thresholds:
+    for t in swept:
         for cond in conditions:
             real_feature = np.asarray(features[t][REAL_CONDITION])
             cond_feature = np.asarray(features[t][cond])
@@ -323,6 +624,7 @@ def silence_diagnostic(
             sweep_rows.append(
                 {
                     "threshold_dbfs": t,
+                    "gate_threshold": t == reference.threshold_dbfs,
                     "condition": cond,
                     "eer": eer,
                     "leaked_at_floor": bool(eer < SANITY_EER_FLOOR),
@@ -330,4 +632,4 @@ def silence_diagnostic(
                     "condition_silence_s_mean": float(cond_feature.mean()),
                 }
             )
-    return pd.DataFrame(floor_rows), pd.DataFrame(sweep_rows)
+    return pd.DataFrame(floor_rows), pd.DataFrame(sweep_rows), reference

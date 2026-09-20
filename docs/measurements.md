@@ -542,7 +542,7 @@ Recorded, not acted on. Every value was above the `SANITY_EER_FLOOR` of 0.40
 under both rules, so no verdict changed either way — this is evidence about the
 mechanism, not a gate result.
 
-### Silence: griffin_lim trips the INV-12 probe
+### Silence: griffin_lim trips the INV-12 probe, and the probe is misspecified
 
 | probe | condition | tier | EER | floor |
 |---|---|---|---|---|
@@ -550,41 +550,208 @@ mechanism, not a gate result.
 | silence_duration | griffin_lim | zeroshot | **0.355** | 0.40 |
 
 Trim spans are reference-derived (INV-03), so leading and trailing silence are
-identical in LENGTH by construction. What differs is the level inside those
-regions.
+identical in LENGTH by construction. What differs therefore has to be the level
+inside those regions. `btpvf silence-diag` on the run's own audio says that level
+difference is **a tenth of a decibel**, and that the probe separates only at
+thresholds where it is reading noise rather than silence.
 
-**Diagnosed locally**, on synthetic audio through the real Griffin-Lim adapter and
-the real pipeline — the run's audio is not in this repository, so these are not
-its numbers. Source: speech between silent pads with a −65 dBFS room tone, abrupt
-5 ms speech edges, 22 utterances:
+#### The run refutes the synthetic diagnosis, by about a hundredfold
 
-| measurement | real | griffin_lim |
-|---|---|---|
-| level inside the reference's silent regions | −71.0 dBFS | **−57.7 dBFS** (+13.2 dB) |
-| level in the trim pad the probe reads | −70.9 dBFS | **−60.9 dBFS** (+10.0 dB) |
+Level inside the regions the real reference calls silent, median dBFS:
 
-The probe's own feature, swept across thresholds:
-
-| threshold | EER | real silence | griffin_lim silence |
+| condition | median | vs real | synthetic prediction |
 |---|---|---|---|
-| −60 dBFS | 0.136 | 0.048 s | 0.022 s |
-| −50 dBFS | 0.000 | 0.061 s | 0.036 s |
-| −40 dBFS | 0.091 | 0.063 s | 0.055 s |
-| **−30 dBFS** | **0.500** | 0.066 s | 0.066 s |
-| −20 dBFS | 0.182 | 0.189 s | 0.126 s |
+| `real` | −53.556 | 0.000 | 0.000 |
+| `bigvgan_112m` | −53.524 | +0.033 | — |
+| `griffin_lim` | −53.448 | **+0.108** | **+13.2** |
+| `vocos` | −53.628 | −0.072 | — |
 
-Three things follow. The separation is total at thresholds near the noise and
-**gone at −30 dBFS**, which is what distinguishes a noise floor from a duration
-difference. `real` passes through the identical trim, loudness and PCM_16 path
-and shows no elevated floor, so the shared pipeline steps are not the cause. And
-at −20 dBFS the separation returns, because there the probe is reading speech
-onsets rather than silence — a different effect, and a real one.
+The synthetic corpus predicted +13.2 dB for `griffin_lim`; the real figure is
++0.108 dB, a factor of about 120. **There is no elevated noise floor.** The
+phase-reconstruction-smearing hypothesis, which those synthetic numbers were
+consistent with, is refuted on the real corpus.
 
-Consistent with phase reconstruction smearing energy into near-silent regions,
-i.e. a vocoder artifact. **Not decided**: `griffin_lim` is not marked
-`expected_by_design`, the floor is unchanged, and the run's own audio has not been
-measured. `btpvf silence-diag --manifest <run>/manifest.csv` produces both tables
-above from a completed run.
+The synthetic corpus overstated it because of how it was built: speech between
+pads holding only a −65 dBFS room tone, with a broadband noise floor added to the
+`griffin_lim` member. That *is* an elevated floor, injected by hand, and the
+measurement recovered the size of the injection. Real Griffin-Lim inverts a mel
+that already contains LJSpeech's own room tone, so what it reconstructs in those
+regions lands within 0.1 dB of what real has. A synthetic corpus returns the
+structure that was built into it; this is the same failure INV-18's second clause
+exists for, in a diagnostic rather than in an exclusion.
+
+**One real effect survives**, and it is in the trim pad rather than in the file's
+silent regions — the pad is the 20 ms of pre-onset context INV-03 keeps, so it
+holds the onset ramp, not room tone. That is why it sits 6.3 dB above the silent
+regions (−47.265 dBFS against −53.556). Median level in the pad:
+
+| condition | median | vs real |
+|---|---|---|
+| `real` | −47.265 dBFS | 0.000 |
+| `bigvgan_112m` | −47.351 | −0.086 |
+| `griffin_lim` | −46.378 | **+0.887** |
+| `vocos` | −48.068 | −0.803 |
+
+Roughly 1 dB, in a 40 ms region, and it is a level difference rather than a
+duration one. It is now **measured on every run and gated by nothing** — see
+*The trim-pad level is recorded and ungated* below.
+
+#### The probe's threshold is −50 dBFS, which is inside the corpus floor
+
+The probe's own feature, swept over all three conditions (real's column is the
+same audio the gate reads):
+
+| threshold | real | `griffin_lim` | `bigvgan_112m` | `vocos` |
+|---|---|---|---|---|
+| −60 dBFS | 0.006703 s | 0.001600 s / **0.290** | 0.005945 s / 0.435 | 0.005146 s / 0.445 |
+| **−50 dBFS** | 0.015524 s | 0.010500 s / **0.370** | 0.015601 s / 0.500 | 0.015080 s / 0.480 |
+| −40 dBFS | 0.040759 s | 0.039600 s / 0.460 | 0.041819 s / 0.530 | 0.042160 s / 0.510 |
+| −30 dBFS | 0.088867 s | 0.092700 s / 0.540 | 0.087170 s / 0.495 | 0.090848 s / 0.535 |
+| −20 dBFS | 0.247841 s | 0.278500 s / 0.535 | 0.241532 s / 0.495 | 0.262309 s / 0.525 |
+
+(seconds of leading + trailing silence / EER against real.)
+
+**The dip is specific to `griffin_lim`.** At −50 dBFS `bigvgan_112m` reads
+0.015601 s against real's 0.015524 s — indistinguishable, EER 0.500 — and `vocos`
+0.015080 s at 0.480. Only `griffin_lim` reads materially less silence, 0.010500 s.
+So this is not a general property of putting audio through a vocoder, and not a
+property of the pipeline: it is one condition's pad crossing a threshold that sits
+inside the corpus's noise, which is the same +0.887 dB pad level showing up as a
+duration.
+
+The failing gate reads 0.350/0.355 against the −50 row's 0.370, which identifies
+the threshold: `_leading_trailing_silence` defaults to **−50 dBFS**, an absolute
+constant with no recorded derivation (see the note below).
+
+**What the rows mean.** INV-03 keeps `TRIM_PAD_MS = 20 ms` of context at each
+end, so a written file holds **2 × 20 = 40 ms** of leading plus trailing silence,
+by construction and identically for every condition. Read against that bound:
+
+- at −50 dBFS the probe reads **15.5 ms of the 40 ms pad**, so it is finding
+  "voiced" samples *inside* the pad — which can only be the pad's own noise;
+- at −40 dBFS it reads **40.8 ms**: the pad, and nothing else;
+- at −30 dBFS, 88.9 ms — more than twice the pad, so it is into speech onsets.
+
+The separation lives entirely at or below −50 dBFS, where the probe reads noise,
+and is gone at −40 dBFS, where it reads the pad. With the corpus's silent regions
+sitting at −53.5 dBFS, a −50 dBFS threshold is ~3 dB inside the floor, so the
+feature is a statistic of how often the signal's own noise crosses a level near
+its own floor — not a silence duration. That is a specification error whichever
+way the gate then reads.
+
+**`reference_silent_fraction` is not a fourth measurement.** It reads 0.172786 on
+every condition's row because it is computed from `real` alone, by INV-03's
+criterion, and applied by index. It also counts silence **anywhere** in the file,
+inter-word pauses included, so it is not comparable with the probe's 15 ms: the
+probe reads inward from the two ends and never looks at the interior. The
+quantity that *is* comparable with it is `2 × TRIM_PAD_MS`.
+
+**Where −50 dBFS came from.** Nowhere recorded. It entered as a bare default
+argument on `_leading_trailing_silence` in the first commit (`ac0cb5a`, the bulk
+"Phase A pipeline" commit) and was never edited afterwards. It was not in
+`data/invariants.py`, not in INV-03's or INV-12's constants, not in
+`btp-project-idea.md`, and no measurement in this file or in
+`docs/enforcement_audit.md` compared it to a corpus noise floor. The underlying
+mismatch is that INV-03 defines silence *relatively* — `TRIM_TOP_DB = 30 dB`
+below the loudest frame — while the probe that checks INV-03 defined it
+*absolutely*. That the two agree on any particular corpus was never checked, and
+on LJSpeech they did not. The default is gone: `_leading_trailing_silence` now
+requires the threshold, so no caller can obtain one without choosing it.
+
+#### The replacement: a threshold derived from the measured floor
+
+Implemented (INV-12). Per dataset and per tier, from the **real reference alone**:
+
+```
+floor     = 99.9th percentile of |sample| inside the quietest 10% of real's RMS frames
+threshold = floor + 8 dB
+```
+
+**Why a sample-peak floor.** The probe compares `|sample|` to the threshold. For a
+noise-like floor the p99.9 of `|x|` sits **+10.35 dB** above its RMS, and the
+maximum over a corpus sits **+14.5 dB** (simulated: +13.1 dB over 200 × 441 pad
+samples, +14.5 dB over full silent regions). A floor quoted as an RMS would hide
+that `sqrt(2 ln N)` term inside the margin, where it scales with region length and
+sample rate — so the same constant would mean something different on another tier.
+
+**Why 8 dB.** Clearing the corpus-wide maximum of a noise-like floor above its own
+p99.9 needs 3.2–4.1 dB; 6 dB is about twice that; 8 dB puts the threshold near the
+middle of the band LJSpeech admits rather than at its edge. The margin comes from
+the noise statistics, and the band below is used to check where it lands, not to
+derive it.
+
+**Why the quietest decile rather than `reference_silent_mask`.** INV-03's relative
+criterion (`TRIM_TOP_DB` below the loudest frame) admits quiet speech — its median
+is −53.5 dBFS, essentially its own cutoff. The loudest samples of a "quiet" band
+are not a floor.
+
+**The band this corpus admits.** INV-03 writes `2 × TRIM_PAD_MS` = 40 ms of
+leading plus trailing silence into every file. Reading real's sweep column against
+that bound and interpolating gives the thresholds at which the probe reads the pad
+and nothing else:
+
+| threshold | real reads | vs the 40 ms pad |
+|---|---|---|
+| −50 dBFS | 15.5 ms | 0.39× — inside the pad's noise |
+| **−43 dBFS** | ~30 ms | 0.75× — lower edge |
+| −40 dBFS | 40.8 ms | **1.02× — the pad, and nothing else** |
+| **−37 dBFS** | ~50 ms | 1.25× — upper edge |
+| −30 dBFS | 88.9 ms | 2.2× — into speech onsets |
+
+The derived threshold is **predicted** to land near −39 dBFS, inside that band:
+the quiet-decile statistics were not in the v0 output, so this is an inference from
+the pad level (−47.265 dBFS) rather than a measurement. `btpvf silence-diag` now
+prints `quiet_frame_rms_dbfs` and `quiet_peak_dbfs`, so the next run reports the
+inputs and the derivation is reproducible from its output.
+
+**The pad-agreement check is what makes it safe, and it raises.** At the derived
+threshold real must read `2 × TRIM_PAD_MS` within 25%, or the probe stops. Below
+the band it is counting the corpus's noise as signal; above it, eating speech
+onsets. A silence EER measured at either is a number nobody can interpret, which
+is worse than no number. The rule therefore carries a range requirement: a corpus
+whose floor is not far enough below speech is **refused rather than measured**
+(`TestDerivedSilenceThreshold` builds one and pins the refusal).
+
+**What it does and does not decide.** Across the whole admissible band the
+`griffin_lim` silence EER is ≥ 0.43, so the gate passes there. That is a
+consequence of fixing the specification, not its justification: the calibration
+uses real alone plus `TRIM_PAD_MS`, both fixed before any condition existed, and
+the diagnosis found no floor difference (+0.108 dB) for the old threshold to have
+been detecting. `griffin_lim` is still not marked `expected_by_design` and
+`SANITY_EER_FLOOR` is unchanged.
+
+#### The trim-pad level is recorded and ungated
+
+The derived threshold sits above the pad's noise by design, so the silence probe
+can no longer see a level difference inside the pad. Nothing else covers it:
+`rms_level` reads whole-file RMS, which is dominated by speech, and the pad is
+40 ms of a multi-second file. So the measurement is kept as a column,
+`trim_pad_above_real_db`, on every silence row of the sanity CSV — +0.887 dB for
+`griffin_lim`, −0.086 for `bigvgan_112m`, −0.803 for `vocos` — and it gates
+nothing.
+
+Ungated because a gate needs a floor and there is no basis here for choosing one.
+What choosing one would take, in order:
+
+1. **A null distribution.** The pad level's spread across utterances *within* a
+   condition, and across independent real recordings, so "how big is big" has an
+   answer that is not an intuition. `vocos` reads −0.803 dB and `griffin_lim`
+   +0.887 dB; without a spread those are two numbers, not two effects.
+2. **A demonstration that it is learnable.** A probe on the pad level alone,
+   grouped by utterance like every other paired probe (INV-18), showing it
+   separates real from a condition. A 1 dB difference in 40 ms may well sit below
+   what any detector can use, in which case it is a curiosity rather than a
+   confound.
+3. **A cause.** Onset smearing in phase reconstruction predicts `griffin_lim`
+   high; it does not predict `vocos` 0.8 dB low. Until the sign pattern is
+   explained, a floor would be fitted to three points.
+
+Only then is there something to gate, and the floor would come from (1) rather
+than from the values in (2). Recording it now costs nothing and means the next
+run's numbers are already there when someone does the work.
+
+**Not decided.** `btpvf silence-diag --manifest <run>/manifest.csv` produces the
+tables above, plus the calibration record, from a completed run.
 
 ---
 

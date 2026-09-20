@@ -168,16 +168,28 @@ def main(argv: list[str] | None = None) -> int:
                 f"from another machine or directory; read from "
                 f"{df.attrs['manifest_root']}, the manifest's own, instead."
             )
-        floors, sweep = silence_diagnostic(df, limit=args.limit)
+        floors, sweep, ref = silence_diagnostic(df, limit=args.limit)
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         floors.to_csv(out_dir / "silence_floors.csv", index=False)
         sweep.to_csv(out_dir / "silence_threshold_sweep.csv", index=False)
-        print("level inside the reference's silent regions:")
+        pd.DataFrame([ref.as_record()]).to_csv(
+            out_dir / "silence_calibration.csv", index=False
+        )
+        print("the derived silence threshold for this dataset (INV-03/INV-12):")
+        for key, value in ref.as_record().items():
+            print(f"  {key:<28} {value}")
+        if not ref.ok:
+            print(
+                "  ^ the threshold does NOT read the trim pad; `btpvf sanity` raises on "
+                "this dataset rather than reporting a silence EER."
+            )
+        print("\nlevel inside the reference's silent regions:")
         print(floors.to_string(index=False))
         print("\nthe probe's own feature, swept over thresholds:")
         print(sweep.to_string(index=False))
-        print(f"\nwritten to {out_dir}/silence_floors.csv and silence_threshold_sweep.csv")
+        print(f"\nwritten to {out_dir}/silence_floors.csv, silence_threshold_sweep.csv "
+              "and silence_calibration.csv")
         print("Diagnosis only: INV-12's floor and verdicts are unchanged.")
         return 0
 

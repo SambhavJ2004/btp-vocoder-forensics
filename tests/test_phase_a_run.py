@@ -28,6 +28,8 @@ from data.invariants import (
     ARCHIVE_TIER,
     LADDER_FMAX,
     SANITY_EER_FLOOR,
+    SILENCE_FLOOR_MARGIN_DB,
+    SILENCE_PAD_AGREEMENT,
     InvariantViolation,
 )
 from experiments.sanity_checks import SILENCE_DIAGNOSTIC_THRESHOLDS
@@ -36,17 +38,72 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 N_UTTS = 22  # >= ALIGNMENT_PROBE_FILES
 
 
+ROOM_TONE_DBFS = -70.0  # a recorded noise floor, which is what a corpus has
+
+
+def _word_gate(n: int, word_s: float = 0.17, gap_s: float = 0.08) -> np.ndarray:
+    """An envelope of "words" separated by pauses, with abrupt 5 ms edges.
+
+    Two properties of real speech that fixtures here have to reproduce, because
+    the silence machinery reads exactly them:
+
+    - **Edges are abrupt.** Under a slow taper the signal takes hundreds of ms to
+      cross any threshold above the floor, so the probe legitimately reads
+      hundreds of ms of "silence" and INV-03's pad agreement cannot hold.
+    - **There are interior pauses.** The silence threshold is derived from the
+      quietest ``SILENCE_FLOOR_FRAME_PERCENTILE`` of frames, so a file that is
+      speech end to end has no floor in its quietest decile and the derivation
+      returns a level from inside speech. LJSpeech is 17% silent by INV-03's own
+      criterion; this gate is 32%.
+    """
+    gate = np.zeros(n)
+    word, gap, edge = (int(s * ARCHIVE_SR) for s in (word_s, gap_s, 0.005))
+    start = 0
+    while start + word <= n:
+        seg = np.ones(word)
+        seg[:edge] *= np.linspace(0.0, 1.0, edge)
+        seg[-edge:] *= np.linspace(1.0, 0.0, edge)
+        gate[start:start + word] = seg
+        start += word + gap
+    return gate
+
+
+def _room(x: np.ndarray, rng: np.random.Generator, tau_s: float = 0.008) -> np.ndarray:
+    """A short decaying tail, as a recording in a small room has.
+
+    Load-bearing for the silence machinery, not atmosphere. ``librosa.effects.trim``
+    returns frame-quantised boundaries and its END overshoots the last non-silent
+    frame, so the trim span reaches ~15 ms past where speech stops. Real speech
+    keeps decaying through that window; a hard-gated synthetic signal drops
+    straight to the floor, which leaves ~20 ms of extra silence inside the span
+    and makes the pad-agreement check fail on audio no corpus produces.
+    """
+    n = int(6 * tau_s * ARCHIVE_SR)
+    ir = 0.05 * np.exp(-np.arange(n) / (tau_s * ARCHIVE_SR)) * rng.standard_normal(n)
+    ir[0] = 1.0
+    return np.convolve(x, ir)[: len(x)]
+
+
 def _speechlike(seconds: float = 1.5, seed: int = 0) -> np.ndarray:
+    """Speech-shaped enough for the silence machinery to be exercised honestly.
+
+    Words with pauses between them (:func:`_word_gate`), a decaying room
+    (:func:`_room`), and a ROOM TONE at a realistic distance below speech -- the
+    silence threshold is derived from that floor (INV-03/INV-12), and a fixture
+    without one is not testing the derivation, it is dodging it.
+    """
     rng = np.random.default_rng(seed)
     n = int(ARCHIVE_SR * seconds)
     t = np.arange(n) / ARCHIVE_SR
     f0 = 120 + 5 * (seed % 11)
     x = sum((0.3 / k) * np.sin(2 * np.pi * f0 * k * t + rng.uniform(0, 6.28))
             for k in range(1, 60))
-    x = x * np.hanning(n) + 0.01 * rng.standard_normal(n)
+    x = _room(x * (1 + 0.4 * np.sin(2 * np.pi * 3.1 * t)) * _word_gate(n), rng)
+    x = 0.35 * x / np.max(np.abs(x))
     pad = int(0.15 * ARCHIVE_SR)
-    x = np.concatenate([np.zeros(pad), x, np.zeros(pad)])
-    return (0.35 * x / np.max(np.abs(x))).astype(np.float32)
+    body = np.concatenate([np.zeros(pad), x, np.zeros(pad)])
+    room = 10 ** (ROOM_TONE_DBFS / 20.0) * rng.standard_normal(len(body))
+    return (body + room).astype(np.float32)
 
 
 @pytest.fixture
@@ -790,28 +847,48 @@ class TestSilenceDiagnostic:
 
     def _corpus(self, tmp_path, noise_dbfs=NOISE_DBFS):
         """real: speech between quiet pads. 'griffin_lim': the same, with low-level
-        noise added everywhere -- the shape of a phase-reconstruction floor."""
+        noise added everywhere -- the shape of a phase-reconstruction floor.
+
+        Both go through the REAL pipeline -- one reference-derived trim span,
+        applied to both, then the shared post-trim ordering -- so the written
+        files carry exactly the TRIM_PAD_MS of context INV-03 promises. A fixture
+        that wrote 200 ms pads instead would make the silence threshold's
+        pad-agreement check fail on audio that is not what Phase A produces.
+        """
         from data.audio_io import write_audio
+        from data.preprocess import (
+            derive_trim_span,
+            finalise_reference,
+            process_condition_output,
+        )
 
         rows = []
         for i in range(12):
             rng = np.random.default_rng(i)
             n = int(1.0 * ARCHIVE_SR)
             t = np.arange(n) / ARCHIVE_SR
-            speech = 0.3 * np.sin(2 * np.pi * (120 + i) * t)
-            edge = int(0.005 * ARCHIVE_SR)  # abrupt edges: a taper would swamp the floor
-            speech[:edge] *= np.linspace(0, 1, edge)
-            speech[-edge:] *= np.linspace(1, 0, edge)
+            # Abrupt edges, interior pauses and a decaying room: see _word_gate
+            # and _room for why each is required rather than decorative.
+            speech = _room(0.3 * np.sin(2 * np.pi * (120 + i) * t) * _word_gate(n), rng)
             pad = np.zeros(int(0.2 * ARCHIVE_SR))
-            real = np.concatenate([pad, speech, pad]).astype(np.float32)
-            real = (real + rng.normal(0, 10 ** (self.FLOOR_DBFS / 20), len(real))).astype(
+            src = np.concatenate([pad, speech, pad]).astype(np.float32)
+            src = (src + rng.normal(0, 10 ** (self.FLOOR_DBFS / 20), len(src))).astype(
                 np.float32
             )
-            noisy = (real + rng.normal(0, 10 ** (noise_dbfs / 20), len(real))).astype(np.float32)
+            noisy_src = (
+                src + rng.normal(0, 10 ** (noise_dbfs / 20), len(src))
+            ).astype(np.float32)
+
+            utt = f"u{i:02d}"
+            span = derive_trim_span(src, utt)
+            real = finalise_reference(src, span).wav
+            noisy = process_condition_output(
+                noisy_src, ARCHIVE_SR, span, condition="griffin_lim"
+            ).wav
             for cond, wav in (("real", real), ("griffin_lim", noisy)):
-                path = tmp_path / cond / f"u{i:02d}.wav"
+                path = tmp_path / cond / f"{utt}.wav"
                 write_audio(path, wav, ARCHIVE_SR)
-                rows.append({"utt_id": f"u{i:02d}", "condition": cond, "tier": ARCHIVE_TIER,
+                rows.append({"utt_id": utt, "condition": cond, "tier": ARCHIVE_TIER,
                              "path": str(path), "split": "eval",
                              "duration_s": len(wav) / ARCHIVE_SR})
         return pd.DataFrame(rows)
@@ -834,7 +911,7 @@ class TestSilenceDiagnostic:
         # The probe fires, exactly as it did on the real run.
         assert silence_probe(df, "griffin_lim", split=None)["leaked"]
 
-        floors, sweep = silence_diagnostic(df, split=None)
+        floors, sweep, ref = silence_diagnostic(df, split=None)
         gl = floors.set_index("condition").loc["griffin_lim"]
         # The injected floor is well above real's, in the regions real calls silent
         # and in the trim pad the probe actually reads.
@@ -859,7 +936,7 @@ class TestSilenceDiagnostic:
         from experiments.sanity_checks import silence_diagnostic
 
         df = self._corpus(tmp_path, noise_dbfs=-200.0)
-        floors, sweep = silence_diagnostic(df, split=None)
+        floors, sweep, ref = silence_diagnostic(df, split=None)
         assert abs(floors.set_index("condition").loc["griffin_lim", "above_real_db"]) < 1.0
         assert (
             (sweep["condition_silence_s_mean"] - sweep["real_silence_s_mean"]).abs() < 0.005
@@ -885,9 +962,25 @@ class TestSilenceDiagnostic:
         self._corpus(tmp_path).to_csv(manifest, index=False)
         out = tmp_path / "diag"
         assert main(["silence-diag", "--manifest", str(manifest), "--out-dir", str(out)]) == 0
-        assert (out / "silence_floors.csv").is_file()
+        floors = pd.read_csv(out / "silence_floors.csv")
+        # The estimator's own inputs, so the derivation is reproducible from this
+        # output rather than from a separate calculation.
+        assert {"quiet_frame_rms_dbfs", "quiet_peak_dbfs"} <= set(floors.columns)
+        assert floors["quiet_peak_dbfs"].notna().all()
+
         sweep = pd.read_csv(out / "silence_threshold_sweep.csv")
-        assert set(sweep["threshold_dbfs"]) == set(SILENCE_DIAGNOSTIC_THRESHOLDS)
+        assert set(SILENCE_DIAGNOSTIC_THRESHOLDS) < set(sweep["threshold_dbfs"])
+        gate = sweep[sweep["gate_threshold"]]
+        assert len(gate) == 1, "the derived threshold is swept alongside the fixed points"
+
+        calibration = pd.read_csv(out / "silence_calibration.csv").iloc[0]
+        assert calibration["margin_db"] == SILENCE_FLOOR_MARGIN_DB
+        assert calibration["threshold_dbfs"] == pytest.approx(
+            calibration["floor_dbfs"] + SILENCE_FLOOR_MARGIN_DB, abs=1e-3
+        )
+        assert calibration["threshold_dbfs"] == pytest.approx(
+            gate["threshold_dbfs"].iloc[0], abs=1e-3
+        )
 
 
 # ================================================ manifest paths and relocation
@@ -997,7 +1090,7 @@ class TestManifestPathsSurviveRelocation:
         sanity = run_all(df, split=None)          # INV-12 probes: open every file
         assert not sanity["leaked"].any()
 
-        floors, sweep = silence_diagnostic(df, split=None, limit=5)
+        floors, sweep, _ = silence_diagnostic(df, split=None, limit=5)
         assert set(floors["condition"]) == {"real", "hifigan_v1"}
         assert not sweep["eer"].isna().any()
 
@@ -1095,3 +1188,287 @@ class TestManifestPathsSurviveRelocation:
         assert Path(prov["generated_in"]).name.startswith(gated_dataset.name)
         raw = pd.read_csv(gated_dataset / "manifest.csv")
         assert not any(Path(p).is_absolute() for p in raw["path"])
+
+
+# ==================================== the derived silence threshold (INV-03/INV-12)
+
+
+def _pipeline_corpus(
+    tmp_path: Path,
+    transform,
+    *,
+    n: int = 12,
+    floor_dbfs: float = ROOM_TONE_DBFS,
+    condition: str = "griffin_lim",
+) -> pd.DataFrame:
+    """A two-condition archive frame built through the REAL pipeline.
+
+    One reference-derived trim span per utterance, applied to both members, then
+    the shared post-trim ordering -- so the written files carry exactly the
+    TRIM_PAD_MS of context INV-03 promises and the pad-agreement check is being
+    tested against audio Phase A could actually produce.
+    """
+    from data.audio_io import write_audio
+    from data.preprocess import (
+        derive_trim_span,
+        finalise_reference,
+        process_condition_output,
+    )
+
+    rows = []
+    for i in range(n):
+        rng = np.random.default_rng(i)
+        m = int(1.0 * ARCHIVE_SR)
+        t = np.arange(m) / ARCHIVE_SR
+        speech = _room(0.3 * np.sin(2 * np.pi * (120 + i) * t) * _word_gate(m), rng)
+        pad = np.zeros(int(0.2 * ARCHIVE_SR))
+        src = np.concatenate([pad, speech, pad]).astype(np.float32)
+        src = (src + rng.normal(0, 10 ** (floor_dbfs / 20), len(src))).astype(np.float32)
+
+        utt = f"u{i:02d}"
+        span = derive_trim_span(src, utt)
+        real = finalise_reference(src, span).wav
+        other = process_condition_output(
+            transform(src, rng), ARCHIVE_SR, span, condition=condition
+        ).wav
+        for cond, wav in (("real", real), (condition, other)):
+            path = tmp_path / cond / f"{utt}.wav"
+            write_audio(path, wav, ARCHIVE_SR)
+            rows.append({"utt_id": utt, "condition": cond, "tier": ARCHIVE_TIER,
+                         "path": str(path), "split": "eval",
+                         "duration_s": len(wav) / ARCHIVE_SR})
+    return pd.DataFrame(rows)
+
+
+class TestDerivedSilenceThreshold:
+    """INV-03/INV-12: the silence probe's threshold comes from the corpus.
+
+    INV-03 defines silence RELATIVELY -- TRIM_TOP_DB below the loudest frame --
+    and this probe compares |sample| to an absolute level. The two only agree if
+    the level is placed against the corpus's own floor. The previous -50.0 dBFS
+    default sat ~3 dB inside LJSpeech's floor, so the feature measured how often
+    the signal's noise crossed a level near its own noise. Nobody noticed for
+    three weeks, partly because the value was in no constants block.
+    """
+
+    def test_the_four_constants_live_in_invariants(self):
+        from data import invariants
+
+        assert invariants.SILENCE_FLOOR_FRAME_PERCENTILE == 10.0
+        assert invariants.SILENCE_FLOOR_PEAK_PERCENTILE == 99.9
+        assert invariants.SILENCE_FLOOR_MARGIN_DB == 8.0
+        assert invariants.SILENCE_PAD_AGREEMENT == 0.25
+
+    def test_no_caller_can_get_a_threshold_without_choosing_one(self):
+        """The mechanism that hid the old value: a default nobody had to supply."""
+        import inspect
+
+        from experiments.sanity_checks import _leading_trailing_silence
+
+        threshold = inspect.signature(_leading_trailing_silence).parameters["threshold_db"]
+        assert threshold.default is inspect.Parameter.empty
+        assert threshold.kind is inspect.Parameter.KEYWORD_ONLY
+        with pytest.raises(TypeError):
+            _leading_trailing_silence(np.zeros(100, np.float32), ARCHIVE_SR)
+
+    def test_the_floor_is_a_sample_peak_not_an_rms(self):
+        """Peak against peak: the probe thresholds |sample|, so the floor must too.
+
+        For a noise-like floor the p99.9 of |x| sits ~10.4 dB above its RMS. A
+        floor given as an RMS would leave that term inside the margin, where it
+        would scale with region length and sample rate.
+        """
+        from experiments.sanity_checks import silence_floor_dbfs
+
+        rng = np.random.default_rng(0)
+        sigma = 10 ** (-60.0 / 20.0)
+        noise = [(sigma * rng.standard_normal(ARCHIVE_SR)).astype(np.float32) for _ in range(6)]
+        floor, cut = silence_floor_dbfs(noise, ARCHIVE_SR)
+        assert floor == pytest.approx(-60.0 + 10.35, abs=1.0)
+        assert cut < floor, "the RMS cut sits below the peak floor, by the crest factor"
+
+    def test_the_threshold_tracks_the_corpus_floor(self, tmp_path):
+        """The VCTK argument: a corpus with a lower floor gets a lower threshold.
+
+        This is the whole reason the value is derived rather than written down.
+        VCTK is recorded in a hemi-anechoic chamber and will not match LJSpeech;
+        a constant tuned on one is wrong on the other, in a way that reads as a
+        clean EER either way. Measured on floors that are unambiguous, because
+        the claim is about the derivation and not about what happens to set a
+        particular fixture's quietest frames.
+        """
+        from experiments.sanity_checks import silence_floor_dbfs
+
+        rng = np.random.default_rng(3)
+        floors = {}
+        for level in (-75.0, -55.0):
+            noise = [(10 ** (level / 20) * rng.standard_normal(ARCHIVE_SR)).astype(np.float32)
+                     for _ in range(6)]
+            floors[level], _ = silence_floor_dbfs(noise, ARCHIVE_SR)
+        assert floors[-55.0] - floors[-75.0] == pytest.approx(20.0, abs=0.5)
+
+    def test_a_pipeline_corpus_derives_a_threshold_that_reads_its_pad(self, tmp_path):
+        """End to end: threshold = floor + margin, and it lands on the trim pad."""
+        from experiments.sanity_checks import silence_reference
+
+        df = _pipeline_corpus(tmp_path, lambda s, r: s)
+        ref = silence_reference(df, split=None)
+        assert ref.threshold_dbfs == pytest.approx(
+            ref.floor_dbfs + SILENCE_FLOOR_MARGIN_DB, abs=1e-6
+        )
+        assert ref.ok and ref.pad_error <= SILENCE_PAD_AGREEMENT
+        assert ref.pad_measured_s == pytest.approx(0.04, abs=0.04 * SILENCE_PAD_AGREEMENT)
+
+    def test_a_floor_too_close_to_speech_is_refused_not_reported(self, tmp_path):
+        """The rule has a range requirement, and it fails closed when it is unmet.
+
+        ``floor + SILENCE_FLOOR_MARGIN_DB`` only reads the pad while the floor is
+        far enough below speech. Raise the corpus floor toward speech and the
+        threshold climbs into the onset, so the probe reads more than the pad and
+        the run stops. That is the designed outcome: the alternative is an EER
+        measured at a threshold that is not reading silence, which is what -50
+        dBFS was doing on LJSpeech.
+        """
+        from experiments.sanity_checks import silence_reference
+
+        df = _pipeline_corpus(tmp_path, lambda s, r: s, floor_dbfs=-55.0)
+        with pytest.raises(InvariantViolation, match="does not read silence"):
+            silence_reference(df, split=None)
+        assert not silence_reference(df, split=None, strict=False).ok
+
+    def test_digital_silence_is_not_a_noise_floor(self, tmp_path):
+        """Exact zeros carry no floor information and must not become the floor.
+
+        A run of PCM_16 zeros is the ABSENCE of a recorded floor. Letting it into
+        the estimate would drag the threshold to the quantiser and the probe would
+        call the whole file voiced.
+        """
+        from experiments.sanity_checks import silence_floor_dbfs
+
+        rng = np.random.default_rng(1)
+        sigma = 10 ** (-55.0 / 20.0)
+        wav = np.concatenate([
+            np.zeros(ARCHIVE_SR // 2, np.float32),
+            (sigma * rng.standard_normal(ARCHIVE_SR)).astype(np.float32),
+        ])
+        floor, _ = silence_floor_dbfs([wav], ARCHIVE_SR)
+        assert floor == pytest.approx(-55.0 + 10.35, abs=1.5)
+
+    def test_pad_disagreement_raises_rather_than_reporting(self, tmp_path):
+        """A number nobody can interpret is worse than none, so the probe stops."""
+        from data.audio_io import write_audio
+        from experiments.sanity_checks import run_all, silence_probe
+
+        rows = []
+        for i in range(12):
+            rng = np.random.default_rng(i)
+            m = int(1.0 * ARCHIVE_SR)
+            t = np.arange(m) / ARCHIVE_SR
+            speech = _room(0.3 * np.sin(2 * np.pi * (120 + i) * t) * _word_gate(m), rng)
+            # 200 ms of pad instead of TRIM_PAD_MS: untrimmed audio, which is not
+            # what INV-03 produces and must not be reported on as if it were.
+            pad = np.zeros(int(0.2 * ARCHIVE_SR))
+            wav = np.concatenate([pad, speech, pad]).astype(np.float32)
+            wav = (wav + rng.normal(0, 10 ** (ROOM_TONE_DBFS / 20), len(wav))).astype(np.float32)
+            for cond in ("real", "griffin_lim"):
+                path = tmp_path / cond / f"u{i:02d}.wav"
+                write_audio(path, wav, ARCHIVE_SR)
+                rows.append({"utt_id": f"u{i:02d}", "condition": cond, "tier": ARCHIVE_TIER,
+                             "path": str(path), "split": "eval",
+                             "duration_s": len(wav) / ARCHIVE_SR})
+        df = pd.DataFrame(rows)
+
+        with pytest.raises(InvariantViolation, match="does not read silence"):
+            silence_probe(df, "griffin_lim", split=None)
+        with pytest.raises(InvariantViolation, match="TRIM_PAD_MS"):
+            run_all(df, split=None)
+
+    def test_the_diagnostic_reports_what_the_gate_raises_on(self, tmp_path):
+        """Diagnosis is the one place a disagreeing threshold must still report."""
+        from data.audio_io import write_audio
+        from experiments.sanity_checks import silence_diagnostic
+
+        rows = []
+        for i in range(8):
+            rng = np.random.default_rng(i)
+            m = int(1.0 * ARCHIVE_SR)
+            t = np.arange(m) / ARCHIVE_SR
+            speech = _room(0.3 * np.sin(2 * np.pi * (120 + i) * t) * _word_gate(m), rng)
+            pad = np.zeros(int(0.2 * ARCHIVE_SR))
+            wav = np.concatenate([pad, speech, pad]).astype(np.float32)
+            wav = (wav + rng.normal(0, 10 ** (ROOM_TONE_DBFS / 20), len(wav))).astype(np.float32)
+            for cond in ("real", "griffin_lim"):
+                path = tmp_path / cond / f"u{i:02d}.wav"
+                write_audio(path, wav, ARCHIVE_SR)
+                rows.append({"utt_id": f"u{i:02d}", "condition": cond, "tier": ARCHIVE_TIER,
+                             "path": str(path), "split": "eval",
+                             "duration_s": len(wav) / ARCHIVE_SR})
+        floors, sweep, ref = silence_diagnostic(pd.DataFrame(rows), split=None)
+        assert not ref.ok and ref.pad_error > SILENCE_PAD_AGREEMENT
+        assert not floors.empty and not sweep.empty
+
+    def test_the_trim_pad_level_is_recorded_and_ungated(self, tmp_path):
+        """Task 3: the ~1 dB pad difference stays visible without becoming a gate.
+
+        The derived threshold sits above the pad's noise by design, so the silence
+        probe can no longer see a pad-level difference, and `rms_level` cannot
+        either -- whole-file RMS is dominated by speech. Adding noise at the
+        floor's own level raises the condition's pad by ~3 dB, which is inside
+        the margin, so the EER stays at chance while the column shows the effect.
+        """
+        from experiments.sanity_checks import run_all
+
+        sigma = 10 ** (ROOM_TONE_DBFS / 20)
+        df = _pipeline_corpus(
+            tmp_path,
+            lambda s, r: (s + r.normal(0, sigma, len(s))).astype(np.float32),
+        )
+        sanity = run_all(df, split=None)
+        silence = sanity[sanity["probe"] == "silence_duration"].iloc[0]
+
+        # Around 1 dB -- the same order as the +0.887 dB the real run recorded for
+        # griffin_lim, and well inside the margin, so it cannot move the threshold.
+        assert 0.2 < silence["trim_pad_above_real_db"] < SILENCE_FLOOR_MARGIN_DB
+        assert not bool(silence["leaked"]), "recorded, not gated"
+        assert silence["eer"] >= SANITY_EER_FLOOR
+        assert not sanity["leaked"].any()
+        # And it is a column, not a probe: no row's verdict is derived from it.
+        assert "trim_pad_above_real_db" not in {"probe", "eer", "leaked"}
+        assert sanity.loc[sanity["probe"] != "silence_duration",
+                          "trim_pad_above_real_db"].isna().all()
+
+    def test_every_sanity_row_carries_the_threshold_it_was_measured_at(self, tmp_path):
+        from experiments.sanity_checks import run_all, silence_reference
+
+        df = _pipeline_corpus(tmp_path, lambda s, r: s)
+        sanity = run_all(df, split=None)
+        ref = silence_reference(df, split=None)
+        for column, value in (
+            ("silence_threshold_dbfs", ref.threshold_dbfs),
+            ("silence_floor_dbfs", ref.floor_dbfs),
+            ("silence_frame_rms_cut_dbfs", ref.frame_rms_percentile_dbfs),
+            ("real_trim_pad_dbfs", ref.pad_level_dbfs),
+        ):
+            assert np.allclose(sanity[column].to_numpy(float), value), column
+
+    def test_the_gated_run_records_the_calibration_in_the_sidecar(self, gated_dataset):
+        """It is a property OF the dataset, so it travels with the dataset."""
+        prov = json.loads((gated_dataset / "manifest.provenance.json").read_text())
+        calibration = prov["silence_threshold"]
+        assert set(calibration) == {"archive", "zeroshot"}
+        for tier, record in calibration.items():
+            assert record["tier"] == tier
+            assert record["pad_agreement_ok"] is True
+            assert record["margin_db"] == SILENCE_FLOOR_MARGIN_DB
+            assert record["threshold_dbfs"] == pytest.approx(
+                record["floor_dbfs"] + SILENCE_FLOOR_MARGIN_DB, abs=1e-3
+            )
+            assert record["pad_expected_s"] == pytest.approx(0.04)
+
+        sanity = pd.read_csv(gated_dataset / "sanity.csv")
+        for tier, record in calibration.items():
+            rows = sanity[sanity["tier"] == tier]
+            assert np.allclose(
+                rows["silence_threshold_dbfs"].to_numpy(float),
+                record["threshold_dbfs"], atol=1e-3,
+            )

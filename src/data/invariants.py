@@ -657,6 +657,46 @@ SPLIT_FRACTIONS: Final[dict[str, float]] = {"train": 0.70, "dev": 0.10, "eval": 
 # not, a confound has leaked and the condition set is not publishable.
 SANITY_EER_FLOOR: Final[float] = 0.40  # 0.5 == chance; below this, investigate
 
+# The silence probe's threshold is DERIVED from the corpus, never a constant.
+#
+# INV-03 defines silence RELATIVELY -- TRIM_TOP_DB below the file's loudest
+# frame -- while the probe that checks INV-03 compares |sample| to an absolute
+# level. Those two definitions only agree on a corpus whose floor happens to sit
+# where the absolute one was set. The probe carried -50.0 dBFS as a bare default
+# argument from the first commit, in no constants block and with no recorded
+# derivation, for three weeks. On LJSpeech the corpus floor is ~-53.5 dBFS, so
+# -50 dBFS sat INSIDE the floor: the feature measured how often the signal's own
+# noise crossed a level near its own noise, not a silence duration. It read
+# 15.5 ms of a pad that INV-03 fixes at 2 * TRIM_PAD_MS = 40 ms.
+#
+# The replacement measures the floor of the REAL reference and clears it:
+#
+#   floor  = the SILENCE_FLOOR_PEAK_PERCENTILE of |sample| within the quietest
+#            SILENCE_FLOOR_FRAME_PERCENTILE of real's RMS frames
+#   thresh = floor + SILENCE_FLOOR_MARGIN_DB
+#
+# Peak against peak, deliberately: the probe compares |sample|, so a floor
+# expressed as an RMS would need the margin to absorb a crest factor of
+# sqrt(2 ln N) -- +10.4 dB at N = one 20 ms pad, +14.5 dB across a corpus -- and
+# the same constant would then mean something different at another sample rate
+# or pad length. That is the INV-11 "64600 samples" mistake in a new place.
+#
+# The margin clears the maximum of a noise-like floor above its own p99.9
+# (3.2 dB at pad scale, 4.1 dB across a corpus) with headroom, and lands the
+# threshold mid-band rather than at the edge of what LJSpeech admits (-43..-37
+# dBFS, measured; docs/measurements.md).
+SILENCE_FLOOR_FRAME_PERCENTILE: Final[float] = 10.0
+SILENCE_FLOOR_PEAK_PERCENTILE: Final[float] = 99.9
+SILENCE_FLOOR_MARGIN_DB: Final[float] = 8.0
+
+# What makes the derived threshold checkable rather than another assertion.
+# INV-03 writes exactly TRIM_PAD_MS of context at each end, so at a correct
+# threshold the real reference must read 2 * TRIM_PAD_MS of leading plus
+# trailing silence. Outside this fractional tolerance the probe RAISES: a
+# silence EER measured at a threshold that is not reading silence is a number
+# nobody can interpret, which is worse than no number at all.
+SILENCE_PAD_AGREEMENT: Final[float] = 0.25
+
 # --- INV-16  Sample alignment ------------------------------------------------
 # Reference-derived trim spans (INV-03) assume the vocoder is sample-aligned
 # with its input. A fixed vocoder delay would turn a time shift into a measured
