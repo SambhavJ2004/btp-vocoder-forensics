@@ -5,6 +5,18 @@ git, and is the artefact a reviewer reads to confirm that the confound controls
 were actually applied rather than merely intended.
 
 Manifest columns exist to answer specific questions:
+  - ``path``         : where the audio is, RELATIVE to the manifest's own
+                       directory, and resolved against it at read time. Never
+                       absolute. A dataset gets renamed (``<out>.staging`` ->
+                       ``<out>.failed``), published, and mounted somewhere else
+                       entirely -- a teammate's ``/kaggle/input/<slug>/`` is not
+                       the ``/kaggle/working/`` the run wrote from. An absolute
+                       path records the machine that generated the data rather
+                       than where the data is, so every consumer that opens
+                       audio breaks on the first relocation while every consumer
+                       that only reads columns carries on, which is how this was
+                       missed. The generating directory is recorded once, in the
+                       provenance sidecar, where staleness is the point.
   - ``tier``/``derived``/``source_rate``/``derivation``/``resample_steps``
                      : INV-01. Which artifact this is, what it came from, and
                        how many filtering passes it has been through. One step,
@@ -45,7 +57,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pandas as pd
 
@@ -165,11 +177,105 @@ class ManifestRow:
         return d
 
 
+def manifest_root(manifest_path: str | Path) -> Path:
+    """The directory a manifest's paths are relative to: its own."""
+    return Path(manifest_path).expanduser().resolve().parent
+
+
+def _is_absolute(stored: str) -> bool:
+    """Absolute under EITHER OS's rules, because manifests cross between them.
+
+    A run writes on Kaggle (Linux) and is read on a laptop (Windows), so
+    ``Path('/kaggle/working/x.wav').is_absolute()`` is False here and joining it
+    to a root silently produces ``C:\\kaggle\\working\\x.wav``. That is the same
+    class of silent wrong answer this whole change is about.
+    """
+    return PurePosixPath(stored).is_absolute() or PureWindowsPath(stored).is_absolute()
+
+
+def _store_path(stored: object, manifest_path: Path) -> str:
+    """One ``path`` value as it is written: relative to the manifest, POSIX form.
+
+    A path already relative is kept as given -- it is already in the stored form,
+    and re-interpreting it against the current working directory would be a
+    second meaning for the same column. An absolute path outside the manifest's
+    own directory is refused rather than stored: the manifest would then describe
+    a tree it does not sit in, which is the defect this function exists to
+    prevent, wearing a different hat.
+    """
+    if not _is_absolute(str(stored)):
+        return Path(str(stored)).as_posix()
+    root = manifest_root(manifest_path)
+    try:
+        return Path(str(stored)).resolve().relative_to(root).as_posix()
+    except ValueError:
+        raise InvariantViolation(
+            f"manifest {manifest_path} would record '{stored}', which is outside its "
+            f"own directory ({root}). Manifest paths are relative to the manifest so "
+            "the dataset survives being renamed, published and mounted elsewhere; a "
+            "path that cannot be made relative describes a tree this manifest does "
+            "not sit in."
+        ) from None
+
+
+def resolve_audio_paths(df: pd.DataFrame, manifest_path: str | Path) -> pd.DataFrame:
+    """Point ``path`` at the audio as it exists HERE, next to this manifest.
+
+    The single resolution every consumer goes through -- the sanity probes, the
+    silence diagnostic, the quality metrics and the detectors all open
+    ``row.path`` and none of them should know where the run happened. Called by
+    :func:`read_manifest`, and directly by the one reader that is deliberately
+    tolerant of older manifests (``btpvf silence-diag``).
+
+    Three cases, in this order:
+
+      relative   joined to the manifest's directory. The sanctioned form.
+      absolute   reconstructed as ``<root>/<tier>/<condition>/<utt>.wav`` -- the
+                 layout Phase A writes -- whenever that file exists. The manifest
+                 describes the tree it sits in, so that tree wins even when the
+                 recorded absolute path still resolves; otherwise reading a copy
+                 would silently score the original.
+      neither    an absolute path with no counterpart here is left exactly as
+                 recorded, so the failure names the path that was written rather
+                 than one this function invented.
+
+    The absolute case is the recovery path for manifests written before paths
+    were stored relative -- including the first v0 run, whose recorded
+    ``.staging`` directory was renamed to ``.failed`` underneath it.
+
+    ``df.attrs`` carries ``manifest_root`` and ``paths_relocated`` for anything
+    that wants to report the recovery rather than perform it silently.
+    """
+    root = manifest_root(manifest_path)
+    has_layout = {"tier", "condition", "utt_id"} <= set(df.columns)
+    resolved: list[str] = []
+    relocated = 0
+    for i, stored in enumerate(df["path"].astype(str)):
+        if not _is_absolute(stored):
+            resolved.append(str(root / stored))
+            continue
+        candidate = None
+        if has_layout:
+            row = df.iloc[i]
+            candidate = root / str(row["tier"]) / str(row["condition"]) / f"{row['utt_id']}.wav"
+        if candidate is not None and candidate.is_file():
+            resolved.append(str(candidate))
+            relocated += int(str(candidate) != stored)
+        else:
+            resolved.append(stored)
+    out = df.copy()
+    out["path"] = resolved
+    out.attrs["manifest_root"] = str(root)
+    out.attrs["paths_relocated"] = relocated
+    return out
+
+
 def write_manifest(rows: list[ManifestRow], path: str | Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame([r.to_dict() for r in rows])
     df = df.reindex(columns=list(MANIFEST_COLUMNS))
+    df["path"] = [_store_path(p, path) for p in df["path"]]
     df.sort_values(["tier", "condition", "utt_id"], inplace=True)
     df.to_csv(path, index=False)
     return path
@@ -180,7 +286,7 @@ def read_manifest(path: str | Path) -> pd.DataFrame:
     missing = set(MANIFEST_COLUMNS) - set(df.columns)
     if missing:
         raise InvariantViolation(f"manifest {path} missing columns: {sorted(missing)}")
-    return df
+    return resolve_audio_paths(df, path)
 
 
 def select_tier(df: pd.DataFrame, tier: str) -> pd.DataFrame:

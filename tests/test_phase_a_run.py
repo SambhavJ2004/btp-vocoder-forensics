@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -887,3 +888,210 @@ class TestSilenceDiagnostic:
         assert (out / "silence_floors.csv").is_file()
         sweep = pd.read_csv(out / "silence_threshold_sweep.csv")
         assert set(sweep["threshold_dbfs"]) == set(SILENCE_DIAGNOSTIC_THRESHOLDS)
+
+
+# ================================================ manifest paths and relocation
+
+
+@pytest.fixture(scope="class")
+def gated_dataset(tmp_path_factory):
+    """One complete gated run, built once. Each test copies it before moving it.
+
+    Class-scoped because a gated run generates two tiers of two conditions and
+    every test below wants a real dataset rather than a hand-built frame -- the
+    defect this class covers lived in what Phase A WROTE, not in what a fixture
+    could assert about it.
+    """
+    import soundfile as sf
+
+    from experiments.phase_a_resynthesis import run_gated
+
+    root = tmp_path_factory.mktemp("relocation")
+    corpus_root = root / "LJSpeech-1.1"
+    (corpus_root / "wavs").mkdir(parents=True)
+    lines = []
+    for i in range(N_UTTS):
+        uid = f"LJ001-{i:04d}"
+        sf.write(
+            corpus_root / "wavs" / f"{uid}.wav", _speechlike(seed=i), ARCHIVE_SR,
+            subtype="PCM_16",
+        )
+        lines.append(f"{uid}|x|x")
+    (corpus_root / "metadata.csv").write_text("\n".join(lines), encoding="utf-8")
+
+    out = root / "resynth_v0"
+    with pytest.MonkeyPatch.context() as mp:
+        _register(mp, lambda w: w)
+        run_gated(corpus_root, ["hifigan_v1"], out, N_UTTS, device="cpu")
+    return out
+
+
+class TestManifestPathsSurviveRelocation:
+    """A manifest describes the tree it sits in, not the machine that wrote it.
+
+    `btpvf silence-diag` crashed on the first v0 run because the manifest
+    recorded absolute `<out>.staging` paths and run_gated renames staging to
+    `<out>.failed` on a failed gate -- so every recorded path pointed into a
+    directory that no longer existed. The same defect breaks the handoff: a
+    teammate mounting the published output at /kaggle/input/<slug>/ would get a
+    manifest of paths into someone else's /kaggle/working.
+
+    It went unnoticed because `btpvf loudness` reads columns and never opens a
+    file. Consumers that open audio are the ones that break, which is why every
+    one of them is exercised here after a move.
+    """
+
+    def _copy(self, dataset: Path, dest: Path) -> Path:
+        shutil.copytree(dataset, dest)
+        return dest
+
+    def test_stored_paths_are_relative_to_the_manifest(self, gated_dataset):
+        raw = pd.read_csv(gated_dataset / "manifest.csv")
+        assert not any(Path(p).is_absolute() for p in raw["path"])
+        # And relative to the manifest itself, in the layout Phase A writes.
+        assert set(raw["path"]) == {
+            f"{r.tier}/{r.condition}/{r.utt_id}.wav" for r in raw.itertuples()
+        }
+        assert all((gated_dataset / p).is_file() for p in raw["path"])
+
+    def test_read_manifest_resolves_against_the_manifest_it_came_from(self, gated_dataset):
+        from data.manifest import read_manifest
+
+        df = read_manifest(gated_dataset / "manifest.csv")
+        assert df.attrs["manifest_root"] == str(gated_dataset.resolve())
+        assert all(Path(p).is_file() for p in df["path"])
+
+    def test_a_renamed_directory_still_resolves(self, gated_dataset, tmp_path):
+        """The reported crash: staging renamed to `.failed` under the manifest."""
+        from data.manifest import read_manifest
+
+        staging = self._copy(gated_dataset, tmp_path / "resynth_v0.staging")
+        failed = staging.parent / "resynth_v0.failed"
+        staging.rename(failed)
+
+        df = read_manifest(failed / "manifest.csv")
+        assert all(Path(p).is_file() for p in df["path"])
+        assert all(Path(p).is_relative_to(failed.resolve()) for p in df["path"])
+
+    def test_the_whole_tree_moved_elsewhere_still_resolves(self, gated_dataset, tmp_path):
+        """The handoff: the same dataset mounted read-only under another root."""
+        from data.manifest import read_manifest, validate_manifest
+
+        mounted = self._copy(gated_dataset, tmp_path / "kaggle" / "input" / "btpvf-v0")
+        df = read_manifest(mounted / "manifest.csv")
+        validate_manifest(df, require_zeroshot=True)
+        assert all(Path(p).is_file() for p in df["path"])
+        assert all(Path(p).is_relative_to(mounted.resolve()) for p in df["path"])
+
+    def test_every_consumer_reads_the_relocated_files(self, gated_dataset, tmp_path):
+        """Each consumer named in the handoff, driven on a moved tree."""
+        from data.invariants import ZEROSHOT_TIER
+        from data.manifest import read_manifest
+        from detectors.protocols import Protocol, score_condition
+        from experiments.sanity_checks import run_all, silence_diagnostic
+        from metrics.runner import evaluate_archive
+
+        mounted = self._copy(gated_dataset, tmp_path / "elsewhere" / "v0")
+        df = read_manifest(mounted / "manifest.csv")
+
+        sanity = run_all(df, split=None)          # INV-12 probes: open every file
+        assert not sanity["leaked"].any()
+
+        floors, sweep = silence_diagnostic(df, split=None, limit=5)
+        assert set(floors["condition"]) == {"real", "hifigan_v1"}
+        assert not sweep["eer"].isna().any()
+
+        quality = evaluate_archive(df, with_f0=False)   # Person B
+        assert len(quality) == N_UTTS and quality["mcd"].notna().all()
+
+        class Dummy:                                    # Person C
+            spec = SimpleNamespace(key="dummy")
+
+            def score_batch(self, wavs):
+                return np.asarray([float(np.std(w)) for w in wavs])
+
+        result = score_condition(
+            Dummy(), df, "hifigan_v1", protocol=Protocol.MISMATCHED,
+            tier=ZEROSHOT_TIER, split="eval", with_ci=False,
+        )
+        assert result.n_bonafide == result.n_spoof > 0
+
+    def test_a_failed_run_is_readable_where_it_was_left(self, corpus, tmp_path, monkeypatch):
+        """End to end: the exact sequence that produced the LibsndfileError."""
+        from scipy.signal import butter, sosfiltfilt
+
+        from experiments.cli import main
+        from experiments.phase_a_resynthesis import run_gated
+
+        sos = butter(8, 2000 / (ARCHIVE_SR / 2), output="sos")
+        _register(monkeypatch, lambda w: sosfiltfilt(sos, w).astype(np.float32))
+        out = tmp_path / "resynth_v0"
+        with pytest.raises(InvariantViolation, match="INV-12"):
+            run_gated(corpus, ["hifigan_v1"], out, N_UTTS, device="cpu", keep_failed=True)
+
+        failed = tmp_path / "resynth_v0.failed"
+        assert main([
+            "silence-diag", "--manifest", str(failed / "manifest.csv"),
+            "--out-dir", str(tmp_path / "diag"), "--limit", "5",
+        ]) == 0
+        assert (tmp_path / "diag" / "silence_floors.csv").is_file()
+
+    def test_a_legacy_absolute_manifest_is_read_from_its_own_directory(
+        self, gated_dataset, tmp_path
+    ):
+        """Manifests written before this change point at another machine entirely.
+
+        They are recovered from the layout their own columns record, not guessed
+        at: <manifest dir>/<tier>/<condition>/<utt_id>.wav. Recovered, and said
+        so -- `paths_relocated` is what the CLI prints rather than staying quiet.
+        """
+        from data.manifest import read_manifest
+
+        mounted = self._copy(gated_dataset, tmp_path / "input" / "v0")
+        raw = pd.read_csv(mounted / "manifest.csv")
+        raw["path"] = [f"/kaggle/working/resynth_v0.staging/{p}" for p in raw["path"]]
+        raw.to_csv(mounted / "manifest.csv", index=False)
+
+        df = read_manifest(mounted / "manifest.csv")
+        assert df.attrs["paths_relocated"] == len(df)
+        assert all(Path(p).is_file() for p in df["path"])
+
+    def test_an_unrecoverable_path_keeps_the_one_that_was_recorded(self, gated_dataset, tmp_path):
+        """No invention: if the file is nowhere, the error names what was written."""
+        from data.manifest import read_manifest
+
+        mounted = self._copy(gated_dataset, tmp_path / "input" / "v0")
+        raw = pd.read_csv(mounted / "manifest.csv")
+        recorded = "/kaggle/working/resynth_v0.staging/archive/real/LJ001-0000.wav"
+        raw.loc[0, "path"] = recorded
+        raw.loc[0, "utt_id"] = "not-a-real-utterance"
+        raw.to_csv(mounted / "manifest.csv", index=False)
+
+        df = read_manifest(mounted / "manifest.csv")
+        assert df.iloc[0]["path"] == recorded
+        assert df.attrs["paths_relocated"] == 0
+
+    def test_write_manifest_refuses_a_path_outside_its_own_directory(self, tmp_path):
+        from data.manifest import ManifestRow, write_manifest
+
+        row = ManifestRow(
+            utt_id="u0", condition="real", path=str(tmp_path / "elsewhere" / "u0.wav"),
+            speaker="LJ", split="train", duration_s=1.0, lufs_out=-27.0,
+            trim_start=0, trim_end=10, trim_ref_length=10,
+        )
+        with pytest.raises(InvariantViolation, match="outside its own directory"):
+            write_manifest([row], tmp_path / "dataset" / "manifest.csv")
+
+    def test_the_generating_directory_is_provenance_not_a_path_column(self, gated_dataset):
+        """The one absolute path a run records, kept where staleness is the point.
+
+        It names the session that generated the data -- for a gated run, the
+        staging directory the bytes were written into, which no longer exists by
+        the time anyone reads this. That is what provenance is for, and it is
+        why it is not the column consumers open files with.
+        """
+        prov = json.loads((gated_dataset / "manifest.provenance.json").read_text())
+        assert Path(prov["generated_in"]).is_absolute()
+        assert Path(prov["generated_in"]).name.startswith(gated_dataset.name)
+        raw = pd.read_csv(gated_dataset / "manifest.csv")
+        assert not any(Path(p).is_absolute() for p in raw["path"])

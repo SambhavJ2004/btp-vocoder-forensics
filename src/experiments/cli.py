@@ -150,14 +150,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "silence-diag":
         import pandas as pd
 
+        from data.manifest import resolve_audio_paths
         from experiments.sanity_checks import silence_diagnostic
 
         # Read tolerantly: this runs on manifests written by earlier versions,
-        # including the failed run being diagnosed.
+        # including the failed run being diagnosed. Paths still go through the
+        # one resolution, which is what makes a manifest whose directory was
+        # renamed under it -- `<out>.staging` -> `<out>.failed` -- readable.
         df = pd.read_csv(args.manifest)
         missing = {"utt_id", "condition", "tier", "path", "split"} - set(df.columns)
         if missing:
             raise SystemExit(f"manifest lacks {sorted(missing)}")
+        df = resolve_audio_paths(df, args.manifest)
+        if df.attrs.get("paths_relocated"):
+            print(
+                f"[paths] {df.attrs['paths_relocated']} rows record an absolute path "
+                f"from another machine or directory; read from "
+                f"{df.attrs['manifest_root']}, the manifest's own, instead."
+            )
         floors, sweep = silence_diagnostic(df, limit=args.limit)
         out_dir = Path(args.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)

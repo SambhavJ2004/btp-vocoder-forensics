@@ -417,6 +417,13 @@ def run(
                 for a in ANALYSES
             },
             "n_utterances": len(spans),
+            # The one absolute path this run records, and the only place one
+            # belongs: provenance, where going stale is the point. Manifest
+            # paths are relative to the manifest, so the dataset survives the
+            # staging rename and being mounted somewhere else; this records the
+            # directory the bytes were actually written into, which for a gated
+            # run is `<out>.staging` -- it names the session, not the dataset.
+            "generated_in": str(out_dir.resolve()),
             "dropped_for_peak": sorted(dropped),
             "corpus": corpus.name,
             "alignment": {r.condition: r.peak_lag for r in reports},
@@ -611,10 +618,12 @@ def run_gated(
                     nothing, and at a few hundred utterances the eval split alone
                     is small enough to trip the floor by chance.
 
-    Then the loudness report is written (a report, not a gate), the manifest's
-    paths are pointed at the final location, and staging is renamed into place.
-    On any failure staging is deleted -- or, with ``keep_failed``, renamed to
-    ``<out>.failed`` for inspection -- and the error propagates.
+    Then the loudness report is written (a report, not a gate) and staging is
+    renamed into place. On any failure staging is deleted -- or, with
+    ``keep_failed``, renamed to ``<out>.failed`` for inspection -- and the error
+    propagates. Either way the manifest keeps working, because its paths are
+    relative to it; the ``.failed`` directory is a readable dataset for exactly
+    the diagnosis it was kept for.
     """
     from data.alignment import read_alignment_report
     from data.corpus import LJSpeech
@@ -658,9 +667,12 @@ def run_gated(
         loudness.to_csv(staging / "loudness_gain.csv", index=False)
         gates["loudness_report"] = "loudness_gain.csv"
 
-        # Point the manifest at where the files WILL be, then move them there.
-        df["path"] = [str(out_dir / Path(p).relative_to(staging)) for p in df["path"]]
-        df.to_csv(staged_manifest, index=False)
+        # Nothing to rewrite before the move: manifest paths are relative to the
+        # manifest, so they are already correct at whatever the directory ends
+        # up being called. This used to rewrite them to absolute `out_dir` paths,
+        # which is why the FAILED runs -- renamed to `<out>.failed` after the
+        # rewrite step was never reached -- carried paths into a `.staging`
+        # directory that no longer existed.
         (staging / "gates.json").write_text(
             json.dumps(gates, indent=2, sort_keys=True, default=str), encoding="utf-8"
         )

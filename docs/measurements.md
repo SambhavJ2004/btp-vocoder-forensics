@@ -502,6 +502,46 @@ low-band-matched level, and both loudness measurements stay on every manifest ro
 so `target − lufs_in` (the old rule's gain) remains computable. The archive must
 be regenerated.
 
+**What it closed, measured rather than argued.** Under the band-referenced rule
+`band_offset_db` is ~1e-9 dB for all three conditions —
+`band_offset_x_resolution` ~1e-6 — against 0.3018 dB and 86.2× for
+`griffin_lim` under the old rule. That residual is the arithmetic of measuring a
+gain and applying it, not a level difference: the in-band level is now the same
+number for every condition by construction, which is what the change was for.
+
+### The rms_level probe improved, and the prediction was the opposite
+
+The expectation was that referencing the gain to the band would leave each
+condition's FULL-band level free to differ, and that the broadband `rms_level`
+probe would therefore read worse. Every value moved the other way — closer to
+chance, which for a two-sided EER means the distance from 0.500 shrank:
+
+| probe | condition | tier | full-band rule | band rule | distance from 0.500 |
+|---|---|---|---|---|---|
+| rms_level | `griffin_lim` | archive | 0.630 | **0.480** | 0.130 → 0.020 |
+| rms_level | `griffin_lim` | zeroshot | 0.680 | **0.555** | 0.180 → 0.055 |
+| rms_level | `bigvgan_112m` | archive | 0.565 | **0.530** | 0.065 → 0.030 |
+| rms_level | `vocos` | archive | 0.495 | 0.500 | 0.005 → 0.000 |
+
+**Why, and it is not a coincidence.** RMS and LUFS weight the high band very
+differently. RMS is unweighted broadband energy, and the high band is only ~2% of
+total energy (INV-17: real 0.01803), so RMS is dominated by in-band content and is
+very nearly an in-band measure already. LUFS is K-weighted — a high-frequency
+shelf — so it gives that same 2% far more say. Matching full-band LUFS across
+conditions therefore had to push the in-band level around to compensate for the
+high-band difference, and RMS, being in-band, saw that compensation directly.
+Referencing the gain to the band aligns the normaliser's weighting with what RMS
+mostly measures, so the compensation is gone.
+
+The ordering says the same thing as the loudness table above, in a different
+measurement: `griffin_lim` has the largest high-band deficit and the largest
+improvement, `vocos` has none and does not move. The two are the same effect
+seen through a K-weighted meter and through an unweighted one.
+
+Recorded, not acted on. Every value was above the `SANITY_EER_FLOOR` of 0.40
+under both rules, so no verdict changed either way — this is evidence about the
+mechanism, not a gate result.
+
 ### Silence: griffin_lim trips the INV-12 probe
 
 | probe | condition | tier | EER | floor |
