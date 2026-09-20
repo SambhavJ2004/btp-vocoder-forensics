@@ -631,8 +631,9 @@ or the two definitions describe different things. Per dataset and per tier, from
 the **real reference alone**:
 
 ```
-floor     = SILENCE_FLOOR_PEAK_PERCENTILE of |sample| inside the quietest
-            SILENCE_FLOOR_FRAME_PERCENTILE of real's RMS frames
+per file  = SILENCE_FLOOR_PEAK_PERCENTILE of |sample| inside the quietest
+            SILENCE_FLOOR_FRAME_PERCENTILE of THAT FILE's RMS frames
+floor     = median of that across real's files
 threshold = floor + SILENCE_FLOOR_MARGIN_DB
 ```
 
@@ -645,6 +646,20 @@ with `SILENCE_FLOOR_FRAME_PERCENTILE = 10.0`, `SILENCE_FLOOR_PEAK_PERCENTILE =
   +14.5 dB over a corpus — and the same constant would then mean something else
   at another sample rate or pad length. That is INV-11's "64600 samples" mistake
   in a new place.
+- **Per file first, then across files.** The first implementation pooled every
+  file's quiet samples and took one percentile of the pool. That is a different
+  quantity — the level 0.1% of all quiet samples ANYWHERE exceed, whose tail
+  comes from the noisiest files — and it **climbs as files are added**: measured
+  on nested synthetic corpora with a 5 dB spread of per-file floors, +5.1 dB from
+  n=8 to n=240, against 1.8 dB of ordinary sampling drift for the median. On
+  identical files the two agree to 0.1 dB, which is why a homogeneous 12-file
+  fixture could not see it and the first 200-file run derived a floor 7.05 dB too
+  high. A statistic whose meaning depends on how much was measured is the same
+  mistake again, so the aggregation is now named in the rule rather than left to
+  the implementation. The **median** is used because the threshold is one number
+  applied to every file: it is the level a typical file's quiet frames reach, it
+  has a 50% breakdown point, and it does not move with n. A lower percentile
+  would target the quietest files and push the threshold under the noisier ones.
 - **The quietest decile, not `reference_silent_mask`.** INV-03's relative
   criterion admits quiet speech: on LJSpeech its median sits at −53.5 dBFS,
   essentially at its own cutoff. Calibrating on the loudest samples of a "quiet"
@@ -686,6 +701,13 @@ row in that table, so the pipeline's own floor is visible next to each
 condition's. It derives its reference **non-strictly**: a dataset whose threshold
 disagrees with its pad is exactly what the diagnostic is for, so it reports what
 the probe raises on. It changes no verdict and no floor.
+
+**The gate and the diagnostic compute the floor through one function.** They did
+not, and reported −39.808 and −46.854 dBFS for the same named quantity on the same
+audio; two numbers under one name is the defect, whichever is right.
+`experiments.sanity_checks.quiet_stats` is now the single implementation of a
+file's two quiet-frame statistics, and `TestDerivedSilenceThreshold` asserts the
+floors table and the calibration agree on `floor_dbfs` for the same input.
 
 **Enforced by.** `experiments.sanity_checks.run_all`; the CLI exits non-zero on
 a leak. `experiments.sanity_checks.silence_reference` derives the threshold and
@@ -1510,13 +1532,24 @@ nudge a pipeline toward a preferred answer.
   nobody can interpret. `griffin_lim` is **not** marked `expected_by_design` and
   `SANITY_EER_FLOOR` is unchanged.
 
-  What the next run settles: the derived threshold is predicted to land near
-  −39 dBFS on LJSpeech — inside the −43..−37 dBFS band the sweep admits — but the
-  quiet-frame statistics it is built from were not in the v0 output, so that is a
-  prediction and not a measurement. `btpvf silence-diag` now prints
-  `quiet_frame_rms_dbfs` and `quiet_peak_dbfs`, so the derivation is reproducible
-  from its output. If the threshold does not read `2 × TRIM_PAD_MS`, the run
-  stops and says by how much; that is the designed outcome, not a regression.
+  **The first derived threshold was wrong, and the pad check refused it.** The
+  200-file run raised on the archive tier: floor −39.808 dBFS, threshold −31.808,
+  real reading **79.2 ms** against the 40 ms INV-03 leaves (98% off). The cause
+  was the floor's aggregation — the gate pooled every file's quiet samples before
+  taking the percentile, which climbs with n, while `silence-diag` took a median
+  of per-file percentiles; the same named quantity read −39.808 and −46.854 dBFS.
+  Fixed: per file first, median across files, through one shared function. Note
+  that at the bad threshold every condition read ~0.5 EER, so **the gate would
+  have passed** — the pad-agreement check is what refused it, and this is the case
+  it was added for. Committed evidence:
+  `data/measurements/silence_{calibration,floors,threshold_sweep}.csv`.
+
+  What the next run settles: with the corrected floor the threshold is
+  −38.854 dBFS, inside the −43..−37 dBFS band real's own sweep admits, and real's
+  pad interpolates to 44.7–46.1 ms — 12–15% off the expected 40 ms, inside the 25%
+  tolerance. That is computed from the committed files, not re-run: the audio is
+  not in this repository. If the threshold does not read `2 × TRIM_PAD_MS`, the
+  run stops and says by how much; that is the designed outcome, not a regression.
 
   Note what the change does and does not decide. Across the whole admissible band
   the silence EER is ≥ 0.43, so the gate passes there — a consequence of fixing

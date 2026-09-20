@@ -106,39 +106,72 @@ def _quiet_mask(wav: np.ndarray, sr: int = ARCHIVE_SR) -> np.ndarray:
     return mask
 
 
+def quiet_stats(wav: np.ndarray, sr: int = ARCHIVE_SR) -> tuple[float, float]:
+    """One FILE's quiet-frame RMS cut and the peak level inside those frames, dBFS.
+
+    The single implementation of both numbers the threshold is built from.
+    :func:`silence_floor_dbfs` aggregates it across files and
+    :func:`silence_diagnostic` reports it per condition, so the gate and the
+    diagnostic cannot disagree about a quantity they both call the floor.
+    """
+    rms = _frame_rms(wav, sr)
+    recorded = rms > _PCM16_LSB
+    if not recorded.any():
+        return float("nan"), float("nan")
+    cut = float(np.percentile(rms[recorded], SILENCE_FLOOR_FRAME_PERCENTILE))
+    mask = _quiet_mask(wav, sr)
+    if not mask.any():
+        return _dbfs_amp(cut), float("nan")
+    peak = float(np.percentile(np.abs(wav[mask].astype(np.float64)),
+                               SILENCE_FLOOR_PEAK_PERCENTILE))
+    return _dbfs_amp(cut), _dbfs_amp(peak)
+
+
 def silence_floor_dbfs(wavs: list[np.ndarray], sr: int = ARCHIVE_SR) -> tuple[float, float]:
     """The corpus's noise floor, as the probe measures levels: a SAMPLE PEAK.
 
-    Returns ``(floor_peak_dbfs, frame_rms_percentile_dbfs)`` -- the pooled
-    ``SILENCE_FLOOR_PEAK_PERCENTILE`` of |sample| inside every file's quietest
-    frames, and the median across files of those frames' RMS cut. The second is
-    reported, not used: it is what makes the first reproducible from
-    ``btpvf silence-diag`` output rather than from a separate calculation.
+    Returns ``(floor_peak_dbfs, frame_rms_percentile_dbfs)``: the **median across
+    files** of each file's :func:`quiet_stats`.
 
     Peak against peak is the point. The probe thresholds |sample|; a floor given
     as an RMS would leave the margin absorbing a crest factor of sqrt(2 ln N),
     which scales with the region length and the sample rate, so the same constant
     would silently mean something else on another corpus or tier.
+
+    **Per file first, then across files.** This function used to concatenate
+    every file's quiet samples and take one percentile of the pool, and that is a
+    different quantity: the level 0.1% of all quiet samples ANYWHERE exceed, whose
+    upper tail is supplied by whichever files have the loudest quiet moments.
+    Measured on synthetic corpora with a 4 dB spread of per-file floors, the
+    pooled figure climbs from +12.9 dB (n=5) to +15.3 dB (n=50) above the samples'
+    own RMS and then plateaus, while the per-file median stays at +10.2 dB
+    throughout. So it depended on how many files were measured, in exactly the
+    range between a test fixture and a real run: the suite passed at n=12 and the
+    first 200-file run derived a floor 7.0 dB too high (-39.808 against -46.854
+    dBFS), putting the threshold 7 dB into speech. The pad-agreement check caught
+    it. That is the `ASVSPOOF_CROP_SAMPLES` failure again -- a constant whose
+    meaning quietly depends on the size of what it is measured over.
+
+    **Median, not a lower percentile.** The threshold is one number applied to
+    every file, so the floor it clears should be the one a TYPICAL file's quiet
+    frames reach. A low percentile would target the quietest files and push the
+    threshold under the noisier ones, whose pads would then read as voiced. The
+    median has a 50% breakdown point, so a minority of noisy files cannot move
+    it, and it does not move with n. What bounds the spread ABOVE the median is
+    the margin, and what catches a spread too wide for the margin is the
+    pad-agreement check: files whose floor exceeds the threshold read no pad at
+    all, real's mean pad falls below `2 * TRIM_PAD_MS`, and the run stops.
     """
-    peaks: list[np.ndarray] = []
-    cuts: list[float] = []
-    for wav in wavs:
-        mask = _quiet_mask(wav, sr)
-        if not mask.any():
-            continue
-        peaks.append(np.abs(wav[mask].astype(np.float64)))
-        rms = _frame_rms(wav, sr)
-        recorded = rms > _PCM16_LSB
-        cuts.append(float(np.percentile(rms[recorded], SILENCE_FLOOR_FRAME_PERCENTILE)))
+    stats = [quiet_stats(wav, sr) for wav in wavs]
+    cuts = [c for c, p in stats if np.isfinite(c) and np.isfinite(p)]
+    peaks = [p for c, p in stats if np.isfinite(c) and np.isfinite(p)]
     if not peaks:
         raise InvariantViolation(
             "INV-12: no frame of the real reference carries signal above the PCM_16 "
             "quantisation floor, so the corpus has no measurable noise floor and the "
             "silence threshold cannot be derived. Check the audio before the probe."
         )
-    pooled = np.concatenate(peaks)
-    floor = float(np.percentile(pooled, SILENCE_FLOOR_PEAK_PERCENTILE))
-    return _dbfs_amp(floor), _dbfs_amp(float(np.median(cuts)))
+    return float(np.median(peaks)), float(np.median(cuts))
 
 
 def _dbfs_amp(amplitude: float) -> float:
@@ -496,27 +529,6 @@ def _dbfs(x: np.ndarray) -> float:
     return float(20.0 * np.log10(max(float(np.sqrt(np.mean(x.astype(np.float64) ** 2))), 1e-12)))
 
 
-def _quiet_stats(wav: np.ndarray, sr: int) -> tuple[float, float]:
-    """One file's quiet-frame RMS cut and the peak level inside those frames.
-
-    The two numbers the derived threshold is built from, per file. Reported by
-    the diagnostic for every condition so the gate's calibration is reproducible
-    from its output rather than from a separate calculation; the gate itself
-    pools across real's files instead of taking a median of per-file values.
-    """
-    rms = _frame_rms(wav, sr)
-    recorded = rms > _PCM16_LSB
-    if not recorded.any():
-        return float("nan"), float("nan")
-    cut = float(np.percentile(rms[recorded], SILENCE_FLOOR_FRAME_PERCENTILE))
-    mask = _quiet_mask(wav, sr)
-    if not mask.any():
-        return _dbfs_amp(cut), float("nan")
-    peak = float(np.percentile(np.abs(wav[mask].astype(np.float64)),
-                               SILENCE_FLOOR_PEAK_PERCENTILE))
-    return _dbfs_amp(cut), _dbfs_amp(peak)
-
-
 def silence_diagnostic(
     manifest: pd.DataFrame,
     *,
@@ -587,7 +599,7 @@ def silence_diagnostic(
             n = min(len(wav), len(mask))
             floors[cond].append(_dbfs(wav[:n][mask[:n]]))
             pads[cond].append(_pad_level_dbfs(wav, sr))
-            cut, peak = _quiet_stats(wav, sr)
+            cut, peak = quiet_stats(wav, sr)
             cuts[cond].append(cut)
             peaks[cond].append(peak)
             for t in swept:
@@ -605,9 +617,9 @@ def silence_diagnostic(
             "trim_pad_above_real_db": float(
                 np.nanmedian(pads[cond]) - np.nanmedian(pads[REAL_CONDITION])
             ),
-            # The estimator's own inputs, per condition. On `real` these are the
-            # per-file medians of what the gate pools; the gate's exact pooled
-            # values are in `reference`.
+            # The estimator's own inputs, per condition, through the same
+            # `quiet_stats` and the same median the gate uses -- so on `real`
+            # these are the gate's own floor, not a second opinion about it.
             "quiet_frame_rms_dbfs": float(np.nanmedian(cuts[cond])),
             "quiet_peak_dbfs": float(np.nanmedian(peaks[cond])),
             "reference_silent_fraction": float(np.mean(silent_fraction)),

@@ -1,0 +1,2 @@
+tier,n_real_files,frame_percentile,peak_percentile,quiet_frame_rms_cut_dbfs,floor_dbfs,margin_db,threshold_dbfs,pad_expected_s,pad_measured_s,pad_error,pad_tolerance,pad_agreement_ok,real_trim_pad_dbfs
+archive,200,10.0,99.9,-54.273,-39.808,8.0,-31.808,0.04,0.079233,0.9808,0.25,False,-47.265

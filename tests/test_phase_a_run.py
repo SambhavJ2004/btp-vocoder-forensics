@@ -29,6 +29,7 @@ from data.invariants import (
     LADDER_FMAX,
     SANITY_EER_FLOOR,
     SILENCE_FLOOR_MARGIN_DB,
+    SILENCE_FLOOR_PEAK_PERCENTILE,
     SILENCE_PAD_AGREEMENT,
     InvariantViolation,
 )
@@ -1286,6 +1287,9 @@ class TestDerivedSilenceThreshold:
         floor, cut = silence_floor_dbfs(noise, ARCHIVE_SR)
         assert floor == pytest.approx(-60.0 + 10.35, abs=1.0)
         assert cut < floor, "the RMS cut sits below the peak floor, by the crest factor"
+        # Homogeneous files, so pooling would have agreed here -- which is why the
+        # pooled statistic's error was invisible until a real corpus ran.
+        assert silence_floor_dbfs(noise * 8, ARCHIVE_SR)[0] == pytest.approx(floor, abs=1e-9)
 
     def test_the_threshold_tracks_the_corpus_floor(self, tmp_path):
         """The VCTK argument: a corpus with a lower floor gets a lower threshold.
@@ -1335,6 +1339,69 @@ class TestDerivedSilenceThreshold:
         with pytest.raises(InvariantViolation, match="does not read silence"):
             silence_reference(df, split=None)
         assert not silence_reference(df, split=None, strict=False).ok
+
+    def test_the_floor_does_not_drift_with_the_number_of_files(self):
+        """The estimate of "the floor" must not depend on how much was measured.
+
+        The first version concatenated every file's quiet samples and took one
+        percentile of the pool. On a corpus whose per-file floors differ that is
+        a different quantity -- the level 0.1% of all quiet samples ANYWHERE
+        exceed, whose tail is supplied by the noisiest files -- and it climbs as
+        files are added. The suite passed at n=12 and the first 200-file run
+        derived a floor 7.0 dB too high, which put the threshold inside speech.
+        Nested subsets, so this measures the estimator and not resampling noise.
+        """
+        from experiments.sanity_checks import _dbfs_amp, _quiet_mask, silence_floor_dbfs
+
+        rng = np.random.default_rng(0)
+        corpus = []
+        for _ in range(240):  # per-file floors spread by 5 dB, as a real corpus's are
+            level = -62.0 + rng.normal(0, 5.0)
+            corpus.append(
+                (10 ** (level / 20) * rng.standard_normal(int(0.6 * ARCHIVE_SR))
+                 ).astype(np.float32)
+            )
+
+        def pooled(wavs):  # the statistic that was wrong, kept as a mutation check
+            pool = np.concatenate(
+                [np.abs(w[_quiet_mask(w, ARCHIVE_SR)].astype(np.float64)) for w in wavs]
+            )
+            return _dbfs_amp(float(np.percentile(pool, SILENCE_FLOOR_PEAK_PERCENTILE)))
+
+        small, large = corpus[:8], corpus
+        derived_drift = (silence_floor_dbfs(large, ARCHIVE_SR)[0]
+                         - silence_floor_dbfs(small, ARCHIVE_SR)[0])
+        pooled_drift = pooled(large) - pooled(small)
+
+        assert abs(derived_drift) < 2.5, "the median across files is stable in n"
+        assert pooled_drift > 3.0, (
+            "the pooled percentile climbs with n -- if this stops being true the "
+            "mutation check has lost its teeth, not the estimator its bug"
+        )
+        assert abs(derived_drift) < pooled_drift / 2
+
+    def test_the_diagnostic_and_the_gate_agree_on_the_floor(self, tmp_path):
+        """One implementation, so the two paths cannot report different floors.
+
+        They disagreed on the first real run -- the diagnostic's floors table said
+        -46.854 dBFS for real and the calibration said -39.808 -- because one took
+        a median of per-file percentiles and the other a percentile of the pool.
+        Two numbers under one name is the defect, whichever is right.
+        """
+        from experiments.sanity_checks import silence_diagnostic
+
+        df = _pipeline_corpus(tmp_path, lambda s, r: s)
+        floors, _, reference = silence_diagnostic(df, split=None)
+        real = floors.set_index("condition").loc["real"]
+
+        assert real["quiet_peak_dbfs"] == pytest.approx(reference.floor_dbfs, abs=1e-9)
+        assert real["quiet_frame_rms_dbfs"] == pytest.approx(
+            reference.frame_rms_percentile_dbfs, abs=1e-9
+        )
+        # And the threshold is that same floor plus the margin, not a third number.
+        assert reference.threshold_dbfs == pytest.approx(
+            real["quiet_peak_dbfs"] + SILENCE_FLOOR_MARGIN_DB, abs=1e-9
+        )
 
     def test_digital_silence_is_not_a_noise_floor(self, tmp_path):
         """Exact zeros carry no floor information and must not become the floor.
@@ -1472,3 +1539,85 @@ class TestDerivedSilenceThreshold:
                 rows["silence_threshold_dbfs"].to_numpy(float),
                 record["threshold_dbfs"], atol=1e-3,
             )
+
+
+class TestSilenceCalibrationArtifacts:
+    """The committed `btpvf silence-diag` output from the run whose gate raised.
+
+    `data/measurements/silence_{calibration,floors,threshold_sweep}.csv`, 200
+    LJSpeech utterances. Committed because they record two things at once: the
+    refutation of the reconstruction-noise hypothesis, and the floor estimator's
+    pooled-percentile defect that the pad-agreement check caught.
+    """
+
+    def _artifacts(self):
+        from data.measurements import (
+            SILENCE_CALIBRATION,
+            SILENCE_FLOORS,
+            SILENCE_SWEEP,
+            load_csv,
+        )
+
+        return (
+            load_csv(SILENCE_CALIBRATION).iloc[0],
+            load_csv(SILENCE_FLOORS).set_index("condition"),
+            load_csv(SILENCE_SWEEP),
+        )
+
+    def test_the_run_raised_and_the_record_says_so(self):
+        cal, _, _ = self._artifacts()
+        assert cal["n_real_files"] == 200
+        assert not bool(cal["pad_agreement_ok"])
+        assert cal["pad_measured_s"] == pytest.approx(0.079233, abs=1e-6)
+        assert cal["pad_error"] > SILENCE_PAD_AGREEMENT
+        # The gate would have PASSED at that threshold: every condition reads
+        # ~chance. It was refused for not measuring silence, not for its EER.
+        _, _, sweep = self._artifacts()
+        at_gate = sweep[sweep["gate_threshold"]]
+        assert len(at_gate) == 3 and (at_gate["eer"] > SANITY_EER_FLOOR).all()
+
+    def test_the_two_paths_disagreed_on_the_floor_and_agreed_on_the_cut(self):
+        """The defect, pinned in the data that exposed it."""
+        cal, floors, _ = self._artifacts()
+        real = floors.loc["real"]
+        assert cal["quiet_frame_rms_cut_dbfs"] == pytest.approx(
+            real["quiet_frame_rms_dbfs"], abs=5e-4
+        ), "the frame-RMS cut always agreed -- both paths took a median of per-file cuts"
+        gap = float(cal["floor_dbfs"]) - float(real["quiet_peak_dbfs"])
+        assert gap == pytest.approx(7.05, abs=0.05), (
+            "the peak floor did not: pooled percentile against median of per-file "
+            "percentiles"
+        )
+
+    def test_the_corrected_floor_lands_inside_the_band_the_sweep_admits(self):
+        """Derived from the committed files, not from a re-run: the audio is not here.
+
+        Real's own sweep column gives what the probe reads at each threshold;
+        `2 * TRIM_PAD_MS` is what INV-03 leaves. Interpolating between them says
+        whether the corrected threshold reads the pad.
+        """
+        from data.invariants import TRIM_PAD_MS
+
+        _, floors, sweep = self._artifacts()
+        threshold = float(floors.loc["real", "quiet_peak_dbfs"]) + SILENCE_FLOOR_MARGIN_DB
+        assert -43.0 < threshold < -37.0, "inside the band real's sweep admits"
+
+        real = (sweep.drop_duplicates("threshold_dbfs")
+                .set_index("threshold_dbfs")["real_silence_s_mean"].sort_index())
+        xs, ys = real.index.to_numpy(float), real.to_numpy(float)
+        expected = 2 * TRIM_PAD_MS * 1e-3
+        for predicted in (
+            float(np.interp(threshold, xs, ys)),                       # linear
+            float(np.exp(np.interp(threshold, xs, np.log(ys)))),       # log-linear
+        ):
+            assert abs(predicted - expected) / expected < SILENCE_PAD_AGREEMENT
+
+    def test_the_refutation_is_in_the_floors_table(self):
+        """No elevated noise floor: the synthetic +13.2 dB was ~100x the truth."""
+        _, floors, _ = self._artifacts()
+        assert floors.loc["griffin_lim", "above_real_db"] == pytest.approx(0.108, abs=0.01)
+        assert floors["above_real_db"].abs().max() < 0.2
+        # The one effect that survives, and the reason the pad column is recorded.
+        assert floors.loc["griffin_lim", "trim_pad_above_real_db"] == pytest.approx(
+            0.887, abs=0.01
+        )

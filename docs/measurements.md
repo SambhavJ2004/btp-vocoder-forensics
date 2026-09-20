@@ -338,6 +338,41 @@ asserts the evidence clears the control threshold, not that it rose.
 
 ---
 
+## `silence_calibration.csv`, `silence_floors.csv`, `silence_threshold_sweep.csv`
+
+`btpvf silence-diag` output from the first 200-utterance v0 run, the one whose
+INV-12 gate raised. Committed because they record two separate things: the
+**refutation** of the reconstruction-noise hypothesis (below), and the **floor
+estimator's pooled-percentile defect** that the pad-agreement check caught.
+
+| | |
+|---|---|
+| **Files** | 200 LJSpeech utterances, archive tier, all four conditions |
+| **Produced by** | `btpvf silence-diag --manifest <run>/manifest.csv` |
+| **Status** | the run RAISED: `pad_agreement_ok = False`, so no silence EER from it is a silence measurement |
+
+`silence_calibration.csv` is the gate's own record: the frame-RMS cut, the floor,
+the margin, the threshold, and what real actually read against `2 × TRIM_PAD_MS`.
+`silence_floors.csv` is per condition, including the two quiet-frame statistics
+the threshold is derived from. `silence_threshold_sweep.csv` is the probe's own
+feature at five fixed thresholds plus the derived one, per condition.
+
+**They disagreed with each other, which is how the defect surfaced.** Both report
+the same named quantity for `real`:
+
+| | frame-RMS cut | peak floor |
+|---|---|---|
+| `silence_floors.csv` (per file, then median) | −54.273 dBFS | **−46.854 dBFS** |
+| `silence_calibration.csv` (as the gate computed it) | −54.273 dBFS | **−39.808 dBFS** |
+
+The cut agreed because both paths took a median of per-file values. The peak did
+not, because the gate concatenated every file's quiet samples and took one
+percentile of the **pool**. Recorded in
+`TestSilenceCalibrationArtifacts`; the mechanism and the fix are under
+*The replacement* below.
+
+---
+
 ## Reported numbers against the committed artifacts
 
 Several numbers were reported with the earlier 60-file run before `probes.json`
@@ -698,11 +733,74 @@ and nothing else:
 | **−37 dBFS** | ~50 ms | 1.25× — upper edge |
 | −30 dBFS | 88.9 ms | 2.2× — into speech onsets |
 
-The derived threshold is **predicted** to land near −39 dBFS, inside that band:
-the quiet-decile statistics were not in the v0 output, so this is an inference from
-the pad level (−47.265 dBFS) rather than a measurement. `btpvf silence-diag` now
-prints `quiet_frame_rms_dbfs` and `quiet_peak_dbfs`, so the next run reports the
-inputs and the derivation is reproducible from its output.
+**The first implementation got the aggregation wrong, and the pad check caught
+it.** The rule above says "of |sample| inside the quietest 10% of real's RMS
+frames" — but *whose* frames. The gate concatenated all 200 files' quiet samples
+and took one p99.9 of the pool; the diagnostic took each file's p99.9 and the
+median across files. Those are different quantities, and on the real run they
+differed by **7.05 dB**: −39.808 dBFS pooled against −46.854 dBFS per-file.
+
+The pooled version is the level exceeded by 0.1% of all quiet samples *anywhere
+in the corpus*, so its upper tail is supplied by whichever files have the loudest
+quiet moments — and it climbs as files are added. Measured on nested synthetic
+corpora with a 5 dB spread of per-file floors, through the real code path:
+
+| n (nested subsets) | median of per-file p99.9 | pooled p99.9 |
+|---|---|---|
+| 8 | −50.10 dBFS | −48.07 dBFS |
+| 40 | −50.77 | −44.72 |
+| 120 | −51.03 | −45.47 |
+| 240 | −51.88 | **−43.01** |
+
+The median drifts 1.8 dB downward across a 30× change in n — ordinary sampling
+noise on a converging estimator. The pooled figure climbs **5.1 dB**. On
+identical files the two agree to 0.1 dB, which is exactly why the suite did not
+catch it: the fixtures were homogeneous and n = 12, and the defect only appears
+with a heterogeneous corpus at scale. **A statistic whose meaning depends on how
+much was measured** is the `ASVSPOOF_CROP_SAMPLES` failure again, in a new place.
+
+The consequence on the run: threshold −31.808 dBFS, about 7 dB into speech, where
+real read **79.2 ms** against the 40 ms INV-03 leaves — 98% off, so the probe
+raised. Worth stating plainly: at that threshold every condition read ~0.5 EER,
+so **the gate would have passed** on a threshold that was not measuring silence.
+The pad-agreement check is what refused it, and this is the case it was added for.
+
+**Fixed: per file first, then median across files.** `quiet_stats` computes one
+file's two numbers and is now the single implementation — `silence_floor_dbfs`
+takes the median of it across files, and `silence_diagnostic` reports it per
+condition, so the two paths cannot disagree again.
+
+Median rather than a lower percentile: the threshold is one number applied to
+every file, so the floor it clears should be the one a *typical* file's quiet
+frames reach. A low percentile would target the quietest files and push the
+threshold under the noisier ones, whose pads would then read as voiced. The
+median has a 50% breakdown point, so a minority of noisy files cannot move it,
+and it does not move with n. The spread *above* the median is what the margin
+covers, and a spread too wide for the margin is what the pad check catches.
+
+**The margin is unchanged, and the +7.4 dB figure does not argue against it.**
+The per-file floor sits 7.42 dB above `quiet_frame_rms_cut_dbfs`, against the
++10.35 dB a Gaussian floor gives — but those are not the same ratio. The cut is
+the *10th percentile of frame RMS*, an upper bound on the masked samples' own
+RMS, not that RMS. The masked samples sit below it, so +7.4 dB against the cut is
+consistent with ~+10 dB against their own level. Nothing in the margin's
+derivation changes.
+
+**What the corrected threshold is predicted to read.** Computed from the
+committed files, because the run's audio is not in this repository:
+
+| | |
+|---|---|
+| corrected floor (`silence_floors.csv`, real) | −46.854 dBFS |
+| + `SILENCE_FLOOR_MARGIN_DB` | **−38.854 dBFS** |
+| inside the −43…−37 band the sweep admits | yes |
+| real's pad, interpolated from its own sweep column | 44.7 ms (log-linear) to 46.1 ms (linear) |
+| against `2 × TRIM_PAD_MS` = 40 ms | 11.8% to 15.4% off, inside the 25% tolerance |
+
+A prediction, not a measurement: it is an interpolation between the −40 and −30
+dBFS sweep rows. The next run reports the real figure, and if it lands outside
+the tolerance the run stops and says by how much.
+
 
 **The pad-agreement check is what makes it safe, and it raises.** At the derived
 threshold real must read `2 × TRIM_PAD_MS` within 25%, or the probe stops. Below

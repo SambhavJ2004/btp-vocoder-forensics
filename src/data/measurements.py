@@ -43,6 +43,14 @@ BAND_MEASUREMENTS = "band_measurements.csv"
 META = "meta.json"
 PROBES = "probes.json"
 
+# `btpvf silence-diag` output from the first 200-file run whose INV-12 gate
+# raised. Committed as the record of two things at once: the refutation of the
+# reconstruction-noise hypothesis, and the pooled-percentile defect in the floor
+# estimator that the pad-agreement check caught (INV-12; docs/measurements.md).
+SILENCE_CALIBRATION = "silence_calibration.csv"
+SILENCE_FLOORS = "silence_floors.csv"
+SILENCE_SWEEP = "silence_threshold_sweep.csv"
+
 
 def artifact_path(name: str) -> Path:
     path = MEASUREMENTS_DIR / name
