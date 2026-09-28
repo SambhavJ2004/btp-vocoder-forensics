@@ -233,9 +233,11 @@ class TestPreflight:
             (["griffin_lim", "griffin_lim"], "duplicate"),
             (["real"], "not generable"),
             (["specdiff_gan"], "not generable"),
-            (["hifigan_v1"], "INV-08.*blocked"),
-            (["melgan"], "INV-08.*blocked"),
-            (["bigvgan_base"], "INV-08.*checkpoint_sha256"),
+            # hifigan_v1, melgan and bigvgan_base were all in this list until
+            # their weights were located and their digests recorded for v1. The
+            # full-band control is what remains: pinned by revision only, and the
+            # BigVGAN adapter requires a digest.
+            (["bigvgan_v2_22khz_fullband"], "INV-08.*checkpoint_sha256"),
             (["bigvgan_112m", "bigvgan_v2_22khz_fullband"], "INV-08"),
         ],
     )
@@ -385,9 +387,15 @@ class TestBigVGANAdapter:
         assert "bigvgan" not in sys.modules
 
     def test_no_revision_or_no_digest_downloads_nothing(self, tmp_path):
-        from vocoders.bigvgan import BASE_SPEC, LARGE_SPEC, fetch_pinned_snapshot
+        """Both pins are required before a single byte is fetched.
 
-        for spec in (replace(LARGE_SPEC, checkpoint_revision=""), BASE_SPEC):
+        The no-digest case is the FULLBAND control: `bigvgan_base` used to serve
+        here and no longer can, because it now carries a recorded sha256 (its
+        digest was measured and pinned for the v1 run).
+        """
+        from vocoders.bigvgan import FULLBAND_SPEC, LARGE_SPEC, fetch_pinned_snapshot
+
+        for spec in (replace(LARGE_SPEC, checkpoint_revision=""), FULLBAND_SPEC):
             calls = []
             with pytest.raises(InvariantViolation, match="INV-08"):
                 fetch_pinned_snapshot(spec, self._downloader(tmp_path / "snap", calls))
@@ -519,32 +527,69 @@ class TestKaggleNotebook:
             if c["cell_type"] == "code":
                 assert c["outputs"] == [] and c["execution_count"] is None
 
-    def test_holds_no_logic(self):
+    def test_the_driver_cells_hold_no_logic(self):
         """A driver: constants and CLI calls. Logic in a notebook is outside the
-        reproducibility record (working rules)."""
+        reproducibility record (working rules).
+
+        Two cells are exempt and named here rather than waved through: the GPU
+        guard and the bootstrap. They run BEFORE the package exists -- the
+        bootstrap is what makes it importable -- so they cannot be calls into it.
+        They are not unreviewed notebook logic either: both are generated from
+        `experiments.kaggle_harness`, which is in the package, is tested (the guard
+        by execution against a stub torch), and is what
+        `test_the_generated_notebook_is_the_committed_one` pins. Every cell after
+        them is held to the original rule.
+        """
         import re
 
         banned = re.compile(r"^\s*(def |class |for |while |if |elif |else:|try:|with |lambda)",
                             re.MULTILINE)
-        for src in self._code():
-            assert not banned.search(src), f"logic in notebook cell:\n{src}"
+        code = self._code()
+        bootstrap = next(i for i, src in enumerate(code) if "pip" in src and "install" in src)
+        for src in code[bootstrap + 1:]:
+            assert not banned.search(src), f"logic in a driver cell:\n{src}"
+        assert bootstrap == 1, "the guard is first, the bootstrap second, drivers after"
 
     def test_runs_the_gated_cli_for_the_v0_subset(self):
         from vocoders.registry import V0_CONDITIONS
 
         code = "\n".join(self._code())
-        assert "btpvf" in code and '"resynth"' in code and '"loudness"' in code
+        assert "btpvf" in code and "resynth" in code and "loudness" in code
         assert "N_UTTERANCES = 200" in code
         for cond in V0_CONDITIONS:
-            assert f'"{cond}"' in code
+            assert cond in code, cond
         assert "make_archive" in code
         assert "check=True" in code, "a failed gate must stop the notebook"
 
+    def test_it_installs_the_code_snapshot_and_never_clones_github(self):
+        """The defect the harness exists to remove: cloning meant a run launched
+        after an edit executed the last PUSHED commit instead."""
+        code = "\n".join(self._code())
+        assert "/kaggle/input" in code and "pip" in code
+        for forbidden in ("git clone", "github.com", "REPO_URL", "REPO_REF"):
+            assert forbidden not in code, forbidden
+
+    def test_the_generated_notebook_is_the_committed_one(self, tmp_path):
+        """The repo holds what runs, or it holds fiction."""
+        from experiments.kaggle_harness import write_v0_notebook
+
+        assert self.PATH.read_bytes() == write_v0_notebook(tmp_path / "nb.ipynb").read_bytes()
+
     def test_states_the_shared_environment_rather_than_assuming_it(self):
+        from vocoders.registry import SHARED_ENV_REPORTED
+
         md = "\n".join("".join(c["source"]) for c in self._nb()["cells"]
                        if c["cell_type"] == "markdown")
-        assert "INV-13" in md and "same environment" in md
-        assert "hifigan_v1" in md and "melgan" in md
+        assert "INV-13" in md and "one environment" in md
+        for cond in SHARED_ENV_REPORTED:
+            assert cond in md, cond
+        # Reported by the team, not measured here. The notebook says which.
+        assert "reported" in md.lower() and "not measured" in md.lower()
+
+    def test_states_the_accelerator_it_was_pushed_with(self):
+        md = "\n".join("".join(c["source"]) for c in self._nb()["cells"]
+                       if c["cell_type"] == "markdown")
+        assert "enable_gpu" in md
 
     def test_carries_no_credentials(self):
         """INV-15. The HF_TOKEN variable name may appear; a token value may not."""
@@ -560,6 +605,8 @@ class TestKaggleNotebook:
         line that touches the token prints anything."""
         lines = [ln for src in self._code() for ln in src.splitlines() if "HF_TOKEN" in ln]
         assert lines, "the notebook should show how to supply HF_TOKEN"
+        joined = "\n".join(self._code()).lower()
+        assert "kaggle_secrets" in joined, "say where the secret comes from"
         for ln in lines:
             assert "print" not in ln and "display" not in ln, ln
             if "get_secret" in ln or "os.environ[" in ln:
@@ -761,11 +808,23 @@ class TestAuditAgreesWithTheCLI:
         from vocoders.registry import checkpoint_audit
 
         rows = {r["condition"]: r for r in checkpoint_audit()}
-        for cond in ("bigvgan_base", "bigvgan_v2_22khz_fullband"):
+        # The full-band control is the remaining revision-only pin. `bigvgan_base`
+        # left this group when its weight digest was measured and recorded.
+        for cond in ("bigvgan_v2_22khz_fullband",):
             assert rows[cond]["missing_pins"] == "checkpoint_sha256", cond
             assert rows[cond]["blocked"] is True, cond
-        for cond in ("bigvgan_112m", "vocos", "griffin_lim"):
+        for cond in ("bigvgan_112m", "bigvgan_base", "vocos", "griffin_lim"):
             assert rows[cond]["missing_pins"] == "" and rows[cond]["blocked"] is False, cond
+
+    def test_bigvgan_base_is_pinned_by_revision_and_digest(self):
+        """INV-08: the pin that let it run at all. Recorded as a literal because no
+        measurement artifact has used this checkpoint yet."""
+        from vocoders.bigvgan import BASE_SPEC
+
+        assert len(BASE_SPEC.checkpoint_revision) == 40
+        assert BASE_SPEC.checkpoint_sha256 == (
+            "e2a93f92971e1b6750d8f9b701121597cd271e473e6c189c8072be7080047735"
+        )
 
 
 # ============================================================ HF_TOKEN

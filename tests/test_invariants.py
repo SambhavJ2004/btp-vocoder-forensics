@@ -856,23 +856,30 @@ class TestLadder:
         assert rows["griffin_lim"]["pin"] == "n/a"
         assert rows["griffin_lim"]["blocked"] is False
 
-        # HuggingFace-hosted: pinned by revision SHA.
-        for key in ("vocos", "bigvgan_base", "bigvgan_v2_22khz_fullband"):
-            assert rows[key]["pin"] == "hf-revision", key
+        # HuggingFace-hosted: pinned by revision SHA, and reported as such.
+        assert rows["vocos"]["pin"] == "hf-revision"
         assert rows["vocos"]["blocked"] is False
-        # ...but the BigVGAN adapter also requires a weight digest, which these two
-        # lack. The audit reports that, so it agrees with what Phase A accepts.
-        for key in ("bigvgan_base", "bigvgan_v2_22khz_fullband"):
-            assert rows[key]["missing_pins"] == "checkpoint_sha256", key
-            assert rows[key]["blocked"] is True, key
-        # bigvgan_112m additionally carries the weight-file digest from meta.json.
-        assert rows["bigvgan_112m"]["pin"] == "hf-revision+sha256"
-        assert rows["bigvgan_112m"]["blocked"] is False
+        assert rows["bigvgan_v2_22khz_fullband"]["pin"] == "hf-revision"
+        # Both mechanisms in force reads as both. `bigvgan_base` moved into this
+        # group when its weight digest was measured and recorded for the v1 run.
+        for key in ("bigvgan_112m", "bigvgan_base", "hifigan_v1"):
+            assert rows[key]["pin"] == "hf-revision+sha256", key
+        # ...but the BigVGAN adapter also requires a weight digest, which the
+        # full-band control lacks. The audit reports that, so it agrees with what
+        # Phase A accepts.
+        assert rows["bigvgan_v2_22khz_fullband"]["missing_pins"] == "checkpoint_sha256"
+        # MelGAN is pinned by digest alone: its weights are committed into the
+        # upstream repo rather than published on HuggingFace, so there is no
+        # revision to pin and `upstream_commit` carries the code.
+        assert rows["melgan"]["pin"] == "sha256"
+        assert rows["melgan"]["blocked"] is False
+        assert rows["bigvgan_v2_22khz_fullband"]["blocked"] is True
 
-        # Not on HuggingFace: no revision exists, so still unpinned.
-        for key in ("hifigan_v1", "melgan"):
-            assert rows[key]["pin"] == "UNPINNED", key
-            assert rows[key]["blocked"] is True, key
+        # The audit's whole point: "pinned" is never a bare boolean hiding two
+        # different guarantees, so every runnable condition names its mechanism.
+        for key in ("vocos", "bigvgan_112m", "bigvgan_base", "hifigan_v1", "melgan"):
+            assert rows[key]["pin"] != "UNPINNED", key
+            assert rows[key]["blocked"] is False, key
 
         # Declared but not generable.
         assert rows["specdiff_gan"]["role"] == "unavailable"
@@ -1709,7 +1716,10 @@ class TestINV08CheckpointDigest:
         from vocoders.registry import get_spec
 
         p = self._file(tmp_path)
-        spec = get_spec("melgan")  # no digest recorded yet
+        # specdiff_gan is the remaining spec with no digest; melgan used to serve
+        # here and no longer can, because its weights were located and pinned.
+        spec = get_spec("specdiff_gan")
+        assert not spec.checkpoint_sha256
         with pytest.raises(InvariantViolation, match="no recorded checkpoint_sha256"):
             fetch_and_verify(p, spec)
 

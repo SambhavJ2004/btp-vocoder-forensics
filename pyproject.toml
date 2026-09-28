@@ -49,6 +49,9 @@ analysis = [
   "matplotlib>=3.7",
   "seaborn>=0.13",
 ]
+kaggle = [                 # the Kaggle harness shells out to this CLI; it is
+  "kaggle>=2.2",           # never imported, so it is not a package dependency
+]
 dev = [
   "pytest>=7.4",
   "ruff>=0.4",
@@ -70,6 +73,12 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# vocoders/compat.py quotes upstream source VERBATIM so the substitutions
+# match byte for byte. Reflowing those lines to our limit would break the
+# match, and the shim fails closed on a non-match by design.
+"src/vocoders/compat.py" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -6,9 +6,13 @@ Usage:
                                       # Phase A, every gate, output only if all pass
     btpvf validate --manifest ...     # manifest-level invariant gate
     btpvf sanity   --manifest ...     # confound-leakage probes, both tiers
+    btpvf kaggle run --mode iteration|record [--sha ...]
+                                      # Phase A on Kaggle from a code snapshot
     btpvf silence-diag --manifest ... # diagnose a silence-probe hit (not a gate)
     btpvf provenance --manifest ...   # INV-01 derivation paths per tier
     btpvf loudness --manifest ...     # INV-04 gain delta and in-band offset vs real
+    btpvf merge --manifest A --manifest B --out-dir ...
+                                      # INV-13: per-condition runs -> one dataset
     btpvf quality  --manifest ...     # Phase B, X-axis
     btpvf plot     --quality ... --detection ...
 """
@@ -16,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -62,6 +67,41 @@ def main(argv: list[str] | None = None) -> int:
     sd.add_argument("--manifest", required=True)
     sd.add_argument("--out-dir", default="results")
     sd.add_argument("--limit", type=int, default=None, help="utterances to read (default all)")
+
+    kg = sub.add_parser("kaggle", help="run Phase A on Kaggle from a code snapshot")
+    kgsub = kg.add_subparsers(dest="kaggle_cmd", required=True)
+    kgrun = kgsub.add_parser("run", help="snapshot the code, push a kernel, fetch the output")
+    kgrun.add_argument("--mode", choices=["iteration", "record"], required=True,
+                       help="iteration = working tree, marked dirty; record = git archive of --sha")
+    kgrun.add_argument("--sha", default=None, help="commit to archive (record mode only)")
+    kgrun.add_argument("--conditions", nargs="+", default=["bigvgan_112m", "vocos", "griffin_lim"])
+    kgrun.add_argument("--n-utterances", type=int, default=200)
+    kgrun.add_argument("--corpus", default="auto",
+                       help="LJSpeech root on Kaggle; 'auto' finds it by shape under /kaggle/input")
+    kgrun.add_argument("--dataset", action="append", dest="datasets",
+                       default=["mathurinache/the-lj-speech-dataset"],
+                       help="extra owner/slug to attach; repeatable")
+    kgrun.add_argument("--slug", default="btpvf-v0", help="kernel slug (kept private)")
+    kgrun.add_argument("--out-name", default=None,
+                       help="output directory name under /kaggle/working "
+                            "(default: resynth_v0). Use a v1 name so a v1 run can "
+                            "never be mistaken for, or overwrite, v0.")
+    kgrun.add_argument("--title", default="btpvf v0 resynthesis")
+    kgrun.add_argument("--gpu", action="store_true",
+                       help="request a GPU; omit for CPU, which costs no weekly quota")
+    kgrun.add_argument("--timeout", type=int, default=32400, help="kernel run limit, seconds")
+    kgcode = kgsub.add_parser("code", help="snapshot and version the code dataset only")
+    kgcode.add_argument("--mode", choices=["iteration", "record"], required=True)
+    kgcode.add_argument("--sha", default=None)
+    kgsub.add_parser("notebook", help="regenerate notebooks/kaggle_v0.ipynb from V0_SPEC")
+
+    mg = sub.add_parser("merge", help="INV-13: combine per-condition runs into one dataset")
+    mg.add_argument("--manifest", action="append", required=True, dest="manifests",
+                    help="a per-condition run's manifest.csv; repeat once per run")
+    mg.add_argument("--out-dir", required=True, help="must not exist yet")
+    mg.add_argument("--allow-differing-real", action="store_true",
+                    help="report instead of refusing when real is not byte-identical "
+                         "across runs. For inspecting a mismatch, never for shipping one.")
 
     q = sub.add_parser("quality", help="Phase B: quality metrics")
     q.add_argument("--manifest", required=True)
@@ -191,6 +231,62 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nwritten to {out_dir}/silence_floors.csv, silence_threshold_sweep.csv "
               "and silence_calibration.csv")
         print("Diagnosis only: INV-12's floor and verdicts are unchanged.")
+        return 0
+
+    if args.cmd == "kaggle":
+        from experiments.kaggle_harness import (
+            KernelSpec,
+            check_auth,
+            push_code_dataset,
+            run_kernel,
+            stage_snapshot,
+        )
+
+        if args.kaggle_cmd == "notebook":
+            from experiments.kaggle_harness import V0_SPEC, write_v0_notebook
+
+            path = write_v0_notebook()
+            print(f"regenerated {path} from V0_SPEC: {V0_SPEC.conditions} "
+                  f"n={V0_SPEC.n_utterances} gpu={V0_SPEC.gpu}")
+            return 0
+
+        auth = check_auth()
+        print(f"[auth] {auth['username']} via {auth['auth_method']}")  # never the token
+        if args.kaggle_cmd == "code":
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp:
+                snapshot = stage_snapshot(Path(tmp), mode=args.mode, sha=args.sha)
+                result = push_code_dataset(Path(tmp), snapshot, username=auth["username"])
+            print(json.dumps({"snapshot": snapshot.as_record(), "dataset": result}, indent=2))
+            return 0
+
+        spec = KernelSpec(
+            slug=args.slug,
+            title=args.title,
+            conditions=tuple(args.conditions),
+            n_utterances=args.n_utterances,
+            corpus=args.corpus,
+            gpu=args.gpu,
+            dataset_sources=tuple(args.datasets),
+            timeout_s=args.timeout,
+            **({"out_dir": f"/kaggle/working/{args.out_name}"} if args.out_name else {}),
+        )
+        record = run_kernel(spec, mode=args.mode, sha=args.sha)
+        print(f"\nrun record: runs/{record['stamp']}/run.json")
+        if not record["snapshot"]["citable"]:
+            print("ITERATION MODE: debugging output. Do not cite it in docs/measurements.md.")
+        return 0
+
+    if args.cmd == "merge":
+        from data.merge import merge_runs, summarise
+
+        record = merge_runs(
+            args.manifests, args.out_dir,
+            require_identical_real=not args.allow_differing_real,
+        )
+        print(summarise(record))
+        print(f"\nmerge record: {args.out_dir}/manifest.merge.json")
         return 0
 
     if args.cmd == "quality":

@@ -29,6 +29,19 @@ secrets/
 .aws/
 .gcloud/
 *.token
+# The new-style Kaggle token is a bare file with no extension, so *.token
+# does not cover it. It lives in ~/.kaggle, outside this tree; these lines
+# exist so a stray copy inside the repo cannot be committed either.
+access_token
+**/access_token
+**/.kaggle/
+
+# ---------------------------------------------------------------------------
+# Kaggle harness output: one directory per run, holding the code snapshot it
+# uploaded, the kernel it pushed, the log and the downloaded output. Large,
+# and reproducible from run.json plus the recorded snapshot hash.
+# ---------------------------------------------------------------------------
+runs/
 
 # ---------------------------------------------------------------------------
 # Data, checkpoints, generated audio — large and reproducible, keep out of git.

@@ -505,8 +505,37 @@ one of them:
   `GLOBAL_SEED` per utterance, so it is the first condition with a mechanism for
   "fix seeds".
 
-`hifigan_v1`, `melgan`, `bigvgan_base` and the full-band control still have no
-working `load()`. Each adapter declares `required_pins`, which Phase A's preflight
+**Three more conditions were pinned and given working adapters for v1**, so the
+only revision-only pin left is the full-band control:
+
+- **`bigvgan_base`.** Revision plus a recorded weight digest. NVIDIA back-ported
+  the v2 code layout into the v1 model repo, so it ships its own `bigvgan.py`,
+  `config.json` and `alias_free_activation/` at the pinned revision and needs no
+  special handling -- checked rather than assumed, and the v1 config's absent
+  `use_bias_at_final` / `use_tanh_at_final` are read through `h.get(..., True)`.
+  Its digest is a literal (no measurement artifact has used this checkpoint) and
+  equals HuggingFace's own LFS oid for the file, which is the sha256 -- so a
+  future pin can be recorded from the tree API without downloading.
+- **`hifigan_v1`.** The one condition whose code and weights come from **two
+  hosts**, which is the weakest provenance in the study and is stated as such:
+  official code from `jik876/hifi-gan` at a pinned commit, weights from
+  `jaketae/hifigan-lj-v1` at a pinned revision with a recorded sha256, because
+  upstream publishes LJ_V1 only through Google Drive, which cannot be fetched
+  non-interactively. The mirror is a byte-addressed host and nothing more: its own
+  modelling code is never imported, and its architecture config and state-dict key
+  names were checked equal to upstream's before it was trusted at all.
+- **`melgan`.** The best provenance of the three: code *and* weights come from
+  one pinned commit of `descriptinc/melgan-neurips`, because
+  `models/linda_johnson.pt` is committed into the repository rather than
+  published as a release. It is pinned by digest alone, since there is no
+  HuggingFace revision to pin, and `upstream_commit` carries the code. It ships
+  no config file, so INV-02 is enforced against `Audio2Mel`'s constructor
+  defaults (`vocoders.melgan.check_audio2mel_defaults`), including refusing a
+  release that started bounding `mel_fmax` -- which would move `LADDER_FMAX`.
+
+Both HiFi-GAN and MelGAN need `vocoders.compat` to run at all; see the open item.
+
+The full-band control still has no working `load()`. Each adapter declares `required_pins`, which Phase A's preflight
 checks before generating anything. So `bigvgan_base` and the full-band control,
 pinned by revision only, are refused before generation rather than failing after
 the real condition has been written. `checkpoint_audit` reports the same thing:
@@ -660,6 +689,21 @@ with `SILENCE_FLOOR_FRAME_PERCENTILE = 10.0`, `SILENCE_FLOOR_PEAK_PERCENTILE =
   applied to every file: it is the level a typical file's quiet frames reach, it
   has a 50% breakdown point, and it does not move with n. A lower percentile
   would target the quietest files and push the threshold under the noisier ones.
+- **The margin is calibrated against a floor whose ESTIMATE moves with the
+  sample; the band it has to land in does not.** Measured on real LJSpeech
+  through the harness: at 200 utterances the floor reads -46.854 dBFS and the
+  threshold -38.854, where real's pad comes to 44.5 ms against the 40 ms INV-03
+  fixes (11.4% off, inside tolerance). At 24 utterances the same code reads a
+  floor of -53.565 and a threshold of -45.565, where real reads 25.8 ms (36% off)
+  and the probe **refuses**. Speech level does not move between those subsets --
+  the threshold that reads exactly the pad is ~-40 dBFS in both -- so what moved
+  6.7 dB is the floor estimate, and `floor + SILENCE_FLOOR_MARGIN_DB` therefore
+  lands inside the band at n=200 and 5.6 dB below it at n=24.
+  `SILENCE_FLOOR_MARGIN_DB` is consequently **only validated at the dataset sizes
+  this study runs**, and a small pilot is expected to be refused rather than
+  measured. Do not widen the margin to get a small run through: that trades a
+  loud refusal for a silence EER measured at a threshold that is not reading
+  silence, which is the defect the whole rule replaced.
 - **The quietest decile, not `reference_silent_mask`.** INV-03's relative
   criterion admits quiet speech: on LJSpeech its median sits at −53.5 dBFS,
   essentially at its own cutoff. Calibrating on the loudest samples of a "quiet"
@@ -1354,6 +1398,22 @@ path.
 and call into it. Logic that lives only in a notebook is not in the
 reproducibility record.
 
+**Two cells are exempt, named rather than waved through: the GPU guard and the
+snapshot bootstrap.** They run *before* the package exists -- the bootstrap is
+what makes it importable -- so they cannot be calls into it, and they contain
+branching. They are still not unreviewed notebook logic: both are GENERATED from
+`experiments.kaggle_harness`, which is in the package, is tested (the guard by
+execution against a stub torch at capability 6.0 and 7.5), and is what
+`TestKaggleNotebook.test_the_generated_notebook_is_the_committed_one` pins. The
+original rule applies unchanged to every cell after them, and
+`test_the_driver_cells_hold_no_logic` enforces exactly that boundary.
+
+The notebook itself is generated: `btpvf kaggle notebook` writes
+`notebooks/kaggle_v0.ipynb` from `V0_SPEC`, and a test asserts regeneration is a
+no-op. Edit the harness, never the notebook -- otherwise the repository stops
+holding what runs, which is the failure the GitHub clone caused in a different
+place. See [`docs/kaggle_harness.md`](docs/kaggle_harness.md).
+
 **Membership is per analysis, and exclusions cite rows.** Filter with
 `data.manifest.analysis_frame(df, analysis)` before pooling anything. Do not add
 a condition to `ANALYSIS_EXCLUSIONS` without a `MeasurementRef` that resolves
@@ -1556,6 +1616,95 @@ nudge a pipeline toward a preferred answer.
   the specification, not its justification, and the calibration uses real alone
   plus `TRIM_PAD_MS`, both fixed before any condition existed.
   Numbers: [`docs/measurements.md`](docs/measurements.md).
+- **OPEN, YOUR DECISION — the v1 attempt: three conditions pinned, none joined.**
+  All three were made runnable (pins recorded, adapters written, mel configs
+  verified against the checkpoints' own configs) and all three then failed a gate
+  on 200 real LJSpeech utterances. No gate was relaxed and nothing was marked
+  `expected_by_design`, so v1 gained no condition. Each is a separate judgement:
+
+  - **`bigvgan_base` — bandwidth probe, EER 0.395 against the 0.40 floor.**
+    Everything else passed. Diagnosed rather than retried, as INV-12 prescribes
+    for this probe: the 99.5% spectral rolloff sits **79.5 Hz lower** than real
+    (9441.9 vs 9521.3 Hz), lower on 76% of utterances, while `high_band_fraction`
+    is slightly *higher* than real's (0.0338 vs 0.0324). So it is not an energy
+    deficit but a redistribution inside the high band, entirely **above**
+    `LADDER_FMAX` — the primary band-limited analysis is untouched. `bigvgan_112m`
+    did not fire this probe on the same corpus, which makes base-vs-112m differing
+    here exactly what that pair exists to isolate: capacity against high-band
+    fidelity. Whether that is a confound that blocks the condition or a finding to
+    report is the same shape of question as griffin_lim's silence probe, and is
+    yours.
+  - **`hifigan_v1` — alignment (INV-16), modal lag −141 samples (−6.395 ms),
+    shared by only 2 of 20 files.** The load itself worked: digest verified,
+    import guard passed, `config_v1.json` agreed with the audit, weight norm
+    removed, audio generated. A genuine fixed delay shows the same integer on
+    nearly every file, so 2/20 is not a delay — it is a correlation that found
+    nothing. Hypothesis for next time, untested: the mirrored weights
+    (`jaketae/hifigan-lj-v1`) may expect **fairseq's** mel front-end rather than
+    jik876's, which its own README hints at ("based on the official
+    implementation and the fairseq adaptation"). Chasing that means trying front
+    ends until alignment passes, which is fitting the pipeline to the answer, so
+    it stopped here.
+  - **`melgan` — alignment (INV-16), modal lag −1 sample (−0.045 ms), shared by 4
+    of 20 files.** Almost aligned, and the pad arithmetic says it should be exact:
+    `Audio2Mel` reflect-pads `(n_fft - hop)//2 = 384` with `center=False`, and the
+    generator upsamples 256 per frame, so output length equals input length. A
+    modal lag of −1 with 4/20 agreement looks like an under-determined estimate
+    rather than a convention error — MelGAN is the lowest-fidelity condition, so
+    its envelope tracks real least tightly and the correlation peak is broadest.
+    That is a question about the probe's determinacy at `ALIGNMENT_PROBE_FILES =
+    20` for low-fidelity conditions, not a licence to shift audio (INV-16 forbids
+    compensating, and the floor is not mine to move). Yours to decide.
+
+  **What deciding the two alignment items will need, and why it is not here.**
+  INV-16 gates a condition "before a single file of it is written", so both runs
+  returned 200/200 `real` files at both tiers and **zero** condition files, and
+  `write_alignment_report` never ran because it happens alongside the manifest.
+  The modal lag and the agreement fraction in the messages above are therefore the
+  whole of the evidence: the per-file lag distribution, which is what separates a
+  real fixed delay from an under-determined estimate, does not exist in the output.
+  Getting it means either a run that persists the alignment report on failure
+  (Phase A control flow, so a deliberate change) or measuring the lags locally
+  against a condition's audio, which requires that audio to have been written.
+
+  All three ran in **iteration mode**, so none of the numbers above is citable
+  (`docs/kaggle_harness.md`). Re-run in record mode before any of it is quoted.
+
+- **RESOLVED — INV-13's other half exists: `btpvf merge`.** `data.merge.merge_runs`
+  combines per-condition runs into one dataset, which is what "one isolated
+  session per condition, manifests merged afterwards" always required and what
+  had been missing. It refuses two versions of one condition, runs over different
+  utterance sets, and an existing output directory; it takes `real` from one run
+  only; and the merged table goes through `validate_manifest` unchanged.
+
+  **The merge is also a measurement.** Every run regenerates `real` from the same
+  corpus and seed, so the merge checks that every run's `real` is byte-identical
+  and refuses when it is not — which is precisely the drift INV-13 fears (pip
+  resolving a different librosa for one condition and changing STFT edge
+  behaviour). Measured on the two v1 runs, one **GPU** session and one **CPU**
+  session, over the full set each produced: **400 of 400 `real` files
+  byte-identical, 0 differing** (200 archive + 200 zeroshot). Different
+  accelerators, different installed extras, same bytes out. One shared
+  environment could never have produced that evidence.
+
+- **OPEN — two conditions now run UPSTREAM CODE THAT HAS BEEN REWRITTEN (INV-02).**
+  HiFi-GAN's (2020) and MelGAN's (2019) released code does not run on current
+  libraries: `librosa.filters.mel` became keyword-only and `torch.stft` returns a
+  complex tensor. `vocoders.compat` rewrites exactly two call sites per file,
+  records the upstream and post-shim sha256 of each, and **raises** if upstream's
+  text is not what it expects rather than patching fuzzily. Each rule's
+  replacement is semantically identical on the versions involved (same
+  filterbank, same magnitude), and the rules are tested against upstream's real
+  text.
+
+  It is still a difference: the delivered condition runs upstream's *algorithm*
+  through rewritten call sites, not upstream's bytes. Pinning 2019 libraries is
+  not feasible inside a shared Kaggle image and would change every other
+  condition's environment; reimplementing the front-end would make the condition
+  "our version of HiFi-GAN", which INV-02 exists to prevent. A shim, recorded, is
+  the least bad of the four options, and it is recorded here so the thesis's
+  limitations section can say so rather than discover it.
+
 - **Regenerate every condition.** The archive changed meaning twice: files
   produced under the old INV-17 are band-limited at 8 kHz, and files produced
   before INV-04's move to the analysis band carry a full-band-referenced gain.

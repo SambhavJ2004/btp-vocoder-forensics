@@ -28,11 +28,8 @@ the way to the archive (INV-01).
 
 from __future__ import annotations
 
-import importlib
 import json
-import os
 import re
-import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -48,6 +45,8 @@ from data.mel import (
 )
 
 from .base import Vocoder, VocoderSpec, resolve_torch_device
+from .upstream import check_hparams as _check_hparams
+from .upstream import import_pinned
 
 # --- bigvgan_112m: pin and mel config sourced from the measurement run --------
 # data/measurements/meta.json was written by the Kaggle run that produced the
@@ -129,6 +128,17 @@ BASE_SPEC = VocoderSpec(
     mel=BIGVGAN_BASE_22K_MEL,
     checkpoint="nvidia/bigvgan_base_22khz_80band",
     checkpoint_revision="760f0c694aba68b8c200dd52ffd3b4ecafa7028c",
+    # A literal, unlike bigvgan_112m's, which comes from meta.json because that
+    # checkpoint produced the committed band measurements. No measurement run has
+    # used this one, so there is no artifact to read it from; recording it here is
+    # what turns the revision-only pin into one `verify_checkpoint` can enforce.
+    #
+    # Computed from `bigvgan_generator.pt` at the pinned revision, and
+    # cross-checked against HuggingFace's own LFS oid for that file, which is the
+    # same digest -- so a future pin can be recorded from the tree API
+    # (`?expand=true`, `lfs.oid`) without downloading 56 MB. Verified equal here
+    # rather than assumed, because a wrong digest fails the run, not the pin.
+    checkpoint_sha256="e2a93f92971e1b6750d8f9b701121597cd271e473e6c189c8072be7080047735",
     notes="Same architecture family as the large model; isolates capacity from design.",
 )
 
@@ -195,35 +205,6 @@ UPSTREAM_MODULES: tuple[str, ...] = (
     "bigvgan", "activations", "env", "meldataset", "utils", "alias_free_activation",
 )
 
-# config.json key -> MelConfig field
-_HPARAM_FIELDS: tuple[tuple[str, str], ...] = (
-    ("sampling_rate", "sample_rate"),
-    ("n_fft", "n_fft"),
-    ("hop_size", "hop_length"),
-    ("win_size", "win_length"),
-    ("num_mels", "n_mels"),
-    ("fmin", "fmin"),
-    ("fmax", "fmax"),
-)
-
-
-def check_hparams(h: dict, mel: MelConfig, *, condition: str) -> None:
-    """INV-02. The config.json at the pinned revision must match the audit."""
-    for key, field in _HPARAM_FIELDS:
-        if key not in h:
-            raise InvariantViolation(f"INV-02: {condition} config.json has no {key!r}.")
-        value = h[key]
-        if key == "fmax" and value is None:
-            value = h["sampling_rate"] / 2.0  # librosa resolves None to sr/2
-        expected = getattr(mel, field)
-        if expected is None or float(value) != float(expected):
-            raise InvariantViolation(
-                f"INV-02: {condition} config.json {key}={h[key]!r}, audited {field}="
-                f"{expected!r}. The pinned revision is not the checkpoint the audit and "
-                "the committed measurements describe."
-            )
-
-
 def fetch_pinned_snapshot(
     spec: VocoderSpec, download: Callable[..., str] | None = None
 ) -> Path:
@@ -268,70 +249,21 @@ def fetch_pinned_snapshot(
     return root
 
 
-def _module_origin(module) -> list[Path]:
-    """Where Python actually loaded ``module`` from, with every symlink followed."""
-    file = getattr(module, "__file__", None)
-    if file:
-        return [Path(file).resolve()]
-    return [Path(p).resolve() for p in getattr(module, "__path__", [])]
+UPSTREAM_GUARD_MODULES = UPSTREAM_MODULES
+UPSTREAM_WANTED = ("bigvgan", "meldataset", "env")
 
 
-def _expected_origin(root: Path, name: str, module) -> Path:
-    """Where ``name`` lives in the snapshot, with every symlink followed.
-
-    A module with a file is ``<name>.py`` or ``<name>/__init__.py``; a namespace
-    package (``alias_free_activation`` has no ``__init__``) is its directory.
-    """
-    if getattr(module, "__file__", None):
-        for entry in (root / f"{name}.py", root / name / "__init__.py"):
-            if os.path.lexists(entry):
-                return entry.resolve()
-        return (root / f"{name}.py").resolve()  # absent: matches no real file
-    return (root / name).resolve()
-
-
-def _from_snapshot(module, root: Path, name: str) -> bool:
-    """True only if every origin of ``module`` IS the snapshot's own entry.
-
-    Both sides are resolved. The HuggingFace cache stores content in ``blobs/``
-    and makes ``snapshots/<revision>/`` a tree of symlinks into it, so Python
-    legitimately reports a loaded module's file under ``blobs/``. The first
-    version of this check resolved the module's path but compared it against the
-    snapshot DIRECTORY, whose files are symlinks -- so every correctly loaded
-    module failed it (the first real Kaggle run). Comparing the resolved module
-    file with the resolved snapshot ENTRY for that name is at least as strict:
-    it is an equality on what Python loaded, not a prefix test on a directory.
-    """
-    expected = _expected_origin(root, name, module)
-    origins = _module_origin(module)
-    return bool(origins) and all(origin == expected for origin in origins)
+def check_hparams(h: dict, mel: MelConfig, *, condition: str) -> None:
+    """INV-02. The config.json at the pinned revision must match the audit."""
+    _check_hparams(h, mel, condition=condition)
 
 
 def import_upstream(root: Path) -> dict:
     """Import upstream's modules from ``root`` and prove they came from there."""
-    root = Path(root)
-
-    for name in UPSTREAM_MODULES:
-        existing = sys.modules.get(name)
-        if existing is not None and not _from_snapshot(existing, root, name):
-            raise InvariantViolation(
-                f"INV-13: a module named {name!r} is already imported from "
-                f"{[str(o) for o in _module_origin(existing)]}, which is not the pinned "
-                f"snapshot's {name!r} ({_expected_origin(root, name, existing)}). "
-                "BigVGAN's code imports itself by that top-level name and would silently "
-                "get the wrong module. Run the condition in a fresh process."
-            )
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
-    modules = {n: importlib.import_module(n) for n in ("bigvgan", "meldataset", "env")}
-    for name, module in modules.items():
-        if not _from_snapshot(module, root, name):
-            raise InvariantViolation(
-                f"INV-13: imported {name!r} from "
-                f"{[str(o) for o in _module_origin(module)]}, not from the pinned "
-                f"snapshot's {name!r} ({_expected_origin(root, name, module)})."
-            )
-    return modules
+    return import_pinned(
+        Path(root), guard=UPSTREAM_GUARD_MODULES, wanted=UPSTREAM_WANTED,
+        why="BigVGAN's code",
+    )
 
 
 class BigVGAN(Vocoder):
