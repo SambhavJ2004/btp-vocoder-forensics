@@ -24,6 +24,7 @@ Base install stays light; vocoders are never co-installed (CLAUDE.md, INV-13).
 pip install -e .              # core: manifest, audio pipeline, analysis
 pip install -e '.[quality]'   # Person B
 pip install -e '.[detect]'    # Person C
+pip install -e '.[pilot]'     # CPU logistic detection and known-vocoder attribution
 pip install -e '.[dev]'       # tests + ruff
 ```
 
@@ -36,7 +37,15 @@ btpvf validate --manifest manifests/dataset.csv
 btpvf sanity   --manifest manifests/dataset.csv   # MUST pass before B or C run
 btpvf quality  --manifest manifests/dataset.csv
 btpvf plot     --quality results/quality_by_condition.csv --detection results/detection.csv
+btpvf pilot train --manifest ... --out-dir ...  # fresh directory, non-citable development
+btpvf pilot evaluate --bundle ... --manifest ... --out-dir ...
+btpvf pilot predict --bundle ... --wav ...
 ```
+
+The working CPU forensic pilot uses shared archive-tier 8 kHz log-spectral
+features, frozen train/dev/eval groups and two logistic classifiers. Legacy v0
+pilot results are always non-citable. See [the pilot guide](docs/forensic_pilot.md)
+for supported audio, provenance, exact commands and planned Kaggle integration.
 
 ## Order of work
 

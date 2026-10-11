@@ -15,6 +15,7 @@ Usage:
                                       # INV-13: per-condition runs -> one dataset
     btpvf quality  --manifest ...     # Phase B, X-axis
     btpvf plot     --quality ... --detection ...
+    btpvf pilot train|evaluate|predict # non-citable CPU forensic development pilot
 """
 
 from __future__ import annotations
@@ -114,7 +115,41 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--out", default="results/main_plot.png")
     m.add_argument("--quality-col", default="utmos_mean")
 
+    pilot = sub.add_parser("pilot", help="non-citable multi-vocoder CPU forensic pilot")
+    pilots = pilot.add_subparsers(dest="pilot_cmd", required=True)
+    pt = pilots.add_parser("train", help="train on train, select on dev, evaluate eval")
+    pt.add_argument("--manifest", required=True)
+    pt.add_argument("--out-dir", required=True, help="must not exist yet")
+    pt.add_argument("--dataset-id", default="btpvf-v0")
+    from data.invariants import GLOBAL_SEED
+
+    pt.add_argument("--seed", type=int, default=GLOBAL_SEED)
+    pe = pilots.add_parser("evaluate", help="reproduce frozen eval using a trusted local bundle")
+    pe.add_argument("--bundle", required=True)
+    pe.add_argument("--manifest", required=True)
+    pe.add_argument("--out-dir", required=True, help="must not exist yet")
+    pp = pilots.add_parser("predict", help="score one mono PCM_16 archive-rate WAV")
+    pp.add_argument("--bundle", required=True, help="trusted local bundle directory")
+    pp.add_argument("--wav", required=True)
+    pp.add_argument("--work-dir", default=None, help="parent for temporary analysis WAV")
+
     args = p.parse_args(argv)
+
+    if args.cmd == "pilot":
+        if args.pilot_cmd == "predict":
+            from detectors.forensic_pilot import predict_file
+
+            result = predict_file(args.bundle, args.wav, work_dir=args.work_dir)
+        else:
+            from experiments.forensic_pilot import evaluate_pilot, train_pilot
+
+            if args.pilot_cmd == "train":
+                result = train_pilot(args.manifest, args.out_dir,
+                                     dataset_id=args.dataset_id, seed=args.seed)
+            else:
+                result = evaluate_pilot(args.bundle, args.manifest, args.out_dir)
+        print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+        return 0
 
     if args.cmd == "audit":
         import pandas as pd
