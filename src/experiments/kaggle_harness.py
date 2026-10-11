@@ -816,19 +816,29 @@ def download_output(ref: str, dest: Path, *, max_pages: int = 200) -> int:
     PARTIAL: the first bigvgan_base run returned 200 condition files, 8 of real's
     200, and no ``manifest.csv`` at all -- a truncation that looks exactly like a
     complete download unless you count. Counting is what this function replaces.
+
+    A failed page or a repeated continuation token raises rather than reporting
+    a complete download. Files already fetched remain available for diagnosis.
     """
     dest.mkdir(parents=True, exist_ok=True)
     token: str | None = None
+    seen_tokens: set[str] = set()
     for page in range(1, max_pages + 1):
         args = ["kernels", "output", ref, "-p", str(dest), "-q",
                 "--page-size", str(OUTPUT_PAGE_SIZE)]
         if token:
             args += ["--page-token", token]
-        proc = _kaggle(*args, check=False)
+        proc = _kaggle(*args)
         found = _PAGE_TOKEN_RE.search(proc.stdout + proc.stderr)
-        if not found or found.group(1) == token:
+        if not found:
             return page
         token = found.group(1)
+        if token in seen_tokens:
+            raise KaggleHarnessError(
+                f"{ref}: repeated output page token after {page} pages; "
+                "download completeness is unknown"
+            )
+        seen_tokens.add(token)
     raise KaggleHarnessError(
         f"{ref}: still paginating after {max_pages} pages of output; refusing to loop"
     )

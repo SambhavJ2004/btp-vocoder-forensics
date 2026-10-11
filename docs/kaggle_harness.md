@@ -208,6 +208,13 @@ is a finding for INV-12's open item, not something to tune here.
 
 ## A run directory
 
+Output retrieval follows continuation tokens until the CLI returns a successful
+page without one. A nonzero CLI exit, a repeated token (including a cycle), or
+the page limit raises `KaggleHarnessError`; none is evidence of a complete
+download. Already downloaded files are retained for diagnosis. Mocked CLI tests
+cover these cases; this does not verify a current remote run or provide resume
+and retry support.
+
 ```
 runs/<UTC timestamp>/
   code/        the upload: btpvf_code.zip, btpvf_snapshot.json, dataset-metadata.json

@@ -9,6 +9,7 @@ torch -- a guard that is never run is a guard nobody has checked.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import types
 import zipfile
@@ -28,6 +29,7 @@ from experiments.kaggle_harness import (
     _snapshot_paths,
     assert_citable,
     bootstrap_source,
+    download_output,
     find_code_snapshot,
     find_ljspeech_root,
     gpu_guard_source,
@@ -347,6 +349,70 @@ class TestCliOutputFormats:
         assert "starting" in cleaned
         assert "manifest OK: all table-level invariants hold" in cleaned
         assert "0%" not in cleaned and "12/24" not in cleaned
+
+
+class TestOutputDownload:
+    """A partial download must never be reported as complete. No network calls."""
+
+    def _cli_pages(self, monkeypatch, pages):
+        calls = []
+        replies = iter(pages)
+
+        def run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, *next(replies))
+
+        monkeypatch.setattr("experiments.kaggle_harness.subprocess.run", run)
+        return calls
+
+    def test_all_pages_are_followed_including_tokens_on_stderr(self, monkeypatch, tmp_path):
+        calls = self._cli_pages(monkeypatch, [
+            (0, "Next Page Token = page-a\n", ""),
+            (0, "", "Next Page Token = page-b\n"),
+            (0, "Downloaded final page\n", ""),
+        ])
+        assert download_output("someone/run", tmp_path / "output") == 3
+        assert "--page-token" not in calls[0]
+        assert calls[1][-2:] == ["--page-token", "page-a"]
+        assert calls[2][-2:] == ["--page-token", "page-b"]
+        assert all(call[call.index("--page-size") + 1] == "500" for call in calls)
+
+    @pytest.mark.parametrize("failed_page", [1, 2])
+    def test_a_cli_failure_is_not_a_successful_last_page(
+        self, monkeypatch, tmp_path, failed_page
+    ):
+        pages = [(0, "Next Page Token = next\n", "")] * (failed_page - 1)
+        pages.append((1, "", "Download failed"))
+        calls = self._cli_pages(monkeypatch, pages)
+        with pytest.raises(KaggleHarnessError, match=r"failed \(1\)"):
+            download_output("someone/run", tmp_path)
+        assert len(calls) == failed_page
+
+    @pytest.mark.parametrize("tokens", [["a", "a"], ["a", "b", "a"]])
+    def test_repeated_tokens_and_cycles_refuse_completeness(
+        self, monkeypatch, tmp_path, tokens
+    ):
+        calls = self._cli_pages(monkeypatch, [
+            (0, f"Next Page Token = {token}\n", "") for token in tokens
+        ])
+        with pytest.raises(KaggleHarnessError, match="repeated output page token"):
+            download_output("someone/run", tmp_path)
+        assert len(calls) == len(tokens)
+
+    def test_the_page_limit_is_a_failure(self, monkeypatch, tmp_path):
+        calls = self._cli_pages(monkeypatch, [
+            (0, "Next Page Token = a\n", ""),
+            (0, "Next Page Token = b\n", ""),
+        ])
+        with pytest.raises(KaggleHarnessError, match="still paginating after 2 pages"):
+            download_output("someone/run", tmp_path, max_pages=2)
+        assert len(calls) == 2
+
+    def test_an_empty_successful_page_terminates(self, monkeypatch, tmp_path):
+        calls = self._cli_pages(monkeypatch, [(0, "", "")])
+        assert download_output("someone/run", tmp_path / "output") == 1
+        assert len(calls) == 1
+        assert (tmp_path / "output").is_dir()
 
 
 class TestCorpusDiscovery:
