@@ -422,6 +422,29 @@ def bandwidth_probe(
     return _verdict("bandwidth_rolloff", condition, eer, tier)
 
 
+def probe_orientation_diagnostic(
+    real_features: np.ndarray, condition_features: np.ndarray,
+) -> dict[str, float]:
+    """Report scalar separability in both directions without issuing a verdict.
+
+    A physical feature (seconds, RMS, rolloff) has no intrinsic bona-fide score
+    direction. Compute both directional EERs with the shared tie-aware metric;
+    their minimum is a monotonic separability diagnostic, not detector EER.
+    Neither ``run_all`` nor ``_verdict`` uses this helper. Applying it to the
+    publication gate requires a separate review; the existing floor/rule stays.
+    """
+    forward, _ = compute_eer(real_features, condition_features)
+    reverse, _ = compute_eer(
+        -np.asarray(real_features, dtype=np.float64),
+        -np.asarray(condition_features, dtype=np.float64),
+    )
+    return {
+        "eer_forward": forward,
+        "eer_reverse": reverse,
+        "eer_separability": min(forward, reverse),
+    }
+
+
 def _verdict(probe: str, condition: str, eer: float, tier: str) -> dict[str, object]:
     """One probe result.
 

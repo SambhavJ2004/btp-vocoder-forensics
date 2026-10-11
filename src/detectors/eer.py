@@ -14,28 +14,72 @@ from __future__ import annotations
 import numpy as np
 
 
-def compute_eer(bonafide_scores: np.ndarray, spoof_scores: np.ndarray) -> tuple[float, float]:
-    """Return (eer, threshold). EER is a fraction in [0, 1], not a percentage."""
-    bona = np.asarray(bonafide_scores, dtype=np.float64).ravel()
-    spoof = np.asarray(spoof_scores, dtype=np.float64).ravel()
-    if bona.size == 0 or spoof.size == 0:
+def _score_vector(scores: np.ndarray, name: str) -> np.ndarray:
+    """Validate one class without silently flattening a batch/class dimension."""
+    try:
+        values = np.asarray(scores)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a one-dimensional numeric score vector.") from exc
+    if values.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional; got shape {values.shape}.")
+    if values.size == 0:
         raise ValueError("EER needs both bona fide and spoof scores.")
+    if np.iscomplexobj(values):
+        raise ValueError(f"{name} must contain real scores, not complex values.")
+    try:
+        values = values.astype(np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must contain numeric scores.") from exc
+    if not np.isfinite(values).all():
+        raise ValueError(f"{name} must contain only finite scores.")
+    return values
+
+
+def compute_eer(bonafide_scores: np.ndarray, spoof_scores: np.ndarray) -> tuple[float, float]:
+    """Return directional (eer, threshold), with higher scores meaning real.
+
+    Inputs must be nonempty, finite, real one-dimensional vectors; the two
+    classes may have different sizes. EER is a fraction in [0, 1].
+
+    A deterministic decision accepts ``score > threshold``. Equal scores move
+    together, producing only attainable ROC points. EER is the FRR == FAR
+    crossing of the piecewise-linear curve between those points. Interpolation
+    represents randomized threshold decisions, not a deterministic split of a
+    tied group, and need not be attainable at any single threshold.
+
+    The returned threshold is the score boundary at the upper end of the
+    crossing segment (or the exact crossing point). It identifies the transition;
+    applying it alone need not reproduce an interpolated EER. No score-direction
+    optimization is performed: perfectly reversed scores have EER 1, not 0.
+    """
+    bona = _score_vector(bonafide_scores, "bonafide_scores")
+    spoof = _score_vector(spoof_scores, "spoof_scores")
 
     scores = np.concatenate([bona, spoof])
-    labels = np.concatenate([np.ones_like(bona), np.zeros_like(spoof)])
+    labels = np.concatenate([np.ones(bona.size, dtype=int), np.zeros(spoof.size, dtype=int)])
     order = np.argsort(scores, kind="mergesort")
     scores, labels = scores[order], labels[order]
 
-    # Sweeping the threshold upward through the sorted scores.
-    tar_total, non_total = bona.size, spoof.size
-    frr = np.cumsum(labels) / tar_total              # bona fide rejected
-    far = 1.0 - (np.cumsum(1 - labels) / non_total)  # spoof accepted
+    # Reject whole groups as the threshold rises. Comparing adjacent scores,
+    # rather than subtracting them, also avoids overflow at float64 extremes.
+    group_ends = np.flatnonzero(np.r_[scores[:-1] != scores[1:], True])
+    frr = np.cumsum(labels)[group_ends] / bona.size
+    # Count remaining spoofs directly: 1 - rejected/total can round an exact
+    # FRR == FAR point (e.g. 1/3) into an apparent interpolation segment.
+    far = (spoof.size - np.cumsum(1 - labels)[group_ends]) / spoof.size
     frr = np.concatenate([[0.0], frr])
     far = np.concatenate([[1.0], far])
-    thresholds = np.concatenate([[scores[0] - 1e-6], scores])
+    thresholds = np.concatenate([[-np.inf], scores[group_ends]])
 
-    idx = int(np.nanargmin(np.abs(frr - far)))
-    return float((frr[idx] + far[idx]) / 2.0), float(thresholds[idx])
+    # FRR - FAR increases strictly from -1 to +1, so the crossing is unique.
+    difference = frr - far
+    right = int(np.searchsorted(difference, 0.0))
+    if difference[right] == 0.0:
+        return float(frr[right]), float(thresholds[right])
+    left = right - 1
+    weight = -difference[left] / (difference[right] - difference[left])
+    eer = frr[left] + weight * (frr[right] - frr[left])
+    return float(eer), float(thresholds[right])
 
 
 def compute_min_tdcf(*_args, **_kwargs) -> float:
@@ -65,10 +109,12 @@ def bootstrap_eer_ci(
     Needed for the headline claim. With six vocoders, "weak correlation" versus
     "no correlation" turns on whether the per-condition EERs are separated by
     more than their own sampling noise -- a point estimate cannot settle that.
+    Each draw uses the shared directional, tie-aware EER. The existing independent
+    within-class sampling design is unchanged; this is not a paired bootstrap.
     """
     rng = np.random.default_rng(seed)
-    bona = np.asarray(bonafide_scores).ravel()
-    spoof = np.asarray(spoof_scores).ravel()
+    bona = _score_vector(bonafide_scores, "bonafide_scores")
+    spoof = _score_vector(spoof_scores, "spoof_scores")
     boots = np.empty(n_boot)
     for i in range(n_boot):
         b = rng.choice(bona, size=bona.size, replace=True)

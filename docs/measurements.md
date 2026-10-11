@@ -15,6 +15,13 @@ claim, and a claim cannot quote a number the evidence does not contain.
 **Do not hand-edit these files.** They are outputs. If a measurement is re-run,
 replace the file and let the resolver tests tell you which citations moved.
 
+**Evaluation note (2026-10-12).** The shared EER implementation now groups ties
+and interpolates legitimate ROC points. Historical EER tables below retain their
+original values; they have not been recomputed or certified under the correction.
+The current one-sided confound verdict and 0.40 floor are unchanged. See
+[evaluation correctness](evaluation_correctness.md) for score conventions,
+orientation diagnostics and the separately reviewed gate-correction proposal.
+
 ---
 
 ## `band_measurements.csv`
