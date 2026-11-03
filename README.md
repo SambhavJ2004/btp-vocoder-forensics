@@ -40,12 +40,23 @@ btpvf plot     --quality results/quality_by_condition.csv --detection results/de
 btpvf pilot train --manifest ... --out-dir ...  # fresh directory, non-citable development
 btpvf pilot evaluate --bundle ... --manifest ... --out-dir ...
 btpvf pilot predict --bundle ... --wav ...
+btpvf partial build --manifest ... --out-dir ...  # local non-citable partial-audio pilot
+btpvf partial validate --dataset-dir ... --source-manifest ...
 ```
 
 The working CPU forensic pilot uses shared archive-tier 8 kHz log-spectral
 features, frozen train/dev/eval groups and two logistic classifiers. Legacy v0
 pilot results are always non-citable. See [the pilot guide](docs/forensic_pilot.md)
 for supported audio, provenance, exact commands and planned Kaggle integration.
+
+The [VocoPatch partial-audio pilot](docs/vocopatch_partial_pilot.md) creates bounded,
+sample-labeled real/vocoder splices and matched real-only null controls from the
+existing archive. It validates source/output integrity, preserves frozen groups
+and provides an offline audio/timeline review. Publishing remains a separate step.
+
+The [Phase 1 scientific review](docs/vocopatch_phase1_review.md) adds opt-in
+real-to-real controls and explicit `--split-count train=N` selections while
+preserving the first pilot's legacy recipe and original frozen assignments.
 
 ## Order of work
 

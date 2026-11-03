@@ -16,6 +16,7 @@ Usage:
     btpvf quality  --manifest ...     # Phase B, X-axis
     btpvf plot     --quality ... --detection ...
     btpvf pilot train|evaluate|predict # non-citable CPU forensic development pilot
+    btpvf partial build|validate      # non-citable paired partial-audio pilot
 """
 
 from __future__ import annotations
@@ -133,7 +134,57 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--wav", required=True)
     pp.add_argument("--work-dir", default=None, help="parent for temporary analysis WAV")
 
+    partial = sub.add_parser("partial", help="local partial-audio development dataset")
+    partial_sub = partial.add_subparsers(dest="partial_cmd", required=True)
+    pb = partial_sub.add_parser("build", help="validate sources, splice and validate a local pilot")
+    pb.add_argument("--manifest", required=True)
+    pb.add_argument("--out-dir", required=True, help="must not exist yet")
+    pb.add_argument("--n-utterances", type=int, default=None,
+                    help="default 12, or the sum of explicit split counts")
+    pb.add_argument("--seed", type=int, default=GLOBAL_SEED)
+    pb.add_argument("--segment-seconds", type=float, default=1.0)
+    pb.add_argument("--crossfade-ms", type=float, default=10.0)
+    pb.add_argument("--boundary-margin-seconds", type=float, default=0.25)
+    pb.add_argument("--variants", type=int, choices=(1, 2), default=1)
+    pb.add_argument("--real-to-real-controls", action="store_true",
+                    help="also splice a different region of the same real utterance")
+    pb.add_argument("--split-count", action="append", default=None,
+                    help="explicit frozen-split count, e.g. train=4; repeat for dev/eval")
+    pv = partial_sub.add_parser("validate", help="read-only reconstruction and integrity checks")
+    pv.add_argument("--dataset-dir", required=True)
+    pv.add_argument("--source-manifest", required=True)
+
     args = p.parse_args(argv)
+
+    if args.cmd == "partial":
+        from data.partial_audio import PartialAudioConfig
+        from experiments.partial_audio import build_partial_dataset, validate_partial_dataset
+
+        if args.partial_cmd == "build":
+            from data.invariants import SPLIT_NAMES
+
+            split_counts = None
+            if args.split_count:
+                requested = {}
+                for specification in args.split_count:
+                    name, separator, count = specification.partition("=")
+                    if not separator or name not in SPLIT_NAMES or name in requested:
+                        raise ValueError("Use each frozen split once: --split-count train=4")
+                    requested[name] = int(count)
+                split_counts = tuple(requested.get(name, 0) for name in SPLIT_NAMES)
+            n_utterances = args.n_utterances
+            if n_utterances is None:
+                n_utterances = sum(split_counts) if split_counts is not None else 12
+            result = build_partial_dataset(args.manifest, args.out_dir, PartialAudioConfig(
+                seed=args.seed, n_utterances=n_utterances,
+                segment_seconds=args.segment_seconds, crossfade_ms=args.crossfade_ms,
+                boundary_margin_seconds=args.boundary_margin_seconds, variants=args.variants,
+                real_to_real_controls=args.real_to_real_controls, split_counts=split_counts,
+            ))
+        else:
+            result = validate_partial_dataset(args.dataset_dir, args.source_manifest)
+        print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+        return 0
 
     if args.cmd == "pilot":
         if args.pilot_cmd == "predict":
