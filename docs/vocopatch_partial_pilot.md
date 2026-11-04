@@ -1,5 +1,9 @@
 # VocoPatch partial-audio development pilot
 
+2026-11-04: [Phase 2 complete-source expansion](vocopatch_phase2_expansion.md)
+adds explicit all-source scanning and local private-upload preparation. The
+pilot recipes/artifacts and historical results below remain unchanged.
+
 2026-11-03 review: [Phase 1 audit and control improvements](vocopatch_phase1_review.md)
 adds opt-in real-to-real controls and explicit frozen-split counts. Legacy defaults,
 the initial pilot and the historical results below are preserved. Validation now

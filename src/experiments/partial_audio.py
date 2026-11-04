@@ -25,6 +25,7 @@ from data.partial_audio import (
     VOCODERS,
     PartialAudioConfig,
     UnsuitableUtterance,
+    activity_candidates,
     choose_real_donor,
     choose_region,
     interval_labels,
@@ -66,6 +67,8 @@ def write_json(path: Path, value: dict) -> None:
 
 def config_record(config: PartialAudioConfig) -> dict:
     record = asdict(config)
+    if not config.all_utterances:
+        record.pop("all_utterances")  # Preserve both committed pilot recipes byte-for-byte.
     if config.schema_version == SCHEMA_VERSION:
         record.pop("real_to_real_controls")
         record.pop("split_counts")
@@ -176,12 +179,18 @@ def plan_partial_dataset(manifest: str | Path, config: PartialAudioConfig) -> di
     manifest = Path(manifest).resolve()
     frame = source_frame(manifest)
     digest = sha256_file(manifest)
-    if config.split_counts is None:
+    split_counts = config.split_counts
+    if config.all_utterances:
+        if frame.utt_id.nunique() != config.n_utterances:
+            raise ValueError("All-source request must equal the original manifest utterance count.")
+        split_counts = tuple(frame.loc[frame.split.eq(s), "utt_id"].nunique()
+                             for s in SPLIT_NAMES)
+    if split_counts is None:
         order = np.random.default_rng(config.seed).permutation(sorted(set(frame.utt_id))).tolist()
         pools = [("all", config.n_utterances, order)]
     else:
         pools = []
-        for split, count in zip(SPLIT_NAMES, config.split_counts, strict=True):
+        for split, count in zip(SPLIT_NAMES, split_counts, strict=True):
             ids = sorted(set(frame.loc[frame.split.eq(split), "utt_id"]))
             seed = int.from_bytes(hashlib.sha256(
                 f"vocopatch-split-selection|{config.seed}|{split}".encode(),
@@ -194,6 +203,7 @@ def plan_partial_dataset(manifest: str | Path, config: PartialAudioConfig) -> di
         selected_in_pool = 0
         for rank, utt_id in enumerate(order):
             group = frame[frame.utt_id.eq(utt_id)]
+            wavs, sources, start, end, activity = None, None, None, None, None
             try:
                 wavs, sources = _read_group(group, manifest.parent, digest)
                 start, end, activity = choose_region(wavs["real"], config, str(utt_id))
@@ -204,6 +214,27 @@ def plan_partial_dataset(manifest: str | Path, config: PartialAudioConfig) -> di
                              "reason": str(exc), **FLAGS}
                 if config.schema_version != SCHEMA_VERSION:
                     exclusion["selection_split"] = split
+                if config.all_utterances:
+                    observations = {}
+                    for row in group.itertuples():
+                        path = Path(row.path).resolve()
+                        observations[row.condition] = {
+                            "path": path.relative_to(manifest.parent).as_posix(),
+                            "exists": path.is_file(),
+                            "sha256": sha256_file(path) if path.is_file() else None,
+                        }
+                    exclusion.update(observed_source_files=observations,
+                                     validated_sources=sources)
+                    if wavs is not None:
+                        exclusion.update(real_num_samples=len(wavs["real"]),
+                                         real_peak_absolute=float(np.abs(wavs["real"]).max()),
+                                         target_region=[start, end] if start is not None else None,
+                                         target_activity=activity)
+                    if start is not None:
+                        candidates, _ = activity_candidates(wavs["real"], config)
+                        disjoint = candidates[(candidates + config.segment_samples <= start)
+                                              | (candidates >= end)]
+                        exclusion["disjoint_active_donor_candidates"] = int(len(disjoint))
                 excluded.append(exclusion)
                 continue
             item = {"utt_id": str(utt_id), "candidate_rank": rank,
@@ -215,11 +246,11 @@ def plan_partial_dataset(manifest: str | Path, config: PartialAudioConfig) -> di
             if selected_in_pool == count:
                 break
     result = {"source_manifest_sha256": digest, "selected": selected, "excluded": excluded, **FLAGS}
-    if config.split_counts is None:
+    if split_counts is None:
         result["candidate_order"] = pools[0][2]
     else:
         counts = Counter(item["sources"]["real"]["split"] for item in selected)
-        requested = dict(zip(SPLIT_NAMES, config.split_counts, strict=True))
+        requested = dict(zip(SPLIT_NAMES, split_counts, strict=True))
         result.update(
             selection_policy="explicit_frozen_split_counts",
             candidate_order_by_split={split: order for split, _, order in pools},
@@ -228,6 +259,26 @@ def plan_partial_dataset(manifest: str | Path, config: PartialAudioConfig) -> di
             shortfalls_by_split={
                 split: max(0, n - counts[split]) for split, n in requested.items()
             },
+        )
+    if config.all_utterances:
+        # Catch byte-identical source records crossing frozen partitions as well as
+        # the existing manifest's group/speaker split gates. Never repair or reassign.
+        seen = {}
+        for item in selected:
+            for source in item["sources"].values():
+                previous_split = seen.setdefault(source["sha256"], source["split"])
+                if previous_split != source["split"]:
+                    raise ValueError("Identical source audio crosses frozen splits.")
+        excluded_counts = Counter(item["selection_split"] for item in excluded)
+        result.update(
+            selection_policy="all_frozen_source_utterances",
+            available_utterances_by_split=requested,
+            inspected_utterances_by_split={s: len(order) for s, _, order in pools},
+            excluded_utterances_by_split={s: excluded_counts[s] for s in SPLIT_NAMES},
+            exclusion_reasons_by_split={s: dict(Counter(
+                item["reason"] for item in excluded if item["selection_split"] == s
+            )) for s in SPLIT_NAMES},
+            source_census_complete=len(selected) + len(excluded) == config.n_utterances,
         )
     if config.schema_version != SCHEMA_VERSION:
         result["requested_source_utterances"] = config.n_utterances
@@ -467,6 +518,11 @@ def _summary(rows: list[dict], selection: dict, variant_exclusions: list[dict]) 
                                      and summary["utterances_used"] >=
                                      selection["requested_source_utterances"]),
         )
+    if selection.get("selection_policy") == "all_frozen_source_utterances":
+        for key in ("selection_policy", "available_utterances_by_split",
+                    "inspected_utterances_by_split", "excluded_utterances_by_split",
+                    "exclusion_reasons_by_split", "source_census_complete"):
+            summary[key] = selection[key]
     return summary
 
 
@@ -671,6 +727,16 @@ def build_partial_dataset(manifest: str | Path, out_dir: str | Path,
                     f"Null controls: {summary['null_controls']}; real-to-real controls: "
                     f"{summary['real_to_real_controls']}. Parameters:\n\n"
                     f"```json\n{json.dumps(config_record(config), indent=2)}\n```\n"
+                )
+        if config.all_utterances:
+            with (staging / "README.md").open("a", encoding="utf-8") as stream:
+                stream.write(
+                    "\n## Complete-source development expansion\n\n"
+                    "Every original frozen source group was inspected. Excluded groups are "
+                    "not reassigned or backfilled. See validation.json for the complete census "
+                    "and exact eligible/excluded split counts. This expansion retains the "
+                    "reviewed pilot's editing recipe and annotation schema; it remains "
+                    "non-citable and is not research-gate admission.\n"
                 )
         write_json(staging / "artifacts.sha256.json", {
             "files": artifact_inventory(staging), **FLAGS,

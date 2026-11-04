@@ -44,6 +44,7 @@ class PartialAudioConfig:
     demo_examples: int = 5
     real_to_real_controls: bool = False
     split_counts: tuple[int, int, int] | None = None
+    all_utterances: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.split_counts, list):
@@ -52,6 +53,13 @@ class PartialAudioConfig:
     def validate(self) -> None:
         if not isinstance(self.real_to_real_controls, bool):
             raise ValueError("real_to_real_controls must be an explicit boolean.")
+        if not isinstance(self.all_utterances, bool):
+            raise ValueError("all_utterances must be an explicit boolean.")
+        if self.all_utterances and (self.split_counts is not None
+                                   or not self.real_to_real_controls or self.variants != 1):
+            raise ValueError(
+                "All-source expansion requires both controls, one variant and no quotas.",
+            )
         if self.split_counts is not None:
             if (not isinstance(self.split_counts, tuple)
                     or len(self.split_counts) != len(SPLIT_NAMES)
@@ -66,7 +74,10 @@ class PartialAudioConfig:
                 raise ValueError(f"{name} must be an integer.")
         if not 0 <= self.seed < 2**63:
             raise ValueError("seed must lie in [0, 2**63).")
-        if not 1 <= self.n_utterances <= 12 or self.variants not in (1, 2):
+        limit = 200 if self.all_utterances else 12
+        if not 1 <= self.n_utterances <= limit or self.variants not in (1, 2):
+            if self.all_utterances:
+                raise ValueError("Expansion permits 1–200 original source utterances.")
             raise ValueError("Pilot permits 1–12 utterances and 1–2 variants.")
         if not 0 <= self.demo_examples <= 5:
             raise ValueError("demo_examples must lie in [0, 5].")

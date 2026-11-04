@@ -58,6 +58,12 @@ The [Phase 1 scientific review](docs/vocopatch_phase1_review.md) adds opt-in
 real-to-real controls and explicit `--split-count train=N` selections while
 preserving the first pilot's legacy recipe and original frozen assignments.
 
+The [Phase 2 expansion](docs/vocopatch_phase2_expansion.md) scans every frozen
+source group with `partial build --all-utterances --real-to-real-controls`.
+It retains explicit exclusions and prepares a separate local private-upload
+review folder. The [model protocol](docs/vocopatch_training_protocol.md) defines
+future training/evaluation; no upload or model training is performed.
+
 ## Order of work
 
 1. `btpvf audit` — pin checkpoints and verify mel configs (INV-02, INV-08).

@@ -141,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
     pb.add_argument("--out-dir", required=True, help="must not exist yet")
     pb.add_argument("--n-utterances", type=int, default=None,
                     help="default 12, or the sum of explicit split counts")
+    pb.add_argument("--all-utterances", action="store_true",
+                    help="scan every frozen source group (max 200); requires both controls")
     pb.add_argument("--seed", type=int, default=GLOBAL_SEED)
     pb.add_argument("--segment-seconds", type=float, default=1.0)
     pb.add_argument("--crossfade-ms", type=float, default=10.0)
@@ -153,6 +155,15 @@ def main(argv: list[str] | None = None) -> int:
     pv = partial_sub.add_parser("validate", help="read-only reconstruction and integrity checks")
     pv.add_argument("--dataset-dir", required=True)
     pv.add_argument("--source-manifest", required=True)
+    pu = partial_sub.add_parser("prepare-upload", help="local private-upload folder; no network")
+    pu.add_argument("--dataset-dir", required=True)
+    pu.add_argument("--source-manifest", required=True)
+    pu.add_argument("--out-dir", required=True, help="must not exist yet")
+    pu.add_argument("--dataset-card", required=True)
+    pu.add_argument("--protocol", required=True)
+    uv = partial_sub.add_parser("validate-upload", help="read-only local upload-folder checks")
+    uv.add_argument("--dataset-dir", required=True)
+    uv.add_argument("--source-manifest", required=True)
 
     args = p.parse_args(argv)
 
@@ -164,6 +175,8 @@ def main(argv: list[str] | None = None) -> int:
             from data.invariants import SPLIT_NAMES
 
             split_counts = None
+            if args.all_utterances and (args.split_count or args.n_utterances is not None):
+                raise ValueError("--all-utterances cannot be combined with counts or quotas.")
             if args.split_count:
                 requested = {}
                 for specification in args.split_count:
@@ -175,12 +188,26 @@ def main(argv: list[str] | None = None) -> int:
             n_utterances = args.n_utterances
             if n_utterances is None:
                 n_utterances = sum(split_counts) if split_counts is not None else 12
+            if args.all_utterances:
+                from experiments.partial_audio import source_frame
+
+                n_utterances = int(source_frame(args.manifest).utt_id.nunique())
             result = build_partial_dataset(args.manifest, args.out_dir, PartialAudioConfig(
                 seed=args.seed, n_utterances=n_utterances,
                 segment_seconds=args.segment_seconds, crossfade_ms=args.crossfade_ms,
                 boundary_margin_seconds=args.boundary_margin_seconds, variants=args.variants,
                 real_to_real_controls=args.real_to_real_controls, split_counts=split_counts,
+                all_utterances=args.all_utterances,
             ))
+        elif args.partial_cmd == "prepare-upload":
+            from experiments.partial_audio_upload import prepare_upload_directory
+
+            result = prepare_upload_directory(args.dataset_dir, args.source_manifest,
+                                              args.out_dir, args.dataset_card, args.protocol)
+        elif args.partial_cmd == "validate-upload":
+            from experiments.partial_audio_upload import validate_upload_directory
+
+            result = validate_upload_directory(args.dataset_dir, args.source_manifest)
         else:
             result = validate_partial_dataset(args.dataset_dir, args.source_manifest)
         print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
