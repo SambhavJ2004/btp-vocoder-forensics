@@ -17,6 +17,7 @@ Usage:
     btpvf plot     --quality ... --detection ...
     btpvf pilot train|evaluate|predict # non-citable CPU forensic development pilot
     btpvf partial build|validate      # non-citable paired partial-audio pilot
+    btpvf temporal train|predict      # non-citable train/dev localization baseline
 """
 
 from __future__ import annotations
@@ -165,7 +166,43 @@ def main(argv: list[str] | None = None) -> int:
     uv.add_argument("--dataset-dir", required=True)
     uv.add_argument("--source-manifest", required=True)
 
+    temporal = sub.add_parser("temporal", help="CPU development temporal localization")
+    temporal_sub = temporal.add_subparsers(dest="temporal_cmd", required=True)
+    tt = temporal_sub.add_parser("train", help="fit on train and select/report on dev only")
+    tt.add_argument("--dataset-dir", required=True)
+    tt.add_argument("--source-manifest", required=True)
+    tt.add_argument("--out-dir", required=True)
+    tt.add_argument("--setting", action="append", help="window_ms:hop_ms; repeat for search")
+    tt.add_argument("--c", action="append", type=float)
+    tt.add_argument("--threshold", action="append", type=float)
+    tt.add_argument("--smoothing", action="append", type=int, choices=(1, 3))
+    tt.add_argument("--merge-ms", action="append", type=float)
+    tt.add_argument("--seed", type=int, default=GLOBAL_SEED)
+    tp = temporal_sub.add_parser("predict", help="single-file model intervals, no truth input")
+    tp.add_argument("--bundle", required=True)
+    tp.add_argument("--wav", required=True)
+    tp.add_argument("--work-dir", required=True)
+
     args = p.parse_args(argv)
+
+    if args.cmd == "temporal":
+        if args.temporal_cmd == "train":
+            from experiments.temporal_localization import TemporalExperimentConfig, train_temporal
+
+            default = TemporalExperimentConfig()
+            settings = (tuple(tuple(map(float, value.split(":"))) for value in args.setting)
+                        if args.setting else default.settings)
+            result = train_temporal(args.dataset_dir, args.source_manifest, args.out_dir,
+                TemporalExperimentConfig(settings=settings, c_grid=tuple(args.c or default.c_grid),
+                    thresholds=tuple(args.threshold or default.thresholds),
+                    smoothing_widths=tuple(args.smoothing or default.smoothing_widths),
+                    merge_ms=tuple(args.merge_ms or default.merge_ms), seed=args.seed))
+        else:
+            from detectors.temporal_model import predict_temporal_file
+
+            result = predict_temporal_file(args.bundle, args.wav, args.work_dir)
+        print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+        return 0
 
     if args.cmd == "partial":
         from data.partial_audio import PartialAudioConfig

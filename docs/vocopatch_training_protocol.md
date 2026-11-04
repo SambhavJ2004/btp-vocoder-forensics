@@ -1,5 +1,12 @@
 # VocoPatch partial v1: development training and evaluation protocol
 
+Phase 3A follow-up (2026-11-04): [the first CPU temporal baseline](vocopatch_temporal_baseline.md)
+implements train/dev sliding-window experiments under common fixed contexts,
+explicit IIR-support masks and numeric model bundles. Its poor control
+specificity and complete non-citable dev results are reported there. The eval
+partition receives no features/predictions. The planning requirements below
+remain relevant to future models and final research admission.
+
 2026-11-04. **Development-only and non-citable.** This protocol prepares future
 work; no detector is trained and no localization performance is reported here.
 The 18 rules in `CLAUDE.md` remain authoritative. These edited development

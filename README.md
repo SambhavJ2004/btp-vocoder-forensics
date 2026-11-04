@@ -62,7 +62,19 @@ The [Phase 2 expansion](docs/vocopatch_phase2_expansion.md) scans every frozen
 source group with `partial build --all-utterances --real-to-real-controls`.
 It retains explicit exclusions and prepares a separate local private-upload
 review folder. The [model protocol](docs/vocopatch_training_protocol.md) defines
-future training/evaluation; no upload or model training is performed.
+training/evaluation separation. Phase 2 performs no upload or model training.
+
+The [Phase 3A temporal baseline](docs/vocopatch_temporal_baseline.md) adds
+`btpvf temporal train|predict`: CPU logistic localization with acoustic windows,
+explicit ignore/support masks, safe numeric bundles and source-grouped train/dev
+metrics. Its first development run has poor real-only control specificity;
+it is non-citable and does not run final eval.
+
+The [Phase 3B failure analysis](docs/vocopatch_temporal_failure_analysis.md) audits
+the saved baseline and compares four fixed acoustic representations with grouped
+validation inside train and control-FPR thresholds. Dev comparisons are
+descriptive; eval remains unused. Reproduction uses the `temporal_review` and
+`temporal_ablation` experiment modules.
 
 ## Order of work
 
