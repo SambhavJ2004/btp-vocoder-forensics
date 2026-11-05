@@ -87,6 +87,11 @@ audits source alignment and labels, acoustic differences, activity and source
 score shifts, controls, and four limited nuisance ablations inside train.
 It reuses frozen models and does not train another neural network.
 
+The [Phase 3E paired-negative study](docs/vocopatch_phase3e_paired_training.md)
+tests two fixed matched-content real-negative weighting levels against the
+unchanged 64-ms logistic protocol. Source-grouped train-only selection locks all
+models and cutoffs before the exposed dev benchmark; eval remains unused.
+
 ## Order of work
 
 1. `btpvf audit` — pin checkpoints and verify mel configs (INV-02, INV-08).
