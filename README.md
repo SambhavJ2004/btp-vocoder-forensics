@@ -76,6 +76,12 @@ validation inside train and control-FPR thresholds. Dev comparisons are
 descriptive; eval remains unused. Reproduction uses the `temporal_review` and
 `temporal_ablation` experiment modules.
 
+The [Phase 3C paired-signal diagnostics](docs/vocopatch_paired_signal.md) compare
+same-time real/vocoder cores, gain/activity controls and real-to-real negatives
+using train-only grouped oracle classification. Oracle results describe core
+detectability, not localization. A predeclared training-only criterion determines
+whether to proceed with a compact learned model; eval remains unused.
+
 ## Order of work
 
 1. `btpvf audit` — pin checkpoints and verify mel configs (INV-02, INV-08).
