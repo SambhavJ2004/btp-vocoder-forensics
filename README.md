@@ -82,6 +82,11 @@ using train-only grouped oracle classification. Oracle results describe core
 detectability, not localization. A predeclared training-only criterion determines
 whether to proceed with a compact learned model; eval remains unused.
 
+The [Phase 3D signal/dataset investigation](docs/vocopatch_phase3d_diagnostics.md)
+audits source alignment and labels, acoustic differences, activity and source
+score shifts, controls, and four limited nuisance ablations inside train.
+It reuses frozen models and does not train another neural network.
+
 ## Order of work
 
 1. `btpvf audit` — pin checkpoints and verify mel configs (INV-02, INV-08).
