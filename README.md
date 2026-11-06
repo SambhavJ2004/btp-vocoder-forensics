@@ -92,6 +92,11 @@ tests two fixed matched-content real-negative weighting levels against the
 unchanged 64-ms logistic protocol. Source-grouped train-only selection locks all
 models and cutoffs before the exposed dev benchmark; eval remains unused.
 
+The [VocoTrace verification benchmark](docs/vocotrace_phase4b_verification.md)
+separates known-source attribution, genuine false attribution and three
+held-out-vocoder trials, using train-only group calibration and explicit
+abstention. It reuses the whole-audio acoustic baseline and numeric inference.
+
 ## Order of work
 
 1. `btpvf audit` — pin checkpoints and verify mel configs (INV-02, INV-08).

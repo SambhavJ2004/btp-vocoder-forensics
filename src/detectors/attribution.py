@@ -60,22 +60,42 @@ def family_labels(conditions: tuple[str, ...] = LADDER) -> dict[str, str]:
 
 
 def energy_score(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
-    """Free-energy OOD score. Lower energy == more in-distribution.
+    """E=-T*logsumexp(z/T), over the last axis; lower is nominally known-like.
 
-    E(x) = -T * logsumexp(logits / T). Preferred over max-softmax because it
-    keeps the magnitude information softmax normalises away -- which is exactly
-    the information that distinguishes "confidently one of these" from
-    "confidently none of these".
+    This preserves the original orientation/formula, not a calibrated unknown
+    probability. Absolute logits require empirical OOD validation. Center before
+    division to handle tiny T and large finite logits without ratio overflow.
+    Unrepresentable float64 results raise rather than silently saturating.
     """
-    from scipy.special import logsumexp
-
-    return -temperature * logsumexp(np.asarray(logits, dtype=np.float64) / temperature, axis=-1)
+    t = np.asarray(temperature)
+    if t.ndim or t.dtype.kind not in "iuf" or not np.isfinite(t) or t <= 0:
+        raise ValueError("Temperature must be a finite positive numeric scalar.")
+    t = float(t)
+    if not np.isfinite(t) or t <= 0:
+        raise ValueError("Temperature is outside positive float64 range.")
+    z = np.asarray(logits, dtype=np.float64)
+    if z.ndim < 1 or not z.size or not np.isfinite(z).all():
+        raise ValueError("Energy requires finite logits with a nonempty class axis.")
+    maximum = z.max(axis=-1)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        centered = (z - maximum[..., None]) / t
+        correction = np.log(np.exp(centered).sum(axis=-1))
+        product = t * correction
+        total = maximum + product
+        # Product alone can overflow although its sum with a negative maximum fits.
+        fallback = np.isinf(product) & (maximum < 0)
+        if np.any(fallback):
+            total = np.where(fallback, t * (maximum / t + correction), total)
+    if not np.isfinite(total).all():
+        raise ValueError("Energy is outside representable float64 range.")
+    return -total
 
 
 def open_set_metrics(*_args, **_kwargs) -> dict[str, float]:
     """AUROC / FPR@95TPR for known-vs-unknown, plus closed-set accuracy on the
-    accepted subset. Report both: a rejector that rejects everything scores
-    perfectly on the first and uselessly on the second.
+    accepted subset. Report both alongside coverage. Rejecting everything at
+    one cutoff does not establish score discrimination; constant scores give
+    AUROC 0.5 when both populations are present.
     """
     raise NotImplementedError(
         "Implement once the closed-set classifier is trained. Calibrate any "
