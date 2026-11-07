@@ -34,6 +34,23 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("audit", help="checkpoint / mel-config readiness table")
 
+    ingest = sub.add_parser("ingest", help="non-citable native source intake; no generation")
+    intake_sub = ingest.add_subparsers(dest="ingest_cmd", required=True)
+    intake = intake_sub.add_parser("vctk", help="read-only VCTK 0.92 mic2 source selection")
+    intake.add_argument("--source-root", required=True)
+    intake.add_argument("--out-dir", required=True)
+    intake.add_argument(
+        "--evidence-dir", default=None,
+        help="directory containing official README.txt and license_text.txt",
+    )
+    intake.add_argument("--speakers", type=int, default=50)
+    intake.add_argument("--utterances-per-speaker", type=int, default=10)
+    intake.add_argument("--source-kind", choices=["local_dataset", "fixture"], required=True)
+    check_intake = intake_sub.add_parser("verify", help="remeasure source intake and integrity")
+    check_intake.add_argument("--ingestion-dir", required=True)
+    check_intake.add_argument("--source-root", default=None, help="explicit relocated source root")
+    check_intake.add_argument("--evidence-dir", default=None)
+
     a = sub.add_parser(
         "resynth",
         help="Phase A: gated resynthesis -> full-band archive, derived tier, manifest",
@@ -184,6 +201,22 @@ def main(argv: list[str] | None = None) -> int:
     tp.add_argument("--work-dir", required=True)
 
     args = p.parse_args(argv)
+
+    if args.cmd == "ingest":
+        from data.source_ingestion import IntakePolicy, ingest_vctk, verify_ingestion
+
+        if args.ingest_cmd == "verify":
+            result = verify_ingestion(
+                args.ingestion_dir, source_root=args.source_root, evidence_dir=args.evidence_dir,
+            )
+        else:
+            result = ingest_vctk(
+                args.source_root, args.out_dir,
+                policy=IntakePolicy(args.speakers, args.utterances_per_speaker),
+                evidence_dir=args.evidence_dir, source_kind=args.source_kind,
+            )
+        print(json.dumps(result, indent=2))
+        return 0
 
     if args.cmd == "temporal":
         if args.temporal_cmd == "train":
