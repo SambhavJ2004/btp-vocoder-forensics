@@ -34,6 +34,31 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("audit", help="checkpoint / mel-config readiness table")
 
+    multi = sub.add_parser("multispeaker", help="explicit non-citable ingestion-backed generation")
+    multi_sub = multi.add_subparsers(dest="multi_cmd", required=True)
+    mp = multi_sub.add_parser("plan", help="verify intake and freeze twenty training sources")
+    mp.add_argument("--ingestion-dir", required=True)
+    mp.add_argument("--out-dir", required=True)
+    mp.add_argument("--source-kind", choices=["fixture", "local_dataset"], required=True)
+    mp.add_argument("--condition", choices=["fixture_mock", "griffin_lim", "bigvgan_112m", "vocos"],
+                    required=True)
+    mp.add_argument("--acquisition-receipt", default=None)
+    for name in ("compatibility", "generate", "validate"):
+        command = multi_sub.add_parser(name)
+        if name == "validate":
+            command.add_argument("--directory", required=True)
+            command.add_argument("--compatibility-dir", default=None)
+        else:
+            command.add_argument("--plan-dir", required=True)
+            command.add_argument("--out-dir", required=True)
+            command.add_argument("--device", default="cpu")
+            if name == "generate":
+                command.add_argument("--compatibility-dir", required=True)
+        command.add_argument("--source-root", default=None)
+        command.add_argument("--evidence-dir", default=None)
+    mp.add_argument("--source-root", default=None)
+    mp.add_argument("--evidence-dir", default=None)
+
     ingest = sub.add_parser("ingest", help="non-citable native source intake; no generation")
     intake_sub = ingest.add_subparsers(dest="ingest_cmd", required=True)
     intake = intake_sub.add_parser("vctk", help="read-only VCTK 0.92 mic2 source selection")
@@ -201,6 +226,27 @@ def main(argv: list[str] | None = None) -> int:
     tp.add_argument("--work-dir", required=True)
 
     args = p.parse_args(argv)
+
+    if args.cmd == "multispeaker":
+        from experiments.multispeaker_generation import create_plan, generate, validate
+
+        roots = {"source_root": args.source_root, "evidence_dir": args.evidence_dir}
+        if args.multi_cmd == "plan":
+            result = {"plan": str(create_plan(
+                args.ingestion_dir, args.out_dir, source_kind=args.source_kind,
+                condition=args.condition, acquisition_receipt=args.acquisition_receipt, **roots,
+            ))}
+        elif args.multi_cmd == "validate":
+            result = validate(args.directory, compatibility_dir=args.compatibility_dir, **roots)
+        else:
+            result = generate(
+                args.plan_dir, args.out_dir,
+                stage="generation" if args.multi_cmd == "generate" else "compatibility",
+                compatibility_dir=getattr(args, "compatibility_dir", None),
+                device=args.device, **roots,
+            )
+        print(json.dumps(result, indent=2))
+        return 0
 
     if args.cmd == "ingest":
         from data.source_ingestion import IntakePolicy, ingest_vctk, verify_ingestion
