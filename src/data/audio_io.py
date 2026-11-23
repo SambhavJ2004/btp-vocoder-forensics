@@ -12,6 +12,7 @@ silent mistake this module exists to prevent.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import BinaryIO
 
 import numpy as np
 import soundfile as sf
@@ -26,14 +27,15 @@ from .invariants import (
 )
 
 
-def read_native(path: str | Path) -> tuple[np.ndarray, int]:
+def read_native(path: str | Path | BinaryIO) -> tuple[np.ndarray, int]:
     """Read a file at its own native sample rate, downmixed to mono.
 
     Native-rate reading is deliberate: the resample happens exactly once, in
     :func:`data.preprocess.resample_once`, so that no file is ever passed
     through two anti-aliasing filters (INV-01).
     """
-    wav, sr = sf.read(str(path), dtype=DTYPE, always_2d=False)
+    source = str(path) if isinstance(path, (str, Path)) else path
+    wav, sr = sf.read(source, dtype=DTYPE, always_2d=False)
     if wav.ndim == 2:
         wav = wav.mean(axis=1)
     return np.ascontiguousarray(wav, dtype=np.float32), int(sr)
@@ -81,9 +83,10 @@ def write_audio(
     return path
 
 
-def probe(path: str | Path) -> dict[str, object]:
+def probe(path: str | Path | BinaryIO) -> dict[str, object]:
     """Cheap header read: rate, channels, subtype, duration. Used by audits."""
-    info = sf.info(str(path))
+    source = str(path) if isinstance(path, (str, Path)) else path
+    info = sf.info(source)
     return {
         "path": str(path),
         "sample_rate": info.samplerate,
