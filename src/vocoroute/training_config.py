@@ -11,6 +11,7 @@ from . import PROTOTYPE_VERSION
 from .spectral import FRONTEND_V1
 
 CONFIG_SCHEMA = "vocoroute-base-training-v1"
+BUDGET_CONFIG_SCHEMA = "vocoroute-base-training-v2"
 TRAIN_ROLE, DEV_ROLE, EVAL_ROLE = "train", "dev", "eval"
 ROLES = (TRAIN_ROLE, DEV_ROLE, EVAL_ROLE)
 STFT_RESOLUTIONS = ((256, 64), (512, 128), (1024, 256))
@@ -105,8 +106,28 @@ class TrainingConfig:
     scheduler_gamma: float = 0.98
     loss: LossWeights = LossWeights()
     manifest_sha256: str | None = None
+    schema: str = CONFIG_SCHEMA
+    device: str = "cpu"
+    max_updates: int | None = None
+    wall_time_seconds: float | None = None
+    checkpoint_every_updates: int | None = None
 
     def __post_init__(self) -> None:
+        budgets = (self.max_updates, self.wall_time_seconds, self.checkpoint_every_updates)
+        if self.schema == CONFIG_SCHEMA:
+            if self.device != "cpu" or any(value is not None for value in budgets):
+                raise ValueError("device and budget controls require the v2 configuration")
+        elif self.schema == BUDGET_CONFIG_SCHEMA:
+            if self.device not in ("cpu", "cuda"):
+                raise ValueError("device must be cpu or cuda")
+            for name in ("max_updates", "checkpoint_every_updates"):
+                value = getattr(self, name)
+                if type(value) is not int or value < 1:
+                    raise ValueError(f"{name} must be a positive integer")
+            if not finite_number(self.wall_time_seconds) or self.wall_time_seconds <= 0:
+                raise ValueError("wall_time_seconds must be finite and positive")
+        else:
+            raise ValueError("unknown training configuration schema")
         if type(self.seed) is not int or not 0 <= self.seed < 2**63:
             raise ValueError("seed must be an integer in [0, 2**63)")
         if type(self.epochs) is not int or self.epochs < 1:
@@ -123,8 +144,10 @@ class TrainingConfig:
             raise ValueError("manifest_sha256 must be a lowercase SHA-256 digest or null")
 
     def document(self) -> dict:
-        return {
+        document = {
             **fixed_contract(),
+            "schema": self.schema,
+            "device": self.device,
             "seed": self.seed,
             "epochs": self.epochs,
             "manifest_sha256": self.manifest_sha256,
@@ -144,6 +167,13 @@ class TrainingConfig:
             },
             "loss": asdict(self.loss),
         }
+        if self.schema == BUDGET_CONFIG_SCHEMA:
+            document["budget"] = {
+                "max_updates": self.max_updates,
+                "wall_time_seconds": self.wall_time_seconds,
+                "checkpoint_every_updates": self.checkpoint_every_updates,
+            }
+        return document
 
     @property
     def sha256(self) -> str:
@@ -152,7 +182,11 @@ class TrainingConfig:
     @classmethod
     def from_document(cls, document: dict) -> "TrainingConfig":
         try:
+            schema = document["schema"]
+            budget = document["budget"] if schema == BUDGET_CONFIG_SCHEMA else {}
             cfg = cls(
+                schema=schema,
+                device=document["device"],
                 seed=document["seed"],
                 epochs=document["epochs"],
                 manifest_sha256=document["manifest_sha256"],
@@ -160,6 +194,7 @@ class TrainingConfig:
                 weight_decay=document["optimizer"]["weight_decay"],
                 scheduler_gamma=document["scheduler"]["gamma"],
                 loss=LossWeights(**document["loss"]),
+                **budget,
             )
         except (KeyError, TypeError) as exc:
             raise ValueError("invalid training configuration fields") from exc

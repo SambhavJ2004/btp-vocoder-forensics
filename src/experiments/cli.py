@@ -139,6 +139,11 @@ def main(argv: list[str] | None = None) -> int:
     kgcode.add_argument("--mode", choices=["iteration", "record"], required=True)
     kgcode.add_argument("--sha", default=None)
     kgsub.add_parser("notebook", help="regenerate notebooks/kaggle_v0.ipynb from V0_SPEC")
+    kgvoco = kgsub.add_parser("vocoroute-plan", help="stage a VocoRoute-P record kernel locally")
+    kgvoco.add_argument("--sha", required=True, help="existing commit containing N2K support")
+    kgvoco.add_argument("--spec", type=Path, required=True)
+    kgvoco.add_argument("--config", type=Path, required=True)
+    kgvoco.add_argument("--out-dir", type=Path, required=True, help="fresh local staging directory")
 
     mg = sub.add_parser("merge", help="INV-13: combine per-condition runs into one dataset")
     mg.add_argument("--manifest", action="append", required=True, dest="manifests",
@@ -463,6 +468,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "kaggle":
+        if args.kaggle_cmd == "vocoroute-plan":
+            from experiments.vocoroute_kaggle import stage_vocoroute_plan
+
+            plan = stage_vocoroute_plan(args.sha, args.spec, args.config, args.out_dir)
+            result = {"snapshot": plan["snapshot"], "local_plan": str(args.out_dir)}
+            print(json.dumps(result, indent=2))
+            return 0
+
         from experiments.kaggle_harness import (
             KernelSpec,
             check_auth,

@@ -10,8 +10,16 @@ from pathlib import Path
 import torch
 
 from .model import SpectralBackbone
-from .training_config import TrainingConfig, canonical_json, finite_number, is_sha256, parse_json
+from .training_config import (
+    BUDGET_CONFIG_SCHEMA,
+    TrainingConfig,
+    canonical_json,
+    finite_number,
+    is_sha256,
+    parse_json,
+)
 from .training_data import GeneratorManifest, sha256_file
+from .training_device import accelerator_record, resolve_device
 
 RUN_SCHEMA = "vocoroute-base-run-v1"
 CHECKPOINT_SCHEMA = "vocoroute-base-checkpoint-v1"
@@ -36,7 +44,7 @@ def run_provenance(config: TrainingConfig, manifest: GeneratorManifest) -> dict:
         soundfile = version("soundfile")
     except PackageNotFoundError:
         soundfile = None
-    return {
+    record = {
         "schema": RUN_SCHEMA,
         "evidence": "development",
         "config": config.document(),
@@ -53,11 +61,14 @@ def run_provenance(config: TrainingConfig, manifest: GeneratorManifest) -> dict:
             "torch": str(torch.__version__),
             "torchaudio": version("torchaudio"),
             "soundfile": soundfile,
-            "device": "cpu",
+            "device": config.device,
             "threads": torch.get_num_threads(),
             "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
         },
     }
+    if config.schema == BUDGET_CONFIG_SCHEMA:
+        record["runtime"]["accelerator"] = accelerator_record(resolve_device(config.device))
+    return record
 
 
 def _validate_receipt(receipt: dict, config: TrainingConfig) -> None:
@@ -96,10 +107,12 @@ def _validate_receipt(receipt: dict, config: TrainingConfig) -> None:
     ):
         raise ValueError("invalid checkpoint code provenance")
     runtime = run["runtime"]
+    extra_keys = {"accelerator"} if config.schema == BUDGET_CONFIG_SCHEMA else set()
     if (
         not isinstance(runtime, dict)
         or set(runtime)
-        != {
+        != extra_keys
+        | {
             "python",
             "platform",
             "torch",
@@ -109,7 +122,7 @@ def _validate_receipt(receipt: dict, config: TrainingConfig) -> None:
             "threads",
             "deterministic_algorithms",
         }
-        or runtime["device"] != "cpu"
+        or runtime["device"] != config.device
         or type(runtime["threads"]) is not int
         or runtime["threads"] < 1
         or type(runtime["deterministic_algorithms"]) is not bool
@@ -125,6 +138,17 @@ def _validate_receipt(receipt: dict, config: TrainingConfig) -> None:
         or (runtime["soundfile"] is not None and not isinstance(runtime["soundfile"], str))
     ):
         raise ValueError("invalid checkpoint runtime provenance")
+    if config.device == "cuda":
+        accelerator = runtime.get("accelerator")
+        if not isinstance(accelerator, dict) or (
+            not isinstance(accelerator.get("name"), str)
+            or not isinstance(accelerator.get("cuda_build"), str)
+            or accelerator.get("matmul_tf32") is not False
+            or accelerator.get("cudnn_tf32") is not False
+        ):
+            raise ValueError("invalid checkpoint CUDA provenance")
+    elif runtime.get("accelerator") is not None:
+        raise ValueError("CPU checkpoint cannot declare a CUDA accelerator")
     history = receipt["history"]
     if not isinstance(history, list) or len(history) != config.epochs:
         raise ValueError("checkpoint history must contain the full configured run")
