@@ -28,7 +28,13 @@ from .training_config import (
     TrainingConfig,
     load_training_config,
 )
-from .training_data import GeneratorManifest, TrainingAudio, load_manifest, prepare_example
+from .training_data import (
+    GeneratorManifest,
+    TrainingAudio,
+    TrainingExample,
+    load_manifest,
+    prepare_example,
+)
 from .training_device import accelerator_record, training_runtime
 from .training_resume import Progress, read_resume, write_resume
 
@@ -45,15 +51,15 @@ class BaseTrainingModel(nn.Module):
     def forward(self, waveform: Tensor) -> ReconstructionTerms:
         device = self.frontend.window.device
         example = prepare_example(self.frontend, waveform.to(device=device, dtype=torch.float32))
-        spectrum = self.backbone(example.mel)
-        synthesized = self.frontend.synthesize(spectrum, example.length)
-        return self.loss(synthesized, example.target)
+        return self.loss(self.synthesize(example), example.target)
+
+    def synthesize(self, example: TrainingExample) -> Tensor:
+        return self.frontend.synthesize(self.backbone(example.mel), example.length)
 
 
-def _training_parts(config: TrainingConfig, device: torch.device):
-    model = BaseTrainingModel(config).to(device)
+def base_optimizer(model: BaseTrainingModel, config: TrainingConfig) -> torch.optim.AdamW:
     spec = config.document()["optimizer"]
-    optimizer = torch.optim.AdamW(
+    return torch.optim.AdamW(
         model.backbone.parameters(),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
@@ -62,6 +68,11 @@ def _training_parts(config: TrainingConfig, device: torch.device):
         foreach=spec["foreach"],
         fused=spec["fused"],
     )
+
+
+def _training_parts(config: TrainingConfig, device: torch.device):
+    model = BaseTrainingModel(config).to(device)
+    optimizer = base_optimizer(model, config)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=config.scheduler_gamma)
     return model, optimizer, scheduler
 

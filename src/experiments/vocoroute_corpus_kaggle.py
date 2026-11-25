@@ -241,7 +241,9 @@ def run_corpus_kernel(plan: dict, inputs: Path, working: Path) -> dict:
     return result
 
 
-_BOOTSTRAP = f"""\
+def embedded_kernel_bootstrap(module: str, entrypoint: str) -> str:
+    """Verify the small embedded source tree before running a Kaggle driver."""
+    return f"""\
 import base64
 import hashlib
 import io
@@ -271,7 +273,10 @@ with tempfile.TemporaryDirectory(prefix="vocoroute-corpus-source-") as scratch:
         if digest.hexdigest() != PLAN["source_tree_sha256"]:
             raise ValueError("staged corpus source tree checksum mismatch")
     sys.path.insert(0, str(root / "src"))
-    from experiments.vocoroute_corpus_kaggle import run_corpus_kernel
+    from {module} import {entrypoint}
 
-    run_corpus_kernel(PLAN, Path({KAGGLE_INPUT!r}), Path({KAGGLE_WORKING!r}))
+    {entrypoint}(PLAN, Path({KAGGLE_INPUT!r}), Path({KAGGLE_WORKING!r}))
 """
+
+
+_BOOTSTRAP = embedded_kernel_bootstrap("experiments.vocoroute_corpus_kaggle", "run_corpus_kernel")

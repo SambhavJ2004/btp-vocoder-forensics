@@ -22,6 +22,7 @@ from .spectral import FRONTEND_V1, SpectralFrontend, frames_for_length
 from .training_config import canonical_json, is_sha256, parse_json
 from .training_data import (
     MANIFEST_SCHEMA,
+    GeneratorManifest,
     GeneratorRow,
     TrainingAudio,
     load_manifest,
@@ -360,10 +361,8 @@ def _check_examples(audio: TrainingAudio, rows: tuple[GeneratorRow, ...]) -> Non
                 raise ValueError("published audio failed frontend alignment")
 
 
-def load_overfit(
-    folder: Path, expected_sha256: str
-) -> tuple[TrainingAudio, tuple[GeneratorRow, ...]]:
-    """Read an explicitly pinned eight-utterance projection, without dev access."""
+def load_overfit_manifest(folder: Path, expected_sha256: str) -> GeneratorManifest:
+    """Resolve the pinned diagnostic selection against its frozen pilot metadata."""
     selection = read_pinned_json(folder / "manifest.json", expected_sha256)
     if (
         set(selection) != {"schema", "parent_manifest_sha256", "train_utterance_ids"}
@@ -377,8 +376,15 @@ def load_overfit(
     train = {row.utterance_id: row for row in parent.examples("train")}
     if len(set(ids)) != len(ids) or set(ids) - train.keys():
         raise ValueError("diagnostic selection must be a unique subset of parent TRAIN")
-    rows = tuple(train[uid] for uid in ids)
-    return TrainingAudio(replace(parent, rows=rows), folder), rows
+    return replace(parent, rows=tuple(train[uid] for uid in ids))
+
+
+def load_overfit(
+    folder: Path, expected_sha256: str
+) -> tuple[TrainingAudio, tuple[GeneratorRow, ...]]:
+    """Read an explicitly pinned eight-utterance projection, without dev access."""
+    manifest = load_overfit_manifest(folder, expected_sha256)
+    return TrainingAudio(manifest, folder), manifest.rows
 
 
 def _source_metadata(folder: Path, files: dict[str, bytes], profile: dict) -> str:
