@@ -144,6 +144,11 @@ def main(argv: list[str] | None = None) -> int:
     kgvoco.add_argument("--spec", type=Path, required=True)
     kgvoco.add_argument("--config", type=Path, required=True)
     kgvoco.add_argument("--out-dir", type=Path, required=True, help="fresh local staging directory")
+    kgcorpus = kgsub.add_parser("vocoroute-corpus", help="stage a private CPU corpus kernel")
+    kgcorpus.add_argument("--out-dir", type=Path, required=True, help="fresh staging directory")
+    kgcorpus.add_argument("--sha", help="existing user-created commit for record mode")
+    kgcorpus.add_argument("--freeze-source", help="versioned train/dev notebook for eval only")
+    kgcorpus.add_argument("--freeze-sha256", help="approved train/dev freeze digest for eval only")
 
     mg = sub.add_parser("merge", help="INV-13: combine per-condition runs into one dataset")
     mg.add_argument("--manifest", action="append", required=True, dest="manifests",
@@ -468,6 +473,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "kaggle":
+        if args.kaggle_cmd == "vocoroute-corpus":
+            from experiments.vocoroute_corpus_kaggle import stage_corpus_kernel
+
+            result = stage_corpus_kernel(
+                args.out_dir, sha=args.sha, freeze_source=args.freeze_source,
+                freeze_sha256=args.freeze_sha256,
+            )
+            print(json.dumps(result, indent=2))
+            return 0
         if args.kaggle_cmd == "vocoroute-plan":
             from experiments.vocoroute_kaggle import stage_vocoroute_plan
 

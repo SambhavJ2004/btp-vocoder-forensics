@@ -95,3 +95,18 @@ def probe(path: str | Path | BinaryIO) -> dict[str, object]:
         "frames": info.frames,
         "duration_s": info.duration,
     }
+
+
+def write_generator_pcm16(stream: BinaryIO, wav: np.ndarray, sample_rate: int) -> None:
+    """Encode native generator targets without applying forensic loudness policy."""
+    if (
+        type(sample_rate) is not int
+        or sample_rate <= 0
+        or wav.ndim != 1
+        or not wav.size
+        or not np.isfinite(wav).all()
+        or wav.min() < -1.0
+        or wav.max() > 32767 / 32768
+    ):
+        raise ValueError("expected finite mono samples in the PCM16 range and a valid rate")
+    sf.write(stream, wav, sample_rate, format="WAV", subtype="PCM_16")

@@ -161,6 +161,12 @@ def _under(root: Path, name: str) -> Path:
 
 
 def _dataset_manifest(plan: dict, root: Path) -> tuple[Path, Path]:
+    # The raw acquisition also contains the held-out speakers. Refuse either full mount.
+    for directory, subdirs, files in os.walk(root):
+        if {"VCTK-Corpus-0.92.zip", "eval-index.json"}.intersection(files) or (
+            Path(directory).name in ("native", "prepared") and "eval" in subdirs
+        ):
+            raise ValueError("raw VCTK or held-out evaluation audio is mounted for training")
     expected = plan["spec"]["data"]
     mount = _under(root, expected["mount"])
     raw = _under(mount, "dataset-receipt.json").read_bytes()
