@@ -156,6 +156,10 @@ def main(argv: list[str] | None = None) -> int:
     kgphase.add_argument("--sha", required=True, help="existing user-created N2B.1-P commit")
     kgphase.add_argument("--baseline-receipt", type=Path, required=True)
     kgphase.add_argument("--out-dir", type=Path, required=True, help="fresh staging directory")
+    kgeight = kgsub.add_parser("vocoroute-eight-plan", help="stage the N2B.2 RECORD kernel")
+    kgeight.add_argument("--sha", required=True, help="existing user-created N2B.2 commit")
+    kgeight.add_argument("--source-metadata", type=Path, required=True)
+    kgeight.add_argument("--out-dir", type=Path, required=True, help="fresh staging directory")
 
     mg = sub.add_parser("merge", help="INV-13: combine per-condition runs into one dataset")
     mg.add_argument("--manifest", action="append", required=True, dest="manifests",
@@ -480,6 +484,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "kaggle":
+        if args.kaggle_cmd == "vocoroute-eight-plan":
+            from experiments.vocoroute_overfit_eight_kaggle import stage_eight_kernel
+
+            result = stage_eight_kernel(args.sha, args.source_metadata, args.out_dir)
+            print(json.dumps(result, indent=2))
+            return 0
         if args.kaggle_cmd == "vocoroute-phase-plan":
             from experiments.vocoroute_phase_kaggle import stage_phase_kernel
 
