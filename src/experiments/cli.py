@@ -152,6 +152,10 @@ def main(argv: list[str] | None = None) -> int:
     kgoverfit = kgsub.add_parser("vocoroute-overfit-plan", help="stage the N2B.1 record kernel")
     kgoverfit.add_argument("--sha", required=True, help="existing user-created N2B.1 commit")
     kgoverfit.add_argument("--out-dir", type=Path, required=True, help="fresh staging directory")
+    kgphase = kgsub.add_parser("vocoroute-phase-plan", help="stage the N2B.1-P RECORD kernel")
+    kgphase.add_argument("--sha", required=True, help="existing user-created N2B.1-P commit")
+    kgphase.add_argument("--baseline-receipt", type=Path, required=True)
+    kgphase.add_argument("--out-dir", type=Path, required=True, help="fresh staging directory")
 
     mg = sub.add_parser("merge", help="INV-13: combine per-condition runs into one dataset")
     mg.add_argument("--manifest", action="append", required=True, dest="manifests",
@@ -476,6 +480,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "kaggle":
+        if args.kaggle_cmd == "vocoroute-phase-plan":
+            from experiments.vocoroute_phase_kaggle import stage_phase_kernel
+
+            result = stage_phase_kernel(args.sha, args.baseline_receipt, args.out_dir)
+            print(json.dumps(result, indent=2))
+            return 0
         if args.kaggle_cmd == "vocoroute-overfit-plan":
             from experiments.vocoroute_overfit_kaggle import stage_overfit_kernel
 
