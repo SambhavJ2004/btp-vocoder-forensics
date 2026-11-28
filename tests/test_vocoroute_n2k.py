@@ -386,3 +386,180 @@ def test_mounted_dataset_pin_and_no_eval_audio(corpus, tmp_path):
     (root / "example-5.wav").write_bytes(b"must not be opened")
     with pytest.raises(ValueError, match="held-out evaluation audio"):
         kaggle._dataset_manifest(plan, tmp_path)
+
+
+def test_pilot_wall_stop_during_dev_and_resume(corpus, tmp_path, monkeypatch):
+    from vocoroute import pilot_diagnostics as pilot
+    from vocoroute.training_config import LossWeights
+    from vocoroute.training_data import TrainingAudio, load_manifest
+
+    root, manifest_path, config = corpus
+    config = replace(config, loss=LossWeights(phase_enabled=True), scheduler_gamma=1.0)
+    manifest = load_manifest(manifest_path, config.manifest_sha256)
+    audio = TrainingAudio(manifest, root)
+    panel = pilot.panel_ids(manifest, config.seed, per_speaker=2)
+    protocol = {"panel_utterance_ids": panel, "panel_epochs": [1, 2]}
+    clock = SimpleNamespace(now=0.0, enabled=False, rows=0)
+    monkeypatch.setattr(train_base, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    evaluate = pilot.PilotDiagnostics.evaluate
+
+    def evaluate_checked(self, model, row, waveform):
+        assert row.role == "dev" and not model.training and not torch.is_grad_enabled()
+        before = {name: tensor.clone() for name, tensor in model.state_dict().items()}
+        rng = torch.get_rng_state().clone()
+        result = evaluate(self, model, row, waveform)
+        same(before, model.state_dict())
+        same(rng, torch.get_rng_state())
+        if clock.enabled:
+            clock.rows += 1
+            if clock.rows == 3:
+                clock.now = config.wall_time_seconds
+        return result
+
+    monkeypatch.setattr(pilot.PilotDiagnostics, "evaluate", evaluate_checked)
+
+    def run_pilot(label, resume_from=None, document=protocol):
+        return train_base._run_budgeted(
+            config, manifest, audio, tmp_path / label, torch.device("cpu"),
+            pilot_protocol=document, resume=resume_from, attempt_updates=None,
+        )
+
+    full = run_pilot("pilot-full")
+    clock.enabled = True
+    partial = run_pilot("pilot-partial")
+    assert (partial["status"], partial["reason"]) == ("budget_limited", "wall_time")
+    assert (partial["completed_epochs"], partial["updates"], partial["next_dev_row"]) == (1, 6, 1)
+    assert not partial["convergence_claimed"]
+    partial_root = tmp_path / "pilot-partial"
+    _, best = load_base_checkpoint(
+        partial_root / "inference", config, receipt_sha256=partial["checkpoint_receipt_sha256"]
+    )
+    assert best["best_epoch"] == 1 and len(best["history"]) == 1
+    assert best["run"]["pilot_protocol_sha256"] == pilot.protocol_digest(protocol)
+    current = partial["latest_resume"]
+    resume_from = (partial_root / current["directory"], current["receipt_sha256"])
+
+    clock.enabled, clock.now = False, 0.0
+    with pytest.raises(ValueError, match="identity disagrees"):
+        run_pilot("pilot-bad-resume", resume_from, {**protocol, "panel_epochs": [2]})
+    recovered = run_pilot("pilot-resumed", resume_from)
+    assert (recovered["status"], recovered["updates"]) == ("completed", 6)
+    same(state(tmp_path / "pilot-full", full), state(tmp_path / "pilot-resumed", recovered))
+    merged = tmp_path / "pilot-resumed" / "pilot-metrics.json"
+    metrics = json.loads(merged.read_bytes())
+    full_metrics = json.loads((tmp_path / "pilot-full" / merged.name).read_bytes())
+    attempt_keys = metrics.pop("listening_keys_sha256")
+    full_keys = full_metrics.pop("listening_keys_sha256")
+    assert metrics == full_metrics
+    assert attempt_keys == {key: full_keys[key] for key in attempt_keys}
+    assert metrics["train_utterance_exposures"] == dict.fromkeys(("0", "1", "2"), 2)
+    assert metrics["epochs"][0]["dev_by_speaker"]["dev"]["utterances"] == 2
+    assert metrics["epochs"][0]["dev_macro"]["circular_phase_error"] > 0
+
+    listening = partial_root / "listening"
+    assert sorted(path.name for path in listening.iterdir()) == [
+        "best", "best-key.json", "epoch-01", "epoch-01-key.json",
+        "initialization", "initialization-key.json", "raw", "reference",
+    ]
+    key = json.loads((listening / "initialization-key.json").read_bytes())
+    assert len(list((listening / "initialization").iterdir())) == 4
+    assert sum(name.endswith("-a.wav") and row["condition"] == "reference"
+               for name, row in key.items()) == 1
+    for name, row in key.items():
+        assert digest((listening / "initialization" / name).read_bytes()) == row["sha256"]
+        if row["condition"] == "reference":
+            reference = root / f"example-{row['utterance_id']}.wav"
+            assert row["sha256"] == digest(reference.read_bytes())
+
+
+def test_pilot_attachment_inventory_and_record_staging(corpus, tmp_path, monkeypatch):
+    from vocoroute import pilot_diagnostics as pilot
+    from vocoroute.training_data import load_manifest
+
+    root, manifest_file, config = corpus
+    manifest = load_manifest(manifest_file, config.manifest_sha256)
+    receipt = b"fixture metadata"
+    monkeypatch.setattr(pilot, "PILOT_METADATA", {"dataset-receipt.json": digest(receipt)})
+    (root / "dataset-receipt.json").write_bytes(receipt)
+    manifest_file.unlink()
+    pilot.validate_attachment(root, manifest)
+    (root / "forbidden.wav").write_bytes(b"extra")
+    with pytest.raises(ValueError, match="exact train/dev projection"):
+        pilot.validate_attachment(root, manifest)
+    (root / "forbidden.wav").unlink()
+    (root / "dataset-receipt.json").write_bytes(b"wrong metadata")
+    with pytest.raises(ValueError, match="metadata SHA-256 mismatch"):
+        pilot.validate_attachment(root, manifest)
+
+    spec = spec_document()
+    spec["data"].update(ref=pilot.PILOT_DATA_REF, version=1, receipt_sha256=digest(receipt))
+    cuda = replace(config, device="cuda")
+    protocol = {"schema": pilot.PILOT_SCHEMA, "training_config_sha256": cuda.sha256}
+    spec["pilot"] = {"protocol": protocol, "sha256": pilot.protocol_digest(protocol)}
+    conf_path = put_json(tmp_path / "config.json", cuda.document())
+    spec_path = put_json(tmp_path / "spec.json", spec)
+
+    def snapshot(path, *, mode, sha):
+        assert mode == "record" and sha == "1234567"
+        path.mkdir()
+        files = {
+            "src/experiments/vocoroute_kaggle.py": b"",
+            "src/vocoroute/training_resume.py": b"",
+            "src/vocoroute/pilot_diagnostics.py": b"",
+        }
+        record = Snapshot(mode, sha + "0" * 33, _tree_sha256(files), len(files), 0, "test")
+        with zipfile.ZipFile(path / record.archive, "w") as archive:
+            for name, payload in files.items():
+                archive.writestr(f"{SNAPSHOT_ROOT_IN_ZIP}/{name}", payload)
+        put_json(path / "btpvf_snapshot.json", record.as_record())
+        return record
+
+    monkeypatch.setattr(kaggle, "stage_snapshot", snapshot)
+    staged = tmp_path / "staged"
+    plan = kaggle.stage_vocoroute_plan("1234567", spec_path, conf_path, staged)
+    metadata = json.loads((staged / "kernel/kernel-metadata.json").read_bytes())
+    assert metadata["machine_shape"] == "NvidiaTeslaT4" and metadata["is_private"] == "true"
+    assert metadata["enable_internet"] == "false"
+    assert metadata["dataset_sources"] == [spec["code"]["ref"], spec["data"]["ref"]]
+    assert plan["spec"]["pilot"] == spec["pilot"]
+    inputs = tmp_path / "input"
+    (inputs / spec["data"]["mount"]).mkdir(parents=True)
+    (staged / "code").rename(inputs / spec["code"]["mount"])
+    kaggle._verify_pilot_mounts(spec, inputs, plan)
+    extra = inputs / "raw"
+    extra.mkdir()
+    with pytest.raises(ValueError, match="unapproved pilot input mount"):
+        kaggle._verify_pilot_mounts(spec, inputs, plan)
+    extra.rmdir()
+    (inputs / spec["code"]["mount"] / "some-audio.wav").write_bytes(b"extra")
+    with pytest.raises(ValueError, match="alongside the pilot code snapshot"):
+        kaggle._verify_pilot_mounts(spec, inputs, plan)
+
+
+def test_pilot_attachment_projection_copies_only_verified_files(corpus, tmp_path, monkeypatch):
+    from vocoroute import pilot_diagnostics as pilot
+
+    root, manifest_file, config = corpus
+    source = tmp_path / "saved-n2b0"
+    source.mkdir()
+    root.rename(source / "pilot")
+    freeze = source / "freeze.json"
+    freeze.write_bytes(b"frozen receipt")
+    monkeypatch.setattr(pilot, "PILOT_MANIFEST", config.manifest_sha256)
+    monkeypatch.setattr(pilot, "PILOT_METADATA", {
+        manifest_file.name: config.manifest_sha256,
+        freeze.name: digest(freeze.read_bytes()),
+    })
+    forbidden = source / "pilot" / "example-5.wav"
+    forbidden.write_bytes(b"held-out placeholder")
+    output = tmp_path / "projection"
+    receipt = pilot.prepare_attachment(source, output)
+    assert receipt["files"] == 7
+    assert not (output / forbidden.name).exists()
+    assert forbidden.read_bytes() == b"held-out placeholder"
+    assert receipt["bytes"] == sum(path.stat().st_size for path in output.iterdir())
+    freeze.write_bytes(b"tampered")
+    refused = tmp_path / "refused"
+    with pytest.raises(ValueError, match="saved pilot output SHA-256 mismatch"):
+        pilot.prepare_attachment(source, refused)
+    assert not refused.exists()

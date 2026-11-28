@@ -22,6 +22,7 @@ class Progress:
     history: list[dict] = field(default_factory=list)
     train_losses: list[float] = field(default_factory=list)
     dev_losses: list[float] = field(default_factory=list)
+    pilot: dict | None = None
 
     def cursor(self) -> dict:
         return {
@@ -167,13 +168,16 @@ def write_resume(
     device: torch.device,
 ) -> str:
     """Write an immutable checkpoint and publish its receipt last."""
+    position = asdict(progress)
+    if progress.pilot is None:
+        del position["pilot"]
     buffer = io.BytesIO()
     torch.save(
         {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
-            "progress": asdict(progress),
+            "progress": position,
             "best_weights": best_weights,
             "rng": _rng_state(device),
         },
@@ -243,6 +247,19 @@ def read_resume(
     except TypeError as exc:
         raise ValueError("invalid resume progress fields") from exc
     _validate_progress(progress, config, train_rows, dev_rows)
+    if "pilot_protocol_sha256" in run:
+        pilot = progress.pilot
+        if (
+            not isinstance(pilot, dict)
+            or set(pilot) != {"train", "dev", "epochs"}
+            or any(not isinstance(pilot[key], list) for key in pilot)
+            or len(pilot["train"]) != len(progress.train_losses)
+            or len(pilot["dev"]) != len(progress.dev_losses)
+            or len(pilot["epochs"]) != len(progress.history)
+        ):
+            raise ValueError("pilot resume diagnostics disagree with the cursor")
+    elif progress.pilot is not None:
+        raise ValueError("unexpected pilot resume diagnostics")
     if canonical_json(progress.cursor()) != canonical_json(receipt["cursor"]):
         raise ValueError("resume receipt cursor disagrees with the saved state")
     _validate_weights(state["model"], model)

@@ -77,7 +77,7 @@ def _validate_receipt(receipt: dict, config: TrainingConfig) -> None:
     ):
         raise ValueError("invalid base checkpoint receipt schema")
     run = receipt["run"]
-    if not isinstance(run, dict) or set(run) != {
+    run_fields = {
         "schema",
         "evidence",
         "config",
@@ -86,8 +86,14 @@ def _validate_receipt(receipt: dict, config: TrainingConfig) -> None:
         "manifest_sha256",
         "source_sha256",
         "runtime",
-    }:
+    }
+    if not isinstance(run, dict) or run.keys() - {"pilot_protocol_sha256"} != run_fields:
         raise ValueError("invalid run provenance schema")
+    pilot = "pilot_protocol_sha256" in run
+    if pilot and (
+        config.schema != BUDGET_CONFIG_SCHEMA or not is_sha256(run["pilot_protocol_sha256"])
+    ):
+        raise ValueError("invalid pilot checkpoint provenance")
     if (
         run["schema"] != RUN_SCHEMA
         or run["evidence"] != "development"
@@ -150,7 +156,9 @@ def _validate_receipt(receipt: dict, config: TrainingConfig) -> None:
     elif runtime.get("accelerator") is not None:
         raise ValueError("CPU checkpoint cannot declare a CUDA accelerator")
     history = receipt["history"]
-    if not isinstance(history, list) or len(history) != config.epochs:
+    if not isinstance(history, list) or not (
+        0 < len(history) <= config.epochs if pilot else len(history) == config.epochs
+    ):
         raise ValueError("checkpoint history must contain the full configured run")
     for epoch, row in enumerate(history, 1):
         if (

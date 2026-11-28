@@ -61,7 +61,7 @@ def _mount_spec(document: dict, fields: set[str]) -> None:
 def _validate_spec(spec: dict) -> None:
     if (
         not isinstance(spec, dict)
-        or set(spec)
+        or set(spec) - {"pilot"}
         != {
             "schema",
             "title",
@@ -93,6 +93,26 @@ def _validate_spec(spec: dict) -> None:
         or not all(isinstance(value, str) and value.strip() for value in runtime.values())
     ):
         raise ValueError("pin Python, audio libraries, Torch builds and CUDA build")
+    if "pilot" in spec:
+        from vocoroute.pilot_diagnostics import (
+            PILOT_DATA_REF,
+            PILOT_METADATA,
+            PILOT_SCHEMA,
+            protocol_digest,
+        )
+
+        pilot = spec["pilot"]
+        if (
+            not isinstance(pilot, dict)
+            or set(pilot) != {"protocol", "sha256"}
+            or not isinstance(pilot["protocol"], dict)
+            or pilot["protocol"].get("schema") != PILOT_SCHEMA
+            or protocol_digest(pilot["protocol"]) != pilot["sha256"]
+            or spec["data"]["ref"] != PILOT_DATA_REF
+            or spec["data"]["version"] != 1
+            or spec["data"]["receipt_sha256"] != PILOT_METADATA["dataset-receipt.json"]
+        ):
+            raise ValueError("invalid pilot protocol or frozen attachment identity")
 
 
 def stage_vocoroute_plan(sha: str, spec_path: Path, config_path: Path, output: Path) -> dict:
@@ -110,6 +130,9 @@ def stage_vocoroute_plan(sha: str, spec_path: Path, config_path: Path, output: P
         or not config.manifest_sha256
     ):
         raise ValueError("Kaggle training requires a CUDA v2 config and frozen manifest pin")
+    pilot = spec.get("pilot")
+    if pilot and pilot["protocol"].get("training_config_sha256") != config.sha256:
+        raise ValueError("pilot protocol and configuration digest disagree")
     output.mkdir(parents=True, exist_ok=False)
     snapshot = stage_snapshot(output / "code", mode=RECORD, sha=sha)
     archive_path = output / "code" / snapshot.archive
@@ -122,8 +145,11 @@ def stage_vocoroute_plan(sha: str, spec_path: Path, config_path: Path, output: P
                 "vocoroute/training_resume.py",
             )
         }
+        if pilot:
+            required.add(f"{SNAPSHOT_ROOT_IN_ZIP}/src/vocoroute/pilot_diagnostics.py")
         if not required <= set(source.namelist()):
-            raise ValueError("the specified commit does not contain N2K training support")
+            experiment = "N2B.3 pilot" if pilot else "N2K"
+            raise ValueError(f"the specified commit does not contain {experiment} training support")
     plan = {
         "spec": spec,
         "config": config.document(),
@@ -139,6 +165,8 @@ def stage_vocoroute_plan(sha: str, spec_path: Path, config_path: Path, output: P
     )
     sources = [spec[label]["ref"] for label in ("code", "data", "resume") if spec[label]]
     metadata.update(kernel_type="script", enable_internet="false", dataset_sources=sources)
+    if pilot:
+        metadata["machine_shape"] = "NvidiaTeslaT4"
     _write_json(kernel / "kernel-metadata.json", metadata)
     (kernel / "train.py").write_text(
         f"PLAN_JSON = {json.dumps(plan, sort_keys=True)!r}\n" + _KERNEL, encoding="utf-8"
@@ -195,12 +223,54 @@ def _dataset_manifest(plan: dict, root: Path) -> tuple[Path, Path]:
     return mount, manifest
 
 
-def run_kernel_plan(plan: dict, source: Path, inputs: Path, output: Path) -> dict:
+def _verify_pilot_mounts(spec: dict, inputs: Path, plan: dict) -> None:
+    """Refuse unexpected sources, including unexpected files alongside approved code."""
+    mounts = {
+        name: _under(inputs, spec[name]["mount"])
+        for name in ("code", "data", "resume")
+        if spec[name] is not None
+    }
+    sources = list(mounts.values())
+    if any(a.is_relative_to(b) for i, a in enumerate(sources)
+           for j, b in enumerate(sources) if i != j):
+        raise ValueError("pilot mounts must be separate")
+    for path in inputs.rglob("*"):
+        if path.is_symlink() or not path.resolve().is_relative_to(inputs.resolve()):
+            raise ValueError("pilot inputs contain an unsafe link")
+        if not any(path.is_relative_to(mount) or mount.is_relative_to(path)
+                   for mount in mounts.values()):
+            raise ValueError(f"unapproved pilot input mount: {path.relative_to(inputs)}")
+    code = mounts["code"]
+    packed = (code / plan["snapshot"]["archive"]).is_file()
+    roots = [path for path in (code / "btpvf_code", code / SNAPSHOT_ROOT_IN_ZIP) if path.is_dir()]
+    if packed:
+        allowed = {"btpvf_snapshot.json", plan["snapshot"]["archive"]}
+    elif len(roots) == 1:
+        root = roots[0]
+        nested = root / SNAPSHOT_ROOT_IN_ZIP
+        if nested.is_dir() and {path.name for path in root.iterdir()} != {nested.name}:
+            raise ValueError("unapproved contents alongside the expanded pilot code snapshot")
+        allowed = {"btpvf_snapshot.json", root.name}
+    else:
+        raise ValueError("expected one pilot code payload")
+    if {entry.name for entry in code.iterdir()} != allowed:
+        raise ValueError("unapproved contents alongside the pilot code snapshot")
+    if "resume" in mounts:
+        checkpoint = _under(mounts["resume"], spec["resume"]["checkpoint"])
+        expected = {checkpoint / "resume.json", checkpoint / "training.pt"}
+        if {path for path in mounts["resume"].rglob("*") if path.is_file()} != expected:
+            raise ValueError("the pilot resume mount must contain only the pinned checkpoint")
+
+
+def run_kernel_plan(
+    plan: dict, source: Path, inputs: Path, output: Path, *, started_at: float | None = None
+) -> dict:
     """Called only by the staged, verified kernel; preserve failures as outputs."""
     import torch
 
-    from vocoroute.training_config import TrainingConfig
+    from vocoroute.training_config import TrainingConfig, canonical_json
 
+    _validate_spec(plan["spec"])
     config = TrainingConfig.from_document(plan["config"])
     if config.sha256 != plan["config_sha256"] or config.device != "cuda":
         raise ValueError("kernel config digest or device disagrees with the plan")
@@ -218,6 +288,13 @@ def run_kernel_plan(plan: dict, source: Path, inputs: Path, output: Path) -> dic
     if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
         raise RuntimeError("Kaggle training requires visible CUDA device 0")
     _write_json(output / "runtime.json", actual)
+    pilot = plan["spec"].get("pilot")
+    if pilot:
+        visible = [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())]
+        _write_json(output / "pilot-devices.json", {"visible": visible, "training": "cuda:0"})
+        if len(visible) != 2 or any(name not in ("Tesla T4", "NVIDIA T4") for name in visible):
+            raise RuntimeError(f"pilot requires exactly two visible T4 GPUs: {visible}")
+        _verify_pilot_mounts(plan["spec"], inputs, plan)
     smi = shutil.which("nvidia-smi")
     if smi:
         driver = subprocess.run(
@@ -248,6 +325,12 @@ def run_kernel_plan(plan: dict, source: Path, inputs: Path, output: Path) -> dic
         "--out-dir",
         str(output / "training"),
     ]
+    if pilot:
+        protocol = output / "pilot-protocol.json"
+        protocol.write_bytes(canonical_json(pilot["protocol"]) + b"\n")
+        command.extend(("--pilot-protocol", str(protocol)))
+        if started_at is not None:
+            command.extend(("--attempt-started-at", str(started_at)))
     resume = plan["spec"]["resume"]
     if resume:
         checkpoint = _under(_under(inputs, resume["mount"]), resume["checkpoint"])
@@ -260,7 +343,17 @@ def run_kernel_plan(plan: dict, source: Path, inputs: Path, output: Path) -> dic
             command, env=env, cwd=source, stdout=log, stderr=subprocess.STDOUT, check=True
         )
     result = json.loads((output / "training" / "run.json").read_bytes())
-    return {key: result[key] for key in ("status", "reason", "updates", "latest_resume")}
+    record = {key: result[key] for key in ("status", "reason", "updates", "latest_resume")}
+    if pilot:
+        record.update(
+            pilot_protocol_sha256=pilot["sha256"],
+            training_run_sha256=hashlib.sha256(
+                (output / "training" / "run.json").read_bytes()
+            ).hexdigest(),
+            pilot_metrics_sha256=result["pilot_metrics_sha256"],
+            best_checkpoint_receipt_sha256=result.get("checkpoint_receipt_sha256"),
+        )
+    return record
 
 
 # Bootstrap uses only stdlib until the attached commit's contents are verified.
@@ -270,10 +363,12 @@ import io
 import json
 import sys
 import tempfile
+import time
 import traceback
 import zipfile
 from pathlib import Path
 
+started_at = time.monotonic()
 plan = json.loads(PLAN_JSON)
 inputs = Path("/kaggle/input")
 output = Path("/kaggle/working/vocoroute-run")
@@ -315,7 +410,10 @@ try:
             raise ValueError("attached source tree digest mismatch")
         sys.path.insert(0, str(source / "src"))
         from experiments.vocoroute_kaggle import run_kernel_plan
-        receipt.update(run_kernel_plan(plan, source, inputs, output))
+        if "pilot" in plan["spec"]:
+            receipt.update(run_kernel_plan(plan, source, inputs, output, started_at=started_at))
+        else:
+            receipt.update(run_kernel_plan(plan, source, inputs, output))
 except Exception as exc:
     receipt.update(status="failed", error_type=type(exc).__name__, error=str(exc))
     (output / "failure.log").write_text(traceback.format_exc(), encoding="utf-8")

@@ -77,9 +77,10 @@ def _training_parts(config: TrainingConfig, device: torch.device):
     return model, optimizer, scheduler
 
 
-def _train_example(model, optimizer, waveform: Tensor, uid: str) -> float:
+def _train_example(model, optimizer, waveform: Tensor, uid: str, *, record=None) -> float:
     optimizer.zero_grad(set_to_none=True)
-    loss = model(waveform).total
+    terms = model(waveform)
+    loss = terms.total
     if not torch.isfinite(loss):
         raise ValueError(f"nonfinite training loss for {uid}")
     loss.backward()
@@ -88,6 +89,10 @@ def _train_example(model, optimizer, waveform: Tensor, uid: str) -> float:
         for param in model.backbone.parameters()
     ):
         raise ValueError(f"missing or nonfinite gradient for {uid}")
+    if record is not None:
+        from .pilot_diagnostics import loss_metrics
+
+        record.append(loss_metrics(terms))
     optimizer.step()
     return loss.item()
 
@@ -189,14 +194,23 @@ def _run_budgeted(
     *,
     resume: tuple[Path, str] | None,
     attempt_updates: int | None,
+    pilot_protocol: dict | None = None,
+    started_at: float | None = None,
 ) -> dict:
-    start = time.monotonic()
+    start = time.monotonic() if started_at is None else started_at
     audio.validate_headers()
     model, optimizer, scheduler = _training_parts(config, device)
     run = run_provenance(config, manifest)
     train_rows = len(manifest.examples(TRAIN_ROLE))
     dev = manifest.examples(DEV_ROLE)
     progress, best = Progress(), None
+    pilot = None
+    if pilot_protocol is not None:
+        from .pilot_diagnostics import PilotDiagnostics, protocol_digest
+
+        pilot = PilotDiagnostics(pilot_protocol, manifest, config, audio, output)
+        run["pilot_protocol_sha256"] = protocol_digest(pilot_protocol)
+        progress.pilot = {"train": [], "dev": [], "epochs": []}
     if resume is None:
         random.seed(config.seed)
         torch.random.default_generator.manual_seed(config.seed)
@@ -264,6 +278,11 @@ def _run_budgeted(
     try:
         reason = "max_epochs"
         with _graceful_stop() as stopping:
+            if pilot and initial_updates == 0 and not _budget_stop(
+                config, 0, 0, None, start, stopping, fitting=False
+            ):
+                model.eval()
+                pilot.render(model, "initialization")
             while len(progress.history) < config.epochs:
                 epoch = len(progress.history) + 1
                 train = manifest.examples(TRAIN_ROLE, seed=config.seed, epoch=epoch)
@@ -280,7 +299,10 @@ def _run_budgeted(
                     if reason:
                         break
                     model.train()
-                    value = _train_example(model, optimizer, audio.waveform(row), row.utterance_id)
+                    track = {"record": progress.pilot["train"]} if pilot else {}
+                    value = _train_example(
+                        model, optimizer, audio.waveform(row), row.utterance_id, **track
+                    )
                     progress.train_losses.append(value)
                     progress.updates += 1
                     if progress.updates % config.checkpoint_every_updates == 0:
@@ -300,7 +322,13 @@ def _run_budgeted(
                             )
                             if reason:
                                 break
-                            value = model(audio.waveform(row)).total.item()
+                            waveform = audio.waveform(row)
+                            if pilot:
+                                measured = pilot.evaluate(model, row, waveform)
+                                progress.pilot["dev"].append(measured)
+                                value = measured["metrics"]["weighted_objective"]
+                            else:
+                                value = model(waveform).total.item()
                             if not math.isfinite(value):
                                 raise ValueError(f"nonfinite dev loss for {row.utterance_id}")
                             progress.dev_losses.append(value)
@@ -322,22 +350,33 @@ def _run_budgeted(
                         scheduler.step()
                         progress.train_losses.clear()
                         progress.dev_losses.clear()
+                        if pilot:
+                            pilot.finish_epoch(epoch, progress.pilot)
+                            if epoch in pilot.epochs:
+                                # Persist the completed epoch before writing its listening files.
+                                checkpoint()
+                                pilot.render(model, f"epoch-{epoch:02d}")
                         reason = "max_epochs"
                         continue
                 break
 
         checkpoint()
-        if len(progress.history) == config.epochs:
+        complete = len(progress.history) == config.epochs
+        if complete or (pilot and progress.history):
             best_epoch = min(progress.history, key=lambda row: row["dev_total"])["epoch"]
             digest = save_base_checkpoint(
                 output / "inference", config, run, progress.history, best_epoch, best
             )
-            record.update(
-                status="completed",
-                reason="max_epochs",
-                best_epoch=best_epoch,
-                checkpoint_receipt_sha256=digest,
-            )
+            record.update(best_epoch=best_epoch, checkpoint_receipt_sha256=digest)
+            if pilot:
+                # The latest training state has already been saved for resume.
+                model.backbone.load_state_dict(best, strict=True)
+                model.eval()
+                pilot.render(model, "best")
+        if pilot:
+            record["pilot_metrics_sha256"] = pilot.save_metrics(progress, manifest, config)
+        if complete:
+            record.update(status="completed", reason="max_epochs")
         else:
             record.update(
                 status="interrupted" if reason == "signal" else "budget_limited", reason=reason
@@ -379,6 +418,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--resume-receipt-sha256")
     parser.add_argument("--attempt-updates", type=int)
+    parser.add_argument("--pilot-protocol", type=Path)
+    parser.add_argument("--attempt-started-at", type=float)
     args = parser.parse_args(argv)
 
     try:
@@ -429,6 +470,14 @@ def _prepare_run(args: argparse.Namespace, config: TrainingConfig) -> dict:
         raise ValueError("training requires explicit --config and a fresh --out-dir")
     if args.dry_run and args.out_dir is not None:
         raise ValueError("dry-run has no output directory")
+    if args.pilot_protocol is not None and (
+        not args.train or args.config is None or config.schema != BUDGET_CONFIG_SCHEMA
+    ):
+        raise ValueError("pilot protocol requires explicit v2 training configuration")
+    if args.attempt_started_at is not None and (
+        args.pilot_protocol is None or not 0 <= args.attempt_started_at <= time.monotonic()
+    ):
+        raise ValueError("invalid pilot monotonic attempt start")
     with training_runtime(config.device) as device:
         _cuda_preflight(config, device)
         return _ready_run(args, config, device)
@@ -440,6 +489,15 @@ def _ready_run(args: argparse.Namespace, config: TrainingConfig, device: torch.d
         if args.manifest is None or args.data_root is None or config.manifest_sha256 is None:
             raise ValueError("real data needs --manifest, --data-root, and an approved config pin")
         manifest = load_manifest(args.manifest, config.manifest_sha256)
+        pilot = None
+        if args.pilot_protocol is not None:
+            from .pilot_diagnostics import pilot_protocol, validate_attachment
+            from .training_config import parse_json
+
+            pilot = parse_json(args.pilot_protocol.read_bytes())
+            if pilot != pilot_protocol(manifest, config):
+                raise ValueError("pilot protocol or fixed listening panel disagrees")
+            validate_attachment(args.data_root, manifest)
         audio = TrainingAudio(manifest, args.data_root)
         if args.train:
             output = args.out_dir.resolve()
@@ -460,6 +518,8 @@ def _ready_run(args: argparse.Namespace, config: TrainingConfig, device: torch.d
                             device,
                             resume=resume,
                             attempt_updates=args.attempt_updates,
+                            pilot_protocol=pilot,
+                            started_at=args.attempt_started_at,
                         )
                 finally:
                     random.setstate(rng)
